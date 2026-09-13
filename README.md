@@ -5,7 +5,11 @@ subscriptions — without waiting for that person to become available.
 
 > **Language note:** the code, comments and this README are in English. Everything the tool
 > *says to a human* — CLI output, errors, the agent-facing channel notices — is in Spanish,
-> and so is the acceptance runbook. That was a deliberate product choice, not an oversight.
+> and so is the documentation for the people actually running it. That was a deliberate product
+> choice, not an oversight.
+>
+> **¿Español?** La guía paso a paso para las dos personas que lo van a usar está en
+> [`docs/inicio-rapido.md`](docs/inicio-rapido.md).
 
 ## The problem
 
@@ -77,38 +81,71 @@ fence holds. So the boundary is enforced by configuration, not by asking the mod
 - Postgres 16 for the relay — Docker locally, a managed instance in production
 - A host for the relay. A `render.yaml` blueprint is included.
 
+## Two people, two roles
+
+The two machines never talk to each other and neither is exposed to the internet. Both call *out*
+to a relay you host — think of it as a reception desk both people trust.
+
+There are three roles. In a two-person pilot one person usually holds two of them.
+
+| Role | Who it is | What they do |
+| --- | --- | --- |
+| **Relay operator** | whoever hosts it, usually you | Deploys the relay once and issues one enrollment link per person. Can read every question and answer — say that out loud to the other person. |
+| **Answerer** | the person whose knowledge you want | Leaves a Claude Code session running in a locked room, with copies of only the files they chose to share. |
+| **Asker** | the person with the question | Asks from their own Claude Code, or from the CLI. |
+
+Permission is **directional**. Ana being allowed to ask Dev does not let Dev ask Ana. If you want
+both directions, do the grant step twice, once each way. Either side can revoke instantly.
+
+The "locked room" is the important idea. The answerer picks one folder and copies into it only
+what they're willing to share. Their agent can read that folder and **nothing else on the
+machine** — that's enforced by configuration, not by asking the model nicely. Everything in the
+room is fair game, so the room is curated on purpose. It is not your working repo.
+
+```mermaid
+sequenceDiagram
+    participant A as Ana's Claude Code
+    participant R as Relay (self-hosted)
+    participant D as Dev's locked session
+    Note over A,D: one time: both enroll, Dev grants Ana permission
+    A->>R: ask_contact "which timeout applies to card reads?"
+    R->>D: question + a 4-character code
+    Note over D: reads only the shared folder
+    D->>R: reply, validated against the code
+    R->>A: check_answer returns the answer
+```
+
+Nobody has to be online at the same moment. If Dev's session is down, the question waits in the
+queue for him.
+
 ## Quickstart
 
-### 1. Build
+Ana is going to ask; Dev is going to answer. Swap the names for your own.
+
+### On both machines
+
+Node >= 22.4 is required. Dev also needs Claude Code; Ana only needs it if she wants to ask from
+inside her agent rather than from the terminal.
 
 ```bash
 git clone https://github.com/Joseamica/agentbridge.git
 cd agentbridge
 npm ci
 npm run build
-```
-
-That produces two bundles: the CLI at `packages/cli/dist/main.js` and the Claude Code plugin
-server at `plugins/agentbridge/dist/server.js`.
-
-A convenient alias — note that `ab` is ApacheBench on macOS, so without this you will get its
-usage text rather than a "command not found":
-
-```bash
 alias ab="node $PWD/packages/cli/dist/main.js"
 ```
 
-### 2. Deploy the relay
+Heads up on that alias: `ab` is ApacheBench on macOS, so without it you get a benchmarking tool's
+help text instead of a "command not found", which is confusing the first time.
 
-Deploy with the included `render.yaml`, or run it anywhere that gives you Postgres and a public
-URL. Set `ADMIN_TOKEN` to a long random string and keep it in a password manager — it mints
-enrollment links, so it is the master credential. `PUBLIC_URL` falls back to Render's
-`RENDER_EXTERNAL_URL` if unset.
+### Once, on the relay operator's machine
 
-### 3. Enroll both people
+Deploy the relay with the included `render.yaml`, or anywhere that gives you Postgres and a public
+URL. Set `ADMIN_TOKEN` to a long random string and keep it in a password manager: it mints
+enrollment links, so it is the master credential. Never paste it into a chat.
 
-The relay operator issues a one-time link per person (single use, expiring, bound to the first
-device that redeems it):
+Then issue one link per person — single use, expiring, and bound to the first device that redeems
+it:
 
 ```bash
 read -rs AGENTBRIDGE_ADMIN_TOKEN && export AGENTBRIDGE_ADMIN_TOKEN
@@ -118,58 +155,101 @@ ab admin enroll-link --handle dev --name "Dev"
 ab admin enroll-link --handle ana --name "Ana"
 ```
 
-Each person redeems their own link on their own machine:
+Send each person their own link, over any channel you already use.
+
+### On Dev's machine — the person who answers
+
+**1. Redeem the link.**
 
 ```bash
-ab enroll "<link>"
+ab enroll "<Dev's link>"
 ab whoami
 ```
 
-### 4. Grant permission
-
-The person who will *answer* creates an invite; the person who will *ask* accepts it:
+**2. Build the room.** Create a folder and copy into it only what Dev is willing to share. A
+README, a config file, an architecture note. Not the working repo, and nothing with credentials.
 
 ```bash
-ab invite            # responder runs this, sends the link over any channel
-ab accept "<link>"   # asker runs this
-ab contacts          # either side, to see who can ask whom
-ab revoke ana        # responder, at any time
+mkdir -p ~/AgentBridge/shared
 ```
 
-### 5. Set up the responder session
+**3. Set up the locked session.**
 
 ```bash
 ab setup-responder --share ~/AgentBridge/shared --repo "$PWD"
 ```
 
-This creates a dedicated `CLAUDE_CONFIG_DIR` profile, writes the restricted settings, generates a
-`start.sh`, and drops a persona `CLAUDE.md` into the shared folder. It refuses to run if the home
-directory would land inside the shared folder. Log in once in that profile, then:
+This creates a dedicated Claude Code profile, writes the restricted permissions, generates a
+`start.sh`, and drops a persona `CLAUDE.md` into the shared folder. It refuses to run if the
+credential directory would land inside the shared folder.
+
+**4. Log in once in that profile, then start it.** The session has to stay running to answer —
+keep it in its own terminal window, or under tmux.
 
 ```bash
 ~/.agentbridge-responder/start.sh
+```
+
+**5. Check it actually works.**
+
+```bash
 ab doctor --home ~/.agentbridge-responder --share ~/AgentBridge/shared --repo "$PWD"
 ```
 
-### 6. Ask
+Every line should read `[ok]`. This is the step that tells you the fence is real, the plugin is
+installed, and nothing dangerous landed in the shared folder. Run it before you trust the setup.
 
-From the CLI:
+**6. Let Ana in.**
+
+```bash
+ab invite
+```
+
+Send Ana the link it prints. That is what grants her permission to ask. Dev can undo it at any
+time with `ab revoke ana`.
+
+### On Ana's machine — the person who asks
+
+**1. Redeem her own link.**
+
+```bash
+ab enroll "<Ana's link>"
+```
+
+**2. Accept Dev's invite.**
+
+```bash
+ab accept "<Dev's invite link>"
+ab contacts
+```
+
+`ab contacts` should now list Dev under the people she can ask.
+
+**3. Ask.** From the terminal:
 
 ```bash
 ab ask dev "which timeout applies to card reads?" --wait 120
 ```
 
-Or from inside your own Claude Code, which is the point:
+Or — the actual point of this thing — from inside her own Claude Code:
 
 ```bash
 claude mcp add agentbridge --scope user -- node "$PWD/packages/cli/dist/main.js" mcp
 ```
 
-Then just ask your agent to ask theirs. It gets `list_contacts`, `ask_contact` and
-`check_answer`; `check_answer` long-polls within the relay's ceiling so it never hangs a tool call.
+Restart any session that was already open, then just tell her agent to ask Dev. It gets
+`list_contacts`, `ask_contact` and `check_answer`. `check_answer` long-polls within the relay's
+ceiling, so it never hangs a tool call.
 
-The full step-by-step acceptance runbook, in Spanish, with an eight-scenario security checklist,
-is at [`docs/runbooks/m1-acceptance.md`](docs/runbooks/m1-acceptance.md).
+### After that
+
+Dev keeps his session running and forgets about it. Ana asks whenever she needs to. Neither of
+them has to interrupt the other.
+
+For the full pilot protocol in Spanish — including an eight-scenario security checklist you should
+run before trusting this with anything real — see
+[`docs/runbooks/m1-acceptance.md`](docs/runbooks/m1-acceptance.md). There is also a friendlier
+Spanish quickstart at [`docs/inicio-rapido.md`](docs/inicio-rapido.md).
 
 ## CLI reference
 
