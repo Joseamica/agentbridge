@@ -1,0 +1,14 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "agentbridge-local",
+  "description": "Local marketplace for the AgentBridge channel plugin (M1 pilot).",
+  "owner": { "name": "AgentBridge" },
+  "plugins": [
+    {
+      "name": "agentbridge",
+      "description": "Receive questions from authorized people and answer them from a shared folder.",
+      "category": "development",
+      "source": "./plugins/agentbridge"
+    }
+  ]
+}

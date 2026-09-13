@@ -1,0 +1,10 @@
+{
+  "name": "@agentbridge/channel",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@agentbridge/core": "*",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.6.3"
+  }
+}

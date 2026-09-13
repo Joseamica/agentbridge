@@ -1,0 +1,14 @@
+node_modules/
+dist/
+coverage/
+.context/
+demo/
+*.log
+.env
+.env.*
+
+# Internal working documents: kept on disk, never published.
+# They name real people and companies and contain business strategy.
+docs/designs/
+docs/plans/
+docs/superpowers/plans/2026-09-12-agentbridge-m1.md

@@ -1,0 +1,11 @@
+{
+  "name": "@agentbridge/cli",
+  "private": true,
+  "type": "module",
+  "bin": { "agentbridge": "./dist/main.js" },
+  "dependencies": {
+    "@agentbridge/core": "*",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.6.3"
+  }
+}
