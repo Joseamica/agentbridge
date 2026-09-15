@@ -75,3 +75,26 @@ Nada de esto bloquea el piloto. Todo está verificado y acotado.
   puede acuñarse un dispositivo bajo un handle existente y heredar sus permisos.
 - **Fuera de la carpeta compartida no hay alcance** por herramientas de archivo, en cualquier modo
   de permisos.
+
+## Pendientes del comando guiado `setup`
+
+Todo esto es preexistente o cosmético, verificado y acotado. Ninguno bloquea el uso.
+
+- Un `config.json` del respondedor que sea JSON válido pero no una configuración (por ejemplo
+  `{}`) revienta con `Error inesperado: Cannot read properties of undefined` y código de salida 2,
+  en inglés (`packages/core/src/http.ts:28`). Un archivo verdaderamente corrupto sí se maneja bien,
+  en español y con salida 1.
+- `scanShareDirForDanger` se salta en silencio una subcarpeta que no puede leer
+  (`setup.ts:262-266`). Es la misma forma del bug de los enlaces simbólicos: "no pude mirar y no
+  dije nada". No es una exposición, porque la sesión respondedora corre con el mismo usuario y
+  tampoco podría leerla.
+- Un enlace de alta mal escrito o caducado termina la corrida en vez de volver a preguntar;
+  `askWithRetries` solo reintenta cuando la respuesta viene vacía.
+- En el camino manual, `setup-responder` corrido por separado todavía dice "1. Da de alta este
+  dispositivo" justo después de que el paso 1 de la guía ya te dio de alta. Dentro de `setup` esa
+  contradicción ya no aparece.
+- El README y la guía en español describen los disparadores del candado como carpeta personal,
+  repositorio git y archivos con pinta de credenciales. Ahora también disparan los enlaces
+  simbólicos y un `node_modules` que no se pudo revisar.
+- El candado avisa de cualquier enlace simbólico, incluso de los que el `doctor` considera
+  inofensivos por no salir de la carpeta. Es a propósito: prefiere errar del lado seguro.
