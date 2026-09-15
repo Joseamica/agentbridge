@@ -2,7 +2,7 @@ import { access, readdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
-import { CliError, requireConfig, tryReadConfig, type CliContext, type Prompt } from '../context'
+import { CliError, PromptEOF, requireConfig, tryReadConfig, type CliContext, type Output, type Prompt } from '../context'
 import { resolveComparablePath } from '../fs-paths'
 import { enroll } from './account'
 import { projectConfigArtifacts, runDoctor } from './doctor'
@@ -67,6 +67,65 @@ function parseRole(raw: string): Role | null {
   return null
 }
 
+function parseNonEmpty(raw: string): string | null {
+  const trimmed = raw.trim()
+  return trimmed.length > 0 ? trimmed : null
+}
+
+// Deliberately does not accept "sí", "s" or "y" as alternate spellings of the confirmation
+// word: a person has to actually type CONFIRMAR (case- and whitespace-insensitive, per FIX2)
+// rather than reflex-answering the way they would a plain yes/no. That property — that it
+// cannot be answered on autopilot — is the entire point of gating a dangerous folder behind a
+// typed word instead of a y/n prompt, and widening the accepted answers here would erase it.
+function parseConfirmation(raw: string): true | null {
+  return raw.trim().toLowerCase() === CONFIRM_WORD.toLowerCase() ? true : null
+}
+
+function parseYesNo(raw: string): boolean | null {
+  const v = raw.trim().toLowerCase()
+  if (v === 's' || v === 'si' || v === 'sí' || v === 'y' || v === 'yes') return true
+  if (v === 'n' || v === 'no') return false
+  return null
+}
+
+const MAX_ATTEMPTS = 3
+
+// Every question a person answers in this flow goes through here. On an answer `parse` rejects
+// (returns null), it prints what a valid answer looks like and asks the exact same question
+// again — up to MAX_ATTEMPTS times total — instead of ending the whole run over one typo, which
+// would be worse than the written guide this command replaces (at least that doesn't lose your
+// place). Exhausting every attempt still ends in the same Spanish CliError this always threw,
+// just after a real chance to correct course instead of on the first miss.
+//
+// A stream that ends (PromptEOF — real stdin closing or running out, or a test's scripted
+// answers running dry) is NEVER treated as a wasted attempt to retry: `prompt` rejects in that
+// case, the `await` below throws, and this function does not catch it — it propagates straight
+// out uncaught. Retrying an already-closed stream cannot ever produce an answer, so looping on
+// it would either spin forever (unbounded) or, even bounded, burn the retry budget under the
+// wrong diagnosis ("I didn't understand you" instead of "I have no terminal to ask you in").
+// runSetup's own top-level try/catch is what turns a propagated PromptEOF into the same Spanish
+// "needs an interactive terminal" message setupCommand already gives when there is no prompt at
+// all — see the comment there.
+async function askWithRetries<T>(
+  prompt: Prompt,
+  out: Output,
+  question: string,
+  parse: (raw: string) => T | null,
+  invalidHint: string,
+  giveUpMessage: string,
+): Promise<T> {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const raw = await prompt(question)
+    const parsed = parse(raw)
+    if (parsed !== null) return parsed
+    if (attempt < MAX_ATTEMPTS) {
+      const trimmed = raw.trim()
+      out.log(trimmed ? `No entendí "${trimmed}". ${invalidHint}` : `No escribiste nada. ${invalidHint}`)
+    }
+  }
+  throw new CliError(giveUpMessage)
+}
+
 // Patterns a fresh, curated share folder should never contain. Matched against bare file
 // names in the folder's top level — good enough to catch the common, careless case (a
 // `.env` copied in alongside real files) without pretending to be a full secret scanner.
@@ -98,7 +157,25 @@ export async function assessShareDir(shareDirRaw: string): Promise<ShareDirAsses
 
 const CONFIRM_WORD = 'CONFIRMAR'
 
+// The public entry point tests and setupCommand call. It's a thin wrapper around
+// `runGuidedSetup`: its only job is to turn a `PromptEOF` that escapes the whole flow into the
+// same Spanish "needs an interactive terminal" message `setupCommand` already gives when there
+// is no prompt at all (see NON_INTERACTIVE_ES) — reached whenever stdin closes or a test's
+// scripted answers run out partway through, not just when there was never a prompt to begin
+// with. Every other error (a normal CliError from a validation or a give-up message, a relay
+// error, …) passes through unchanged.
 export async function runSetup(ctx: SetupContext): Promise<void> {
+  try {
+    await runGuidedSetup(ctx)
+  } catch (err) {
+    if (err instanceof PromptEOF) {
+      throw new CliError(NON_INTERACTIVE_ES)
+    }
+    throw err
+  }
+}
+
+async function runGuidedSetup(ctx: SetupContext): Promise<void> {
   const { out, prompt } = ctx
 
   out.log('AgentBridge — configuración guiada')
@@ -111,12 +188,14 @@ export async function runSetup(ctx: SetupContext): Promise<void> {
   if (!config) {
     out.log('Esta computadora todavía no está dada de alta.')
     out.log('Pide un enlace de alta a quien opere el relay (o créalo tú con: agentbridge admin enroll-link).')
-    const link = (await prompt('Enlace de alta: ')).trim()
-    if (!link) {
-      throw new CliError(
-        'Necesito un enlace de alta para continuar. Vuelve a correr "agentbridge setup" cuando lo tengas, o da de alta a mano: agentbridge enroll <enlace>',
-      )
-    }
+    const link = await askWithRetries(
+      prompt,
+      out,
+      'Enlace de alta: ',
+      parseNonEmpty,
+      'Necesito el enlace que te mandaron para darte de alta.',
+      'No diste un enlace de alta. Vuelve a correr "agentbridge setup" cuando lo tengas, o da de alta a mano: agentbridge enroll <enlace>',
+    )
     await enroll([link], ctx)
     config = await requireConfig(ctx)
   } else {
@@ -125,11 +204,14 @@ export async function runSetup(ctx: SetupContext): Promise<void> {
   out.log('')
 
   // 2. Which side
-  const roleRaw = await prompt(ROLE_QUESTION_ES)
-  const role = parseRole(roleRaw)
-  if (!role) {
-    throw new CliError(`No entendí "${roleRaw.trim()}". Vuelve a correr "agentbridge setup" y responde 1, 2 o 3.`)
-  }
+  const role = await askWithRetries(
+    prompt,
+    out,
+    ROLE_QUESTION_ES,
+    parseRole,
+    'Escribe 1, 2 o 3.',
+    'No pude entender qué ibas a hacer. Vuelve a correr "agentbridge setup" y responde 1, 2 o 3.',
+  )
   const willAnswer = role === 'responder' || role === 'ambas'
   const willAsk = role === 'preguntar' || role === 'ambas'
   out.log('')
@@ -142,6 +224,13 @@ export async function runSetup(ctx: SetupContext): Promise<void> {
     out.log(SHARE_FOLDER_EXPLANATION_ES)
     out.log('')
     const defaultShare = join(homedir(), 'AgentBridge', 'compartido')
+    // Not routed through askWithRetries: any non-empty string is a syntactically valid folder
+    // path (an empty answer just falls back to the suggested default), so there is no
+    // "unrecognized answer" for this one to retry on — whether the path is actually safe to use
+    // is a separate question, handled by the confirmation gate right below, which does retry.
+    // A stream ending here still surfaces correctly: `prompt` itself rejects with PromptEOF
+    // regardless of whether the call is wrapped in askWithRetries, and runSetup's top-level
+    // catch handles that uniformly.
     const rawShare = (await prompt(`Carpeta a compartir (Enter para usar ${defaultShare}): `)).trim()
     const shareDir = resolve(rawShare || defaultShare)
 
@@ -155,12 +244,16 @@ export async function runSetup(ctx: SetupContext): Promise<void> {
       out.log(`Ojo: ${shareDir} se ve peligrosa para compartir —`)
       for (const reason of assessment.reasons) out.log(`  - ${reason}`)
       out.log(
-        `Si de verdad quieres usarla de todos modos, escribe exactamente ${CONFIRM_WORD}. Cualquier otra respuesta cancela y no toca nada.`,
+        `Si de verdad quieres usarla de todos modos, escribe exactamente ${CONFIRM_WORD} (mayúsculas o minúsculas da igual). Cualquier otra respuesta cancela.`,
       )
-      const confirmation = (await prompt(`Escribe ${CONFIRM_WORD} para continuar: `)).trim()
-      if (confirmation !== CONFIRM_WORD) {
-        throw new CliError(`No confirmaste. No se tocó ${shareDir}. Vuelve a correr "agentbridge setup" con una carpeta distinta.`)
-      }
+      await askWithRetries(
+        prompt,
+        out,
+        `Escribe ${CONFIRM_WORD} para continuar: `,
+        parseConfirmation,
+        `Para seguir con esta carpeta, escribe exactamente la palabra ${CONFIRM_WORD} (sin comillas; mayúsculas o minúsculas da igual).`,
+        `No escribiste "${CONFIRM_WORD}". No se tocó ${shareDir}. Vuelve a correr "agentbridge setup" con otra carpeta si quieres, o confirma esta de nuevo.`,
+      )
     }
     // Never create the folder silently: say so before setupResponder does it.
     out.log(assessment.exists ? `Voy a usar la carpeta que ya existe: ${shareDir}` : `${shareDir} no existe todavía; la voy a crear vacía.`)
@@ -192,9 +285,16 @@ export async function runSetup(ctx: SetupContext): Promise<void> {
   // 4. Asking side
   if (willAsk) {
     out.log('Para preguntar desde tu propio Claude Code hace falta registrar el servidor MCP de AgentBridge una vez.')
-    const wantsMcp = (await prompt('¿Lo registro ahora? [s/n]: ')).trim().toLowerCase()
+    const wantsMcp = await askWithRetries(
+      prompt,
+      out,
+      '¿Lo registro ahora? [s/n]: ',
+      parseYesNo,
+      'Escribe s (sí) o n (no).',
+      'No entendí tu respuesta. Puedes registrarlo tú cuando quieras con: claude mcp add agentbridge --scope user -- npx -y agentbridge@latest mcp',
+    )
     let mcpRegistered = false
-    if (wantsMcp.startsWith('s')) {
+    if (wantsMcp) {
       const result = await ctx.run(
         'claude',
         ['mcp', 'add', 'agentbridge', '--scope', 'user', '--', 'npx', '-y', 'agentbridge@latest', 'mcp'],

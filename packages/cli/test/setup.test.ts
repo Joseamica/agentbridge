@@ -7,7 +7,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { ADMIN_TOKEN, buildListeningApp, resetDb, testPool } from '../../../apps/relay/test/helpers'
 import type { CommandRunner } from '../src/commands/setup-responder'
 import { runSetup } from '../src/commands/setup'
-import { memoryOutput, type Prompt } from '../src/context'
+import { memoryOutput, PromptEOF, type Prompt } from '../src/context'
 import { run } from '../src/router'
 
 let pool: pg.Pool
@@ -36,15 +36,18 @@ afterAll(async () => {
   await pool.end()
 })
 
+// Mirrors what the real readlinePrompt does when its input stream ends before an answer comes
+// back: rejects with PromptEOF, the same way a closed/exhausted real stdin does — never a plain
+// Error, and never a resolved string. This is what lets a test feed fewer answers than a flow
+// needs and get the same "needs an interactive terminal" abort a real dried-up stdin would
+// produce, instead of an unrelated crash.
 function scriptedPrompt(answers: string[]): Prompt {
   const queue = [...answers]
-  return async (question: string) => {
-    if (queue.length === 0) throw new Error(`setup pidió una respuesta de más para: ${question}`)
+  return async () => {
+    if (queue.length === 0) throw new PromptEOF()
     return queue.shift()!
   }
 }
-
-const okRunner: CommandRunner = async () => ({ code: 0, stdout: '', stderr: '' })
 
 // runSetup calls doctor internally, whose default `run` would otherwise spawn a real `claude`
 // binary for `claude auth status`. Every test must inject a CommandRunner instead.
@@ -128,27 +131,58 @@ describe('agentbridge setup — dangerous shared folder', () => {
     expect(calls).toEqual([])
   })
 
-  it('refuses a folder containing a git repo unless the person types the exact confirmation', async () => {
+  it('re-asks the confirmation on a wrong answer instead of ending the run, and still refuses after 3 wrong tries', async () => {
     const base = await newBaseContext()
     const link = await createEnrollLink('dev', 'Dev Ejemplo')
     const dangerous = join(root, 'repo-de-trabajo')
     await mkdir(join(dangerous, '.git'), { recursive: true })
     const { run: runner, calls } = trackingRunner()
-    const prompt = scriptedPrompt([link, '1', dangerous, 'no gracias'])
-    await expect(runSetup({ ...base, prompt, run: runner })).rejects.toThrow(/no confirmaste|CONFIRMAR/i)
+    // Three wrong confirmation attempts, none of them "CONFIRMAR" — FIX1 means each one gets a
+    // fresh chance instead of ending the run on the first, and only running out at the third
+    // attempt ends it, with the CliError this always threw.
+    const prompt = scriptedPrompt([link, '1', dangerous, 'no gracias', 'tampoco', 'de plano no'])
+    await expect(runSetup({ ...base, prompt, run: runner })).rejects.toThrow(/CONFIRMAR/)
+    const text = base.out.lines.join('\n')
+    expect(text).toContain('No entendí "no gracias"')
+    expect(text).toContain('No entendí "tampoco"')
     expect(calls).toEqual([])
   })
 
-  it('proceeds with a dangerous folder once the person types the exact confirmation', async () => {
+  it('accepts the confirmation case- and whitespace-insensitively, on the first attempt', async () => {
     const base = await newBaseContext()
     const link = await createEnrollLink('dev', 'Dev Ejemplo')
     const dangerous = join(root, 'repo-de-trabajo-2')
     await mkdir(join(dangerous, '.git'), { recursive: true })
     const responderHome = join(root, 'responder-2')
     const { run: runner } = trackingRunner()
-    const prompt = scriptedPrompt([link, '1', dangerous, 'CONFIRMAR'])
+    // Lowercase and padded with whitespace — FIX2: "confirmar", "CONFIRMAR" and "Confirmar "
+    // must all work, but this must never accept "sí"/"s"/"y" (a separate test below covers that).
+    const prompt = scriptedPrompt([link, '1', dangerous, '  confirmar  '])
     await runSetup({ ...base, responderHome, prompt, run: runner })
     await expect(access(join(responderHome, 'settings.json'))).resolves.toBeUndefined()
+  })
+
+  it('retries a wrong confirmation and then proceeds once a later attempt matches (case-insensitively)', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('dev', 'Dev Ejemplo')
+    const dangerous = join(root, 'repo-de-trabajo-3')
+    await mkdir(join(dangerous, '.git'), { recursive: true })
+    const responderHome = join(root, 'responder-3')
+    const { run: runner } = trackingRunner()
+    const prompt = scriptedPrompt([link, '1', dangerous, 'no gracias', 'Confirmar'])
+    await runSetup({ ...base, responderHome, prompt, run: runner })
+    await expect(access(join(responderHome, 'settings.json'))).resolves.toBeUndefined()
+  })
+
+  it('never accepts "sí", "s" or "y" as the confirmation word — only the word itself', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('dev', 'Dev Ejemplo')
+    const dangerous = join(root, 'repo-de-trabajo-4')
+    await mkdir(join(dangerous, '.git'), { recursive: true })
+    const { run: runner, calls } = trackingRunner()
+    const prompt = scriptedPrompt([link, '1', dangerous, 'sí', 's', 'y'])
+    await expect(runSetup({ ...base, prompt, run: runner })).rejects.toThrow(/CONFIRMAR/)
+    expect(calls).toEqual([])
   })
 })
 
@@ -219,6 +253,81 @@ describe('agentbridge setup — happy path, asking', () => {
     const text = base.out.lines.join('\n')
     expect(text).toContain('claude mcp add agentbridge')
     expect(text).toContain('agentbridge ask')
+  })
+})
+
+describe('agentbridge setup — re-asks instead of aborting on a mistyped answer', () => {
+  it('re-asks the role question on an unrecognized answer instead of ending the run', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('ana', 'Ana')
+    const { run: runner, calls } = trackingRunner()
+    const prompt = scriptedPrompt([link, 'que', '2', 'n'])
+    await runSetup({ ...base, prompt, run: runner })
+    const text = base.out.lines.join('\n')
+    expect(text).toContain('No entendí "que"')
+    expect(text).toContain('Escribe 1, 2 o 3')
+    expect(calls).toEqual([])
+  })
+
+  it('gives up with the usual Spanish error after 3 unrecognized role answers', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('ana', 'Ana')
+    const { run: runner } = trackingRunner()
+    const prompt = scriptedPrompt([link, 'que', 'como', 'mande'])
+    await expect(runSetup({ ...base, prompt, run: runner })).rejects.toThrow(/1, 2 o 3/)
+  })
+
+  it('re-asks the MCP yes/no question on an unrecognized answer instead of ending the run', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('ana', 'Ana')
+    const { run: runner, calls } = trackingRunner()
+    const prompt = scriptedPrompt([link, '2', 'tal vez', 'n'])
+    await runSetup({ ...base, prompt, run: runner })
+    const text = base.out.lines.join('\n')
+    expect(text).toContain('No entendí "tal vez"')
+    expect(calls).toEqual([])
+  })
+
+  it('re-asks the enrollment-link question when the answer is empty instead of ending the run', async () => {
+    const link = await createEnrollLink('dev', 'Dev Ejemplo')
+    const base = await newBaseContext()
+    const { run: runner } = trackingRunner()
+    const prompt = scriptedPrompt(['', link, '2', 'n'])
+    await runSetup({ ...base, prompt, run: runner })
+    const text = base.out.lines.join('\n')
+    expect(text).toContain('No escribiste nada')
+    expect(text).toContain('Dev Ejemplo')
+  })
+})
+
+describe('agentbridge setup — EOF safety (a stream that runs out is never retried)', () => {
+  it('aborts immediately, instead of spinning, when the answers run out before the flow needs them', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('dev', 'Dev Ejemplo')
+    const { run: runner } = trackingRunner()
+    // Only the identity question is answered. The role question right after it has nothing
+    // left in the scripted queue — scriptedPrompt throws PromptEOF for that, exactly as a real
+    // closed/exhausted stdin would. A naive retry loop would treat "no more input" the same as
+    // "invalid input" and keep re-asking (spinning, since there is never anything left to
+    // read); this must instead abort right away with the same message a non-interactive run
+    // gets, and never touch the retry budget.
+    const prompt = scriptedPrompt([link])
+    const start = Date.now()
+    await expect(runSetup({ ...base, prompt, run: runner })).rejects.toThrow(/terminal interactiva/i)
+    expect(Date.now() - start).toBeLessThan(2000)
+  })
+
+  it('also aborts immediately when the stream runs out mid-retry, not just before the first attempt', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('dev', 'Dev Ejemplo')
+    const { run: runner } = trackingRunner()
+    // One invalid role answer uses up a real retry attempt; the stream then ends before a
+    // second one is ever given. Must still abort as EOF, not count the exhaustion itself as a
+    // second invalid answer.
+    const prompt = scriptedPrompt([link, 'que'])
+    const start = Date.now()
+    await expect(runSetup({ ...base, prompt, run: runner })).rejects.toThrow(/terminal interactiva/i)
+    expect(Date.now() - start).toBeLessThan(2000)
   })
 })
 
