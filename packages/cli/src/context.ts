@@ -51,9 +51,32 @@ export class PromptEOF extends Error {
 // Node's own documented usage of `.question()`.
 let sharedPromptInterface: ReturnType<typeof createInterface> | null = null
 
+// Set once, permanently, the moment the interface actually closes — independent of whether a
+// question happens to be in flight at that instant. An earlier version of this file only ever
+// listened for 'close' while a `.question()` call was outstanding (attached right before
+// calling it, detached right after). That misses the gap BETWEEN two questions: stdin can close
+// while nothing is currently being asked — e.g. partway through a multi-second orchestrated
+// step like `claude plugin install`, which runs between two prompts — and readline's own
+// `.question()` throws its own raw English `ERR_USE_AFTER_CLOSE` the very next time it's called
+// on an already-closed interface. Reproduced for real: Ctrl-D during that install step surfaced
+// as "Error inesperado: readline was closed" at exit 2. Checking this flag before ever calling
+// `.question()` again is what lets readlinePrompt refuse in Spanish instead.
+let promptInterfaceClosed = false
+
+function ensurePromptInterface(): ReturnType<typeof createInterface> {
+  if (!sharedPromptInterface) {
+    const rl = createInterface({ input: process.stdin, output: process.stdout })
+    rl.on('close', () => {
+      promptInterfaceClosed = true
+    })
+    sharedPromptInterface = rl
+  }
+  return sharedPromptInterface
+}
+
 export const readlinePrompt: Prompt = (question) => {
-  sharedPromptInterface ??= createInterface({ input: process.stdin, output: process.stdout })
-  const rl = sharedPromptInterface
+  if (promptInterfaceClosed) return Promise.reject(new PromptEOF())
+  const rl = ensurePromptInterface()
   // Verified against the real readline/promises implementation: `.question()`'s own promise
   // never settles — neither resolves nor rejects — if the input stream ends before it is
   // answered. Only the interface's own 'close' event fires. Without racing the two, a closed
@@ -62,16 +85,40 @@ export const readlinePrompt: Prompt = (question) => {
   // nothing else is keeping the event loop alive, silently skipping every bit of Spanish error
   // handling downstream instead of failing cleanly through it.
   return new Promise<string>((resolvePromise, reject) => {
-    const onClose = () => reject(new PromptEOF())
+    let settled = false
+    const onClose = () => {
+      // Deferred by one microtask rather than rejecting synchronously: `.question()`'s own
+      // resolution (a real, already-typed answer) and this 'close' handler can both be
+      // triggered from the same underlying stream event — an answer immediately followed by
+      // Ctrl-D is the realistic shape. `.question()` settling is itself only ever observed
+      // through a Promise `.then()`, i.e. a microtask; queueing this rejection as a microtask
+      // too, instead of firing it immediately and synchronously, lets an already-in-flight
+      // `.then()` — queued first, if the answer's own resolution happened first — run first and
+      // settle this promise with the real answer. By the time this deferred rejection actually
+      // runs, `settled` already being true makes it a no-op instead of discarding a valid last
+      // answer for a spurious EOF.
+      queueMicrotask(() => {
+        if (settled) return
+        settled = true
+        reject(new PromptEOF())
+      })
+    }
     rl.once('close', onClose)
     rl.question(question).then(
       (answer) => {
         rl.off('close', onClose)
+        if (settled) return
+        settled = true
         resolvePromise(answer)
       },
-      (err: unknown) => {
+      () => {
         rl.off('close', onClose)
-        reject(err)
+        if (settled) return
+        settled = true
+        // Any rejection from readline's own `.question()` — a stale/already-closed interface's
+        // ERR_USE_AFTER_CLOSE included — reads as EOF to this function's callers: there is no
+        // answer, and this must never let a raw English Node error escape.
+        reject(new PromptEOF())
       },
     )
   })
