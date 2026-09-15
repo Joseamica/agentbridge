@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify'
-import { access, mkdir, mkdtemp, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type pg from 'pg'
@@ -126,8 +126,33 @@ describe('agentbridge setup — dangerous shared folder', () => {
     const base = await newBaseContext()
     const link = await createEnrollLink('dev', 'Dev Ejemplo')
     const { run: runner, calls } = trackingRunner()
-    const prompt = scriptedPrompt([link, '1', homedir()])
-    await expect(runSetup({ ...base, prompt, run: runner })).rejects.toThrow(/carpeta de usuario|home/i)
+    // '' after the path confirms "yes, use the resolved path shown" (chooseShareDir's own
+    // confirm-the-resolved-path step) — the isHome hard refusal fires right after that, inside
+    // assessShareDir, so no CONFIRMAR prompt is ever reached.
+    const prompt = scriptedPrompt([link, '1', homedir(), ''])
+    await expect(runSetup({ ...base, prompt, run: runner })).rejects.toThrow(/es tu carpeta de usuario/i)
+    expect(calls).toEqual([])
+  })
+
+  it('refuses the caller’s own AgentBridge identity directory as the shared folder outright (C3)', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('dev', 'Dev Ejemplo')
+    const { run: runner, calls } = trackingRunner()
+    // base.home IS ctx.home (the identity established in step 1) — answering with it must be
+    // refused before setupResponder ever runs, the same severity as the home-directory case: a
+    // crafted question could read config.json (the device token) straight out of the fence.
+    const prompt = scriptedPrompt([link, '1', base.home, ''])
+    await expect(runSetup({ ...base, prompt, run: runner })).rejects.toThrow(/token del dispositivo/i)
+    expect(calls).toEqual([])
+  })
+
+  it('refuses the responder’s own dedicated-profile directory as the shared folder outright (C3)', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('dev', 'Dev Ejemplo')
+    const responderHome = join(root, 'responder-c3')
+    const { run: runner, calls } = trackingRunner()
+    const prompt = scriptedPrompt([link, '1', responderHome, ''])
+    await expect(runSetup({ ...base, responderHome, prompt, run: runner })).rejects.toThrow(/token del dispositivo/i)
     expect(calls).toEqual([])
   })
 
@@ -140,7 +165,7 @@ describe('agentbridge setup — dangerous shared folder', () => {
     // Three wrong confirmation attempts, none of them "CONFIRMAR" — FIX1 means each one gets a
     // fresh chance instead of ending the run on the first, and only running out at the third
     // attempt ends it, with the CliError this always threw.
-    const prompt = scriptedPrompt([link, '1', dangerous, 'no gracias', 'tampoco', 'de plano no'])
+    const prompt = scriptedPrompt([link, '1', dangerous, '', 'no gracias', 'tampoco', 'de plano no'])
     await expect(runSetup({ ...base, prompt, run: runner })).rejects.toThrow(/CONFIRMAR/)
     const text = base.out.lines.join('\n')
     expect(text).toContain('No entendí "no gracias"')
@@ -157,7 +182,7 @@ describe('agentbridge setup — dangerous shared folder', () => {
     const { run: runner } = trackingRunner()
     // Lowercase and padded with whitespace — FIX2: "confirmar", "CONFIRMAR" and "Confirmar "
     // must all work, but this must never accept "sí"/"s"/"y" (a separate test below covers that).
-    const prompt = scriptedPrompt([link, '1', dangerous, '  confirmar  '])
+    const prompt = scriptedPrompt([link, '1', dangerous, '', '  confirmar  '])
     await runSetup({ ...base, responderHome, prompt, run: runner })
     await expect(access(join(responderHome, 'settings.json'))).resolves.toBeUndefined()
   })
@@ -169,7 +194,7 @@ describe('agentbridge setup — dangerous shared folder', () => {
     await mkdir(join(dangerous, '.git'), { recursive: true })
     const responderHome = join(root, 'responder-3')
     const { run: runner } = trackingRunner()
-    const prompt = scriptedPrompt([link, '1', dangerous, 'no gracias', 'Confirmar'])
+    const prompt = scriptedPrompt([link, '1', dangerous, '', 'no gracias', 'Confirmar'])
     await runSetup({ ...base, responderHome, prompt, run: runner })
     await expect(access(join(responderHome, 'settings.json'))).resolves.toBeUndefined()
   })
@@ -180,9 +205,114 @@ describe('agentbridge setup — dangerous shared folder', () => {
     const dangerous = join(root, 'repo-de-trabajo-4')
     await mkdir(join(dangerous, '.git'), { recursive: true })
     const { run: runner, calls } = trackingRunner()
-    const prompt = scriptedPrompt([link, '1', dangerous, 'sí', 's', 'y'])
+    const prompt = scriptedPrompt([link, '1', dangerous, '', 'sí', 's', 'y'])
     await expect(runSetup({ ...base, prompt, run: runner })).rejects.toThrow(/CONFIRMAR/)
     expect(calls).toEqual([])
+  })
+
+  it('detects a nested .git two levels deep, not just at the top (C1)', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('dev', 'Dev Ejemplo')
+    const shareDir = join(root, 'proyectos')
+    await mkdir(join(shareDir, 'sub', 'project', '.git'), { recursive: true })
+    const responderHome = join(root, 'responder-c1-git')
+    const { run: runner } = trackingRunner()
+    // '' confirms the resolved path; 'CONFIRMAR' accepts the danger warning this test is
+    // actually about — a bare top-level readdir would have found nothing here at all and
+    // proceeded with zero warning.
+    const prompt = scriptedPrompt([link, '1', shareDir, '', 'CONFIRMAR'])
+    await runSetup({ ...base, responderHome, prompt, run: runner })
+    const text = base.out.lines.join('\n')
+    expect(text).toContain('repositorio de git')
+    expect(text).toContain(join('sub', 'project', '.git'))
+    await expect(access(join(responderHome, 'settings.json'))).resolves.toBeUndefined()
+  })
+
+  it('detects a nested credential-looking file two levels deep, not just at the top (C1)', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('dev', 'Dev Ejemplo')
+    const shareDir = join(root, 'proyectos-2')
+    await mkdir(join(shareDir, 'sub', 'config'), { recursive: true })
+    await writeFile(join(shareDir, 'sub', 'config', '.env'), 'AWS_SECRET=xyz\n')
+    const responderHome = join(root, 'responder-c1-env')
+    const { run: runner } = trackingRunner()
+    const prompt = scriptedPrompt([link, '1', shareDir, '', 'CONFIRMAR'])
+    await runSetup({ ...base, responderHome, prompt, run: runner })
+    const text = base.out.lines.join('\n')
+    expect(text).toContain('parecen credenciales')
+    expect(text).toContain(join('sub', 'config', '.env'))
+    await expect(access(join(responderHome, 'settings.json'))).resolves.toBeUndefined()
+  })
+
+  it('does not descend into node_modules while scanning (C1)', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('dev', 'Dev Ejemplo')
+    const shareDir = join(root, 'proyectos-3')
+    // A .git buried inside node_modules (a real, if odd, occurrence with vendored packages)
+    // must not be treated as this folder's own working repo.
+    await mkdir(join(shareDir, 'node_modules', 'some-pkg', '.git'), { recursive: true })
+    await writeFile(join(shareDir, 'readme.txt'), 'hola\n')
+    const responderHome = join(root, 'responder-nm')
+    const { run: runner } = trackingRunner()
+    const prompt = scriptedPrompt([link, '1', shareDir, ''])
+    await runSetup({ ...base, responderHome, prompt, run: runner })
+    await expect(access(join(responderHome, 'settings.json'))).resolves.toBeUndefined()
+  })
+
+  it('refuses an existing plain file at the chosen path instead of crashing (I5)', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('dev', 'Dev Ejemplo')
+    const notAFolder = join(root, 'ya-es-un-archivo')
+    await writeFile(notAFolder, 'contenido\n')
+    const { run: runner, calls } = trackingRunner()
+    const prompt = scriptedPrompt([link, '1', notAFolder, ''])
+    await expect(runSetup({ ...base, prompt, run: runner })).rejects.toThrow(/no es una carpeta/i)
+    expect(calls).toEqual([])
+  })
+
+  it('refuses a dangling symlink at the chosen path instead of crashing (I5)', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('dev', 'Dev Ejemplo')
+    const brokenLink = join(root, 'enlace-roto')
+    await symlink(join(root, 'no-existe-nada-aqui'), brokenLink)
+    const { run: runner, calls } = trackingRunner()
+    const prompt = scriptedPrompt([link, '1', brokenLink, ''])
+    await expect(runSetup({ ...base, prompt, run: runner })).rejects.toThrow(/enlace roto/i)
+    expect(calls).toEqual([])
+  })
+
+  it('expands a leading ~ instead of creating a literal "~" folder under the cwd (I6)', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('dev', 'Dev Ejemplo')
+    const responderHome = join(root, 'responder-tilde')
+    const { run: runner } = trackingRunner()
+    // ~/AgentBridge/compartido is the exact example the prompt and every doc show. Answering
+    // with the literal spelling must resolve against the real home directory, not `<cwd>/~/...`.
+    const rel = `AgentBridge/ab-tilde-test-${Date.now()}`
+    const expected = join(homedir(), rel)
+    const prompt = scriptedPrompt([link, '1', `~/${rel}`, ''])
+    await runSetup({ ...base, responderHome, prompt, run: runner })
+    const text = base.out.lines.join('\n')
+    expect(text).toContain(`Voy a usar esta carpeta: ${expected}`)
+    await expect(access(expected)).resolves.toBeUndefined()
+    await rm(expected, { recursive: true, force: true })
+  })
+
+  it('shows the resolved absolute path and re-asks for a different folder when the person says no (I6)', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('dev', 'Dev Ejemplo')
+    const firstTry = join(root, 'primera-opcion')
+    const secondTry = join(root, 'segunda-opcion')
+    const responderHome = join(root, 'responder-retry-folder')
+    const { run: runner } = trackingRunner()
+    const prompt = scriptedPrompt([link, '1', firstTry, 'n', secondTry, ''])
+    await runSetup({ ...base, responderHome, prompt, run: runner })
+    const text = base.out.lines.join('\n')
+    expect(text).toContain(`Voy a usar esta carpeta: ${firstTry}`)
+    expect(text).toContain('Bien, dime otra carpeta.')
+    expect(text).toContain(`Voy a usar esta carpeta: ${secondTry}`)
+    await expect(access(join(responderHome, 'settings.json'))).resolves.toBeUndefined()
+    await expect(access(firstTry)).rejects.toThrow()
   })
 })
 
@@ -193,7 +323,7 @@ describe('agentbridge setup — happy path, answering', () => {
     const shareDir = join(root, 'compartido')
     const responderHome = join(root, 'responder-happy')
     const { run: runner, calls } = trackingRunner()
-    const prompt = scriptedPrompt([link, '1', shareDir])
+    const prompt = scriptedPrompt([link, '1', shareDir, ''])
 
     await runSetup({ ...base, responderHome, prompt, run: runner })
 
@@ -220,6 +350,92 @@ describe('agentbridge setup — happy path, answering', () => {
     await expect(access(join(responderHome, 'settings.json'))).resolves.toBeUndefined()
     expect(calls.some((c) => c.args.join(' ').includes('plugin marketplace add'))).toBe(true)
   })
+
+  it('copies the very same device credential into the responder home so it can actually connect (C2)', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('dev', 'Dev Ejemplo')
+    const shareDir = join(root, 'compartido-c2')
+    const responderHome = join(root, 'responder-c2')
+    const { run: runner } = trackingRunner()
+    const prompt = scriptedPrompt([link, '1', shareDir, ''])
+
+    await runSetup({ ...base, responderHome, prompt, run: runner })
+
+    // ctx.home (base.home) is where step 1's enroll actually wrote — the identity's canonical
+    // home. The dedicated responder session always runs with AGENTBRIDGE_HOME=<responderHome>
+    // (see setup-responder.ts's startScript()), so unless the SAME device token also exists
+    // there, the channel plugin's own entry point (packages/channel/src/main.ts) finds no
+    // config and exits 1 — the exact bug this fixes. One enrollment link, one device token,
+    // valid from both directories.
+    const identityConfig = JSON.parse(await readFile(join(base.home, 'config.json'), 'utf8'))
+    const responderConfig = JSON.parse(await readFile(join(responderHome, 'config.json'), 'utf8'))
+    expect(responderConfig).toEqual(identityConfig)
+    expect(responderConfig.deviceToken).toBeTruthy()
+    const text = base.out.lines.join('\n')
+    expect(text).toContain('Copié tu credencial al perfil dedicado')
+  })
+
+  it('does not overwrite a responder home that already has a different identity (C2)', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('dev', 'Dev Ejemplo')
+    const shareDir = join(root, 'compartido-c2b')
+    const responderHome = join(root, 'responder-c2b')
+    const otherLink = await createEnrollLink('otra', 'Otra Persona')
+    expect(await run(['enroll', otherLink], { home: responderHome, out: memoryOutput(), env: {} })).toBe(0)
+    const before = await readFile(join(responderHome, 'config.json'), 'utf8')
+
+    const { run: runner } = trackingRunner()
+    const prompt = scriptedPrompt([link, '1', shareDir, ''])
+    await runSetup({ ...base, responderHome, prompt, run: runner })
+
+    const after = await readFile(join(responderHome, 'config.json'), 'utf8')
+    expect(after).toBe(before)
+    const text = base.out.lines.join('\n')
+    expect(text).toContain('ya tenía otra identidad')
+  })
+
+  it('the responder actually connects to a real relay after a guided enrollment, instead of exiting 1 (C2, live)', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('dev', 'Dev Ejemplo')
+    const shareDir = join(root, 'compartido-live')
+    const responderHome = join(root, 'responder-live')
+    const { run: runner } = trackingRunner()
+    const prompt = scriptedPrompt([link, '1', shareDir, ''])
+    await runSetup({ ...base, responderHome, prompt, run: runner })
+
+    // Drives the channel plugin's own real entry point — exactly what start.sh's `claude
+    // --dangerously-load-development-channels plugin:agentbridge@agentbridge-local` spawns as
+    // its MCP server subprocess — with AGENTBRIDGE_HOME pointed at the responder home setup
+    // just prepared, against the SAME real relay+Postgres this test suite already runs
+    // against. No real `claude` binary involved: this only proves the channel process itself
+    // finds its config and completes a real WebSocket handshake, which is exactly what C2 was
+    // about (packages/channel/src/main.ts exits 1 with "no config" otherwise). Resolved from
+    // the repo root (vitest's own cwd), never from `root` (a throwaway tmpdir).
+    const { spawn } = await import('node:child_process')
+    const channelEntry = join(process.cwd(), 'packages/channel/src/main.ts')
+    const child = spawn(process.execPath, ['--import', 'tsx', channelEntry], {
+      env: { ...process.env, AGENTBRIDGE_HOME: responderHome, AGENTBRIDGE_RELAY_URL: relayUrl },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stderr = ''
+    child.stderr.on('data', (d) => (stderr += String(d)))
+    const connected = await new Promise<boolean>((resolvePromise) => {
+      const timer = setTimeout(() => resolvePromise(false), 8000)
+      child.stderr.on('data', () => {
+        if (/connected to/.test(stderr)) {
+          clearTimeout(timer)
+          resolvePromise(true)
+        }
+      })
+      child.on('exit', () => {
+        clearTimeout(timer)
+        resolvePromise(/connected to/.test(stderr))
+      })
+    })
+    child.kill()
+    expect(stderr).not.toContain('no config')
+    expect(connected).toBe(true)
+  }, 15000)
 })
 
 describe('agentbridge setup — happy path, asking', () => {
@@ -239,6 +455,10 @@ describe('agentbridge setup — happy path, asking', () => {
     expect(text).toMatch(/reinicia|reinici/i)
     expect(text).toContain('agentbridge ask')
     expect(text).toContain('Pendiente')
+    // I7: the asker is told to redeem an invite — without it they have no contacts and every
+    // `ask` fails.
+    expect(text).toContain('agentbridge accept')
+    expect(text).toContain('Acepta la invitación')
   })
 
   it('still explains how to ask, and names the manual command, when the person declines registering the MCP server', async () => {
@@ -253,6 +473,57 @@ describe('agentbridge setup — happy path, asking', () => {
     const text = base.out.lines.join('\n')
     expect(text).toContain('claude mcp add agentbridge')
     expect(text).toContain('agentbridge ask')
+    expect(text).toContain('agentbridge accept')
+  })
+
+  it('treats an unrecognized MCP answer, exhausted 3 times, as "no" and still prints the full summary (I8)', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('ana', 'Ana')
+    const { run: runner, calls } = trackingRunner()
+    const prompt = scriptedPrompt([link, '2', 'tal vez', 'quizás', 'ni idea'])
+    // Must NOT throw — exhausting the MCP yes/no must not discard the verdict.
+    await runSetup({ ...base, prompt, run: runner })
+    expect(calls).toEqual([])
+    const text = base.out.lines.join('\n')
+    expect(text).toContain('== Resumen ==')
+    expect(text).toContain('claude mcp add agentbridge')
+  })
+
+  it('does not discard the whole run’s verdict when both roles are chosen and only MCP registration is unclear (I8, ambas)', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('ana', 'Ana')
+    const responderHome = join(root, 'responder-i8-both')
+    const shareDir = join(root, 'compartido-i8-both')
+    const { run: runner } = trackingRunner()
+    const prompt = scriptedPrompt([link, '3', shareDir, '', 'tal vez', 'quizás', 'ni idea'])
+    await runSetup({ ...base, responderHome, prompt, run: runner })
+    const text = base.out.lines.join('\n')
+    // The responder side's own success must still show up in the verdict.
+    expect(text).toContain('Perfil dedicado preparado en')
+    expect(text).toContain('== Resumen ==')
+  })
+})
+
+describe('agentbridge setup — the verdict reflects what doctor actually found', () => {
+  it('lists every failing doctor check as pending, not just whether the profile logged in', async () => {
+    const base = await newBaseContext()
+    const link = await createEnrollLink('dev', 'Dev Ejemplo')
+    const shareDir = join(root, 'compartido-verdict')
+    const responderHome = join(root, 'responder-verdict')
+    const { run: runner } = trackingRunner()
+    const prompt = scriptedPrompt([link, '1', shareDir, ''])
+    await runSetup({ ...base, responderHome, prompt, run: runner })
+    const text = base.out.lines.join('\n')
+    const pendingSection = text.split('Pendiente:')[1] ?? ''
+    expect(pendingSection).toContain('Sesión iniciada en el perfil dedicado')
+    // Generic, not tied to which specific check fails: every doctor line printed as [falta]
+    // above must also be echoed verbatim into Pendiente — the "Also" bug was that only the
+    // login check made it there, discarding the other nine regardless of what they found.
+    const doctorFailingNames = text
+      .split('\n')
+      .filter((l) => l.startsWith('[falta] '))
+      .map((l) => l.slice('[falta] '.length).split(':')[0]!.trim())
+    for (const name of doctorFailingNames) expect(pendingSection).toContain(name)
   })
 })
 

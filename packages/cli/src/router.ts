@@ -13,7 +13,11 @@ export type Command = (argv: string[], ctx: CliContext) => Promise<void>
 export const USAGE = `AgentBridge — pregúntale al agente de otra persona.
 
 Para empezar (recomendado):
-  agentbridge setup          (te hace las preguntas necesarias y deja todo listo)
+  agentbridge setup [--repo <carpeta>] [--responder-home <carpeta>]
+                              (te hace las preguntas necesarias y deja todo listo; las dos
+                               opciones son solo para quien corre agentbridge desde el código
+                               fuente — --responder-home es la carpeta del perfil dedicado del
+                               respondedor, no la de tu identidad)
 
 Alta y permisos:
   agentbridge admin enroll-link --handle <h> --name <nombre> --relay <url> --admin-token <token>
