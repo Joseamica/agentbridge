@@ -124,19 +124,18 @@ Ana is going to ask; Dev is going to answer. Swap the names for your own.
 
 ### On both machines
 
-Node >= 22.4 is required. Dev also needs Claude Code; Ana only needs it if she wants to ask from
-inside her agent rather than from the terminal.
+Node >= 22.4 is required, to run `npx` — nothing else. Dev also needs Claude Code; Ana only needs
+it if she wants to ask from inside her agent rather than from the terminal.
+
+Nothing to clone, build, or alias. Every command below runs through `npx`, which fetches
+AgentBridge the first time it's used and reuses it after that:
 
 ```bash
-git clone https://github.com/Joseamica/agentbridge.git
-cd agentbridge
-npm ci
-npm run build
-alias ab="node $PWD/packages/cli/dist/main.js"
+npx -y agentbridge@latest --help
 ```
 
-Heads up on that alias: `ab` is ApacheBench on macOS, so without it you get a benchmarking tool's
-help text instead of a "command not found", which is confusing the first time.
+(Hacking on AgentBridge itself instead of installing it? See
+[Running the CLI from a local clone](#running-the-cli-from-a-local-clone) below.)
 
 ### Once, on the relay operator's machine
 
@@ -151,8 +150,8 @@ it:
 read -rs AGENTBRIDGE_ADMIN_TOKEN && export AGENTBRIDGE_ADMIN_TOKEN
 export AGENTBRIDGE_RELAY_URL=https://your-relay.example.com
 
-ab admin enroll-link --handle dev --name "Dev"
-ab admin enroll-link --handle ana --name "Ana"
+npx -y agentbridge@latest admin enroll-link --handle dev --name "Dev"
+npx -y agentbridge@latest admin enroll-link --handle ana --name "Ana"
 ```
 
 Send each person their own link, over any channel you already use.
@@ -162,8 +161,8 @@ Send each person their own link, over any channel you already use.
 **1. Redeem the link.**
 
 ```bash
-ab enroll "<Dev's link>"
-ab whoami
+npx -y agentbridge@latest enroll "<Dev's link>"
+npx -y agentbridge@latest whoami
 ```
 
 **2. Build the room.** Create a folder and copy into it only what Dev is willing to share. A
@@ -176,7 +175,7 @@ mkdir -p ~/AgentBridge/shared
 **3. Set up the locked session.**
 
 ```bash
-ab setup-responder --share ~/AgentBridge/shared --repo "$PWD"
+npx -y agentbridge@latest setup-responder --share ~/AgentBridge/shared
 ```
 
 This creates a dedicated Claude Code profile, writes the restricted permissions, generates a
@@ -193,7 +192,7 @@ keep it in its own terminal window, or under tmux.
 **5. Check it actually works.**
 
 ```bash
-ab doctor --home ~/.agentbridge-responder --share ~/AgentBridge/shared --repo "$PWD"
+npx -y agentbridge@latest doctor --home ~/.agentbridge-responder --share ~/AgentBridge/shared
 ```
 
 Every line should read `[ok]`. This is the step that tells you the fence is real, the plugin is
@@ -202,39 +201,39 @@ installed, and nothing dangerous landed in the shared folder. Run it before you 
 **6. Let Ana in.**
 
 ```bash
-ab invite
+npx -y agentbridge@latest invite
 ```
 
 Send Ana the link it prints. That is what grants her permission to ask. Dev can undo it at any
-time with `ab revoke ana`.
+time with `npx -y agentbridge@latest revoke ana`.
 
 ### On Ana's machine — the person who asks
 
 **1. Redeem her own link.**
 
 ```bash
-ab enroll "<Ana's link>"
+npx -y agentbridge@latest enroll "<Ana's link>"
 ```
 
 **2. Accept Dev's invite.**
 
 ```bash
-ab accept "<Dev's invite link>"
-ab contacts
+npx -y agentbridge@latest accept "<Dev's invite link>"
+npx -y agentbridge@latest contacts
 ```
 
-`ab contacts` should now list Dev under the people she can ask.
+`contacts` should now list Dev under the people she can ask.
 
 **3. Ask.** From the terminal:
 
 ```bash
-ab ask dev "which timeout applies to card reads?" --wait 120
+npx -y agentbridge@latest ask dev "which timeout applies to card reads?" --wait 120
 ```
 
 Or — the actual point of this thing — from inside her own Claude Code:
 
 ```bash
-claude mcp add agentbridge --scope user -- node "$PWD/packages/cli/dist/main.js" mcp
+claude mcp add agentbridge --scope user -- npx -y agentbridge@latest mcp
 ```
 
 Restart any session that was already open, then just tell her agent to ask Dev. It gets
@@ -303,6 +302,26 @@ npm run db:down
 ```
 
 Tests only ever talk to the Docker container on port 55432.
+
+### Running the CLI from a local clone
+
+The Quickstart above installs nothing and runs everything through `npx`. If you're hacking on
+AgentBridge itself instead, run the CLI straight out of your clone after building it:
+
+```bash
+git clone https://github.com/Joseamica/agentbridge.git
+cd agentbridge
+npm ci
+npm run build
+alias ab="node $PWD/packages/cli/dist/main.js"
+```
+
+Heads up on that alias: `ab` is ApacheBench on macOS, so a fresh terminal that hasn't re-run it
+gives you a benchmarking tool's help text instead of "command not found" — confusing the first
+time. That collision, and the alias itself, only exist on this from-source path; the published
+`agentbridge` command needs neither. `setup-responder` and `doctor` also still take an explicit
+`--repo <dir>` here if you ever want to point them at a checkout other than the one they're
+running from.
 
 ## Status
 

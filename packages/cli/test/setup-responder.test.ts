@@ -1,15 +1,18 @@
 import { access, chmod, mkdir, mkdtemp, readFile, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { beforeEach, describe, expect, it } from 'vitest'
 import {
+  findPluginRoot,
   REPLY_TOOL_NAME,
+  repoDirFromBundleLocation,
   RESPONDER_DENY,
   responderSettings,
   setupResponder,
   type CommandRunner,
 } from '../src/commands/setup-responder'
-import { memoryOutput } from '../src/context'
+import { CliError, memoryOutput } from '../src/context'
 
 let root: string
 let repoDir: string
@@ -272,5 +275,74 @@ describe('setupResponder', () => {
         process.chdir(cwdBefore)
       }
     })
+  })
+})
+
+// --repo resolution: setupResponderCommand's default must find plugins/agentbridge/dist/server.js
+// from wherever the running bundle actually is, in both real layouts — a from-source checkout
+// (packages/cli/dist/main.js, three levels below the repo root) and an installed npm package
+// (bin/agentbridge.js, scripts/pack.mjs's own layout, two levels below the package root) —
+// rather than assuming either fixed depth, which is exactly what a reviewer flagged in the
+// previous fixed `'../../..'` version.
+describe('findPluginRoot', () => {
+  it('resolves the from-source layout: packages/cli/dist/main.js is three levels below the repo root', async () => {
+    const devDist = join(repoDir, 'packages/cli/dist')
+    await mkdir(devDist, { recursive: true })
+    await expect(findPluginRoot(devDist)).resolves.toBe(repoDir)
+  })
+
+  it('resolves the installed-package layout: bin/agentbridge.js is two levels below the package root', async () => {
+    const pkgRoot = join(root, 'installed', 'node_modules', 'agentbridge')
+    await mkdir(join(pkgRoot, 'plugins/agentbridge/dist'), { recursive: true })
+    await writeFile(join(pkgRoot, 'plugins/agentbridge/dist/server.js'), '// bundle')
+    const bin = join(pkgRoot, 'bin')
+    await mkdir(bin, { recursive: true })
+    await expect(findPluginRoot(bin)).resolves.toBe(pkgRoot)
+  })
+
+  it('returns null when no ancestor contains the plugin bundle, instead of walking forever', async () => {
+    const nowhere = join(root, 'sin-plugin', 'bin')
+    await mkdir(nowhere, { recursive: true })
+    await expect(findPluginRoot(nowhere)).resolves.toBeNull()
+  })
+
+  it('picks the nearest ancestor when more than one contains a bundle', async () => {
+    // An outer directory that also happens to look like a plugin root must not shadow the
+    // closer, more specific one — the walk stops at the first match going up.
+    const outer = join(root, 'outer')
+    await mkdir(join(outer, 'plugins/agentbridge/dist'), { recursive: true })
+    await writeFile(join(outer, 'plugins/agentbridge/dist/server.js'), '// outer bundle')
+    const innerRepo = join(outer, 'nested', 'repo')
+    await mkdir(join(innerRepo, 'plugins/agentbridge/dist'), { recursive: true })
+    await writeFile(join(innerRepo, 'plugins/agentbridge/dist/server.js'), '// inner bundle')
+    const start = join(innerRepo, 'packages/cli/dist')
+    await mkdir(start, { recursive: true })
+    await expect(findPluginRoot(start)).resolves.toBe(innerRepo)
+  })
+})
+
+describe('repoDirFromBundleLocation', () => {
+  it('resolves through a file:// URL for the from-source layout', async () => {
+    const mainJs = join(repoDir, 'packages/cli/dist/main.js')
+    await mkdir(dirname(mainJs), { recursive: true })
+    await expect(repoDirFromBundleLocation(pathToFileURL(mainJs).href)).resolves.toBe(repoDir)
+  })
+
+  it('resolves through a file:// URL for the installed-package layout', async () => {
+    const pkgRoot = join(root, 'installed2')
+    await mkdir(join(pkgRoot, 'plugins/agentbridge/dist'), { recursive: true })
+    await writeFile(join(pkgRoot, 'plugins/agentbridge/dist/server.js'), '// bundle')
+    const binJs = join(pkgRoot, 'bin/agentbridge.js')
+    await mkdir(dirname(binJs), { recursive: true })
+    await expect(repoDirFromBundleLocation(pathToFileURL(binJs).href)).resolves.toBe(pkgRoot)
+  })
+
+  it('throws a Spanish CliError naming the missing bundle, not a crash, when no --repo can be found', async () => {
+    const binJs = join(root, 'huerfano', 'bin', 'agentbridge.js')
+    await mkdir(dirname(binJs), { recursive: true })
+    const err = await repoDirFromBundleLocation(pathToFileURL(binJs).href).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(CliError)
+    expect((err as Error).message).toContain('plugins/agentbridge/dist/server.js')
+    expect((err as Error).message).toMatch(/--repo/)
   })
 })

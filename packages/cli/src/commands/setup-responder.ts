@@ -241,7 +241,41 @@ export async function setupResponder(o: {
   return { startScriptPath, claudeConfigDir, settingsPath }
 }
 
-const defaultRepoDir = () => resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
+// Where the plugin bundle actually lives, relative to whatever is currently running this
+// code — not a fixed number of `..` segments. Two real layouts have to resolve correctly:
+// - From source: this file compiles to packages/cli/dist/main.js, three levels below the
+//   repo root that holds plugins/agentbridge/dist/server.js.
+// - Installed from npm: scripts/pack.mjs assembles bin/agentbridge.js two levels below the
+//   published package's own root, which carries that same plugins/agentbridge/dist/server.js
+//   layout (see scripts/pack.mjs) so `claude plugin marketplace add <repoDir>` also has a
+//   .claude-plugin/marketplace.json to find there.
+// A reviewer already flagged the old fixed-depth version as bundle-layout dependent — this
+// walks up looking for the marker file itself instead of assuming either depth.
+export async function findPluginRoot(start: string): Promise<string | null> {
+  let dir = start
+  for (;;) {
+    if (await exists(join(dir, 'plugins/agentbridge/dist/server.js'))) return dir
+    const parent = dirname(dir)
+    if (parent === dir) return null
+    dir = parent
+  }
+}
+
+// `bundleUrl` is this module's own import.meta.url in production. Taking it as a parameter
+// (rather than reading import.meta.url directly in this function) is what lets tests exercise
+// both layouts — and the not-found error — without needing to fake this module's own location.
+export async function repoDirFromBundleLocation(bundleUrl: string): Promise<string> {
+  const start = dirname(fileURLToPath(bundleUrl))
+  const found = await findPluginRoot(start)
+  if (!found) {
+    throw new CliError(
+      `No encuentro plugins/agentbridge/dist/server.js cerca de ${start}. Si instalaste agentbridge con npm, reinstala el paquete: al bundle del plugin le falta algo. Si trabajas desde el código fuente del repositorio, ejecuta primero: npm run build. También puedes indicar la carpeta manualmente con --repo.`,
+    )
+  }
+  return found
+}
+
+const defaultRepoDir = () => repoDirFromBundleLocation(import.meta.url)
 
 export async function setupResponderCommand(argv: string[], ctx: CliContext): Promise<void> {
   const { values } = parseArgs({
@@ -258,7 +292,7 @@ export async function setupResponderCommand(argv: string[], ctx: CliContext): Pr
   await setupResponder({
     shareDir: values.share,
     home: values.home ?? join(homedir(), '.agentbridge-responder'),
-    repoDir: values.repo ?? defaultRepoDir(),
+    repoDir: values.repo ?? (await defaultRepoDir()),
     model: values.model,
     effort: values.effort,
     run: defaultRunner,

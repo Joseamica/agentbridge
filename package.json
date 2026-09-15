@@ -8,6 +8,7 @@
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json",
     "build": "node scripts/build.mjs",
+    "pack": "node scripts/pack.mjs",
     "db:up": "docker run -d --name agentbridge-pg -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=agentbridge_test -p 55432:5432 postgres:16",
     "db:down": "docker rm -f agentbridge-pg"
   },
