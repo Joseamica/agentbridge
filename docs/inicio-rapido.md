@@ -105,9 +105,15 @@ Mándale a cada quien su enlace, por donde ya se escriban normalmente.
 
 ## En la computadora de Dev, el que contesta
 
-`agentbridge setup` hace por ti los pasos 1, 3 y 5 de aquí abajo — con las mismas preguntas de
-seguridad sobre la carpeta compartida — y te dice qué falta. Esto es lo que hace, paso a paso, y
-cómo hacer cualquiera de ellos a mano.
+`agentbridge setup` llega al mismo resultado que los pasos 1, 3 y 5 de aquí abajo — pero no
+corriéndolos tal cual. Se da de alta en la identidad *por defecto* de esta computadora (no
+directamente en `~/.agentbridge-responder`) y luego copia esa misma credencial al perfil del
+respondedor, para que la sesión dedicada del paso 3 la encuentre igual. También corre las
+verificaciones de seguridad sobre la carpeta compartida y te dice qué falta. Por eso, **no hagas
+las dos cosas**: si ya usaste tu enlace a mano con el paso 1 de aquí abajo, correr `setup`
+después te va a pedir un enlace que ya no tienes, porque busca la identidad en la carpeta por
+defecto primero, no en `~/.agentbridge-responder`. Elige un solo camino. Lo que sigue es lo que
+`setup` hace por dentro, y cómo hacer cualquiera de esas partes a mano si prefieres saltártelo.
 
 **1. Darse de alta — en la carpeta del respondedor, no en la de siempre.**
 

@@ -185,9 +185,15 @@ Send each person their own link, over any channel you already use.
 
 ### On Dev's machine — the person who answers
 
-`agentbridge setup` does steps 1, 3 and 5 below for you — including the shared-folder safety
-checks — and tells you exactly what's left. This is what it runs, spelled out, and how to do any
-of it by hand.
+`agentbridge setup` reaches the same result as steps 1, 3 and 5 below — but not by running them
+as written. It enrolls into this device's *default* identity (not directly into
+`~/.agentbridge-responder`), then copies that same credential into the responder's profile for
+you, so step 3's dedicated session can still find it. It also runs the shared-folder safety
+checks and tells you exactly what's left. Because of that, **don't do both**: if you've already
+redeemed your link by hand with step 1 below, running `setup` afterward will ask you for a link
+you no longer have, since it looks for an identity at the default location first, not at
+`~/.agentbridge-responder`. Pick one path. What follows is what `setup` does under the hood, and
+how to do any of it by hand if you'd rather skip it.
 
 **1. Redeem the link — into the responder's own home, not the default one.**
 
