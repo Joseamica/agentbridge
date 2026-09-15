@@ -189,12 +189,19 @@ Send each person their own link, over any channel you already use.
 checks — and tells you exactly what's left. This is what it runs, spelled out, and how to do any
 of it by hand.
 
-**1. Redeem the link.**
+**1. Redeem the link — into the responder's own home, not the default one.**
 
 ```bash
-npx -y agentbridge@latest enroll "<Dev's link>"
-npx -y agentbridge@latest whoami
+AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y agentbridge@latest enroll "<Dev's link>"
+AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y agentbridge@latest whoami
 ```
+
+The dedicated session `start.sh` launches later always runs with
+`AGENTBRIDGE_HOME=~/.agentbridge-responder` (that is what keeps it from touching Dev's own
+everyday Claude Code identity). Enrolling anywhere else — the default `~/.agentbridge` included —
+leaves that session with no credential to read, and it exits immediately instead of connecting.
+Enrollment links are single-use, so getting this step wrong means going back to the relay operator
+for a brand-new one.
 
 **2. Build the room.** Create a folder and copy into it only what Dev is willing to share. A
 README, a config file, an architecture note. Not the working repo, and nothing with credentials.
@@ -206,12 +213,13 @@ mkdir -p ~/AgentBridge/shared
 **3. Set up the locked session.**
 
 ```bash
-npx -y agentbridge@latest setup-responder --share ~/AgentBridge/shared
+npx -y agentbridge@latest setup-responder --share ~/AgentBridge/shared --home ~/.agentbridge-responder
 ```
 
 This creates a dedicated Claude Code profile, writes the restricted permissions, generates a
 `start.sh`, and drops a persona `CLAUDE.md` into the shared folder. It refuses to run if the
-credential directory would land inside the shared folder.
+credential directory would land inside the shared folder. (`--home` here defaults to
+`~/.agentbridge-responder` already — it's spelled out so it visibly matches step 1.)
 
 **4. Log in once in that profile, then start it.** The session has to stay running to answer —
 keep it in its own terminal window, or under tmux.
@@ -232,11 +240,14 @@ installed, and nothing dangerous landed in the shared folder. Run it before you 
 **6. Let Ana in.**
 
 ```bash
-npx -y agentbridge@latest invite
+AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y agentbridge@latest invite
 ```
 
 Send Ana the link it prints. That is what grants her permission to ask. Dev can undo it at any
-time with `npx -y agentbridge@latest revoke ana`.
+time with `AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y agentbridge@latest revoke ana`. Every
+command Dev runs about this identity — `invite`, `revoke`, `contacts`, a later `whoami` — needs
+that same `AGENTBRIDGE_HOME`, since that is where step 1 put the credential; exporting it once for
+the whole terminal session avoids repeating it.
 
 ### On Ana's machine — the person who asks
 
@@ -289,7 +300,11 @@ Spanish quickstart at [`docs/inicio-rapido.md`](docs/inicio-rapido.md).
 
 ```
 Guided:
-  agentbridge setup          (interactive, in Spanish — orchestrates everything below)
+  agentbridge setup [--repo <dir>] [--responder-home <dir>]
+                              (interactive, in Spanish — orchestrates everything below;
+                               both flags are only for running from a source checkout —
+                               --responder-home is the responder's dedicated profile dir,
+                               not your own identity's)
 
 Enrollment and permissions:
   agentbridge admin enroll-link --handle <h> --name <name> --relay <url> --admin-token <token>
@@ -333,7 +348,7 @@ Correlation deliberately never depends on the model copying an identifier: the r
 ```bash
 npm ci
 npm run db:up      # Postgres 16 in Docker on port 55432
-npm test           # 204 tests
+npm test           # 227 tests
 npm run typecheck
 npm run build
 npm run db:down

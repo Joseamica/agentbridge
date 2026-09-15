@@ -109,12 +109,19 @@ Mándale a cada quien su enlace, por donde ya se escriban normalmente.
 seguridad sobre la carpeta compartida — y te dice qué falta. Esto es lo que hace, paso a paso, y
 cómo hacer cualquiera de ellos a mano.
 
-**1. Darse de alta.**
+**1. Darse de alta — en la carpeta del respondedor, no en la de siempre.**
 
 ```bash
-npx -y agentbridge@latest enroll "<el enlace de Dev>"
-npx -y agentbridge@latest whoami
+AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y agentbridge@latest enroll "<el enlace de Dev>"
+AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y agentbridge@latest whoami
 ```
+
+La sesión dedicada que vas a arrancar con `start.sh` siempre corre con
+`AGENTBRIDGE_HOME=~/.agentbridge-responder` (así se evita mezclarla con tu identidad normal de
+Claude Code). Si te das de alta en cualquier otro lado — incluida la carpeta por defecto,
+`~/.agentbridge` — esa sesión no va a encontrar ninguna credencial y se va a cerrar sola en vez de
+conectarse. Los enlaces de alta sirven una sola vez, así que si te equivocas aquí vas a necesitar
+pedirle uno nuevo a quien opera el relay.
 
 **2. Armar el cuarto.** Crea la carpeta y copia dentro **solo** lo que estés dispuesto a
 compartir: un README, una configuración, una nota de arquitectura. Copias, no el repo de trabajo,
@@ -127,12 +134,13 @@ mkdir -p ~/AgentBridge/compartido
 **3. Preparar la sesión cerrada.**
 
 ```bash
-npx -y agentbridge@latest setup-responder --share ~/AgentBridge/compartido
+npx -y agentbridge@latest setup-responder --share ~/AgentBridge/compartido --home ~/.agentbridge-responder
 ```
 
 Esto crea un perfil aparte de Claude Code, le escribe los permisos restringidos, genera un
 `start.sh` y deja un `CLAUDE.md` con la personalidad dentro de la carpeta compartida. Si la
-credencial fuera a quedar dentro de la carpeta compartida, se niega a continuar.
+credencial fuera a quedar dentro de la carpeta compartida, se niega a continuar. (`--home` ya usa
+`~/.agentbridge-responder` por defecto — se escribe aquí para que se vea igual que en el paso 1.)
 
 **4. Iniciar sesión una vez en ese perfil y arrancarlo.** La sesión tiene que quedarse corriendo
 para poder contestar: déjala en su propia ventana de terminal, o dentro de tmux.
@@ -154,11 +162,15 @@ de confiar en la instalación**, y vuelve a correrlo si algo se siente raro.
 **6. Darle permiso a Ana.**
 
 ```bash
-npx -y agentbridge@latest invite
+AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y agentbridge@latest invite
 ```
 
 Mándale a Ana el enlace que imprime. Eso es lo que le da permiso de preguntarte. Se lo puedes
-quitar cuando quieras con `npx -y agentbridge@latest revoke ana`.
+quitar cuando quieras con `AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y agentbridge@latest
+revoke ana`. Cualquier comando que corras después sobre esta identidad —`invite`, `revoke`,
+`contacts`, un `whoami` más adelante— necesita ese mismo `AGENTBRIDGE_HOME`, porque ahí es donde
+quedó la credencial desde el paso 1; expórtalo una vez para toda la terminal y te ahorras
+repetirlo.
 
 ## En la computadora de Ana, la que pregunta
 
