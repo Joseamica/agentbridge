@@ -120,6 +120,33 @@ queue for him.
 
 ## Quickstart
 
+### The guided way (recommended)
+
+On each machine, run one command and answer its questions — in Spanish, like everything else a
+human sees in this tool:
+
+```bash
+npx -y agentbridge@latest setup
+```
+
+It enrolls the device if it isn't already, asks whether you're going to answer questions, ask
+questions, or both, and — before it ever asks you to name a folder to share — explains in plain
+language what putting one there means: everything inside becomes readable by anyone you let ask
+you, including a stray `.env` or key file. It refuses your own home directory outright, and makes
+you type an explicit confirmation before using a folder that looks like a working repo or already
+has credential-shaped files in it. It never creates that folder silently. It finishes by telling
+you plainly what's ready, what's still pending, and the one command to run next.
+
+`setup` is a thin conductor: every step it takes is one of the commands documented below
+(`enroll`, `setup-responder`, `doctor`, `claude mcp add`) — it never reimplements their logic. If
+it can't run interactively (no TTY — a script, CI, a redirected pipe), it says so immediately and
+prints the equivalent commands instead of hanging.
+
+Read on if you want to understand exactly what each step does, run one by hand, automate it, or
+fix something `doctor` flagged.
+
+### Manual, step by step
+
 Ana is going to ask; Dev is going to answer. Swap the names for your own.
 
 ### On both machines
@@ -157,6 +184,10 @@ npx -y agentbridge@latest admin enroll-link --handle ana --name "Ana"
 Send each person their own link, over any channel you already use.
 
 ### On Dev's machine — the person who answers
+
+`agentbridge setup` does steps 1, 3 and 5 below for you — including the shared-folder safety
+checks — and tells you exactly what's left. This is what it runs, spelled out, and how to do any
+of it by hand.
 
 **1. Redeem the link.**
 
@@ -209,6 +240,10 @@ time with `npx -y agentbridge@latest revoke ana`.
 
 ### On Ana's machine — the person who asks
 
+`agentbridge setup` does step 1 and, if she asks it to, registers the MCP server from step 3 too
+— reminding her to restart Claude Code afterward. This is what it runs, spelled out, and how to
+do any of it by hand.
+
 **1. Redeem her own link.**
 
 ```bash
@@ -253,6 +288,9 @@ Spanish quickstart at [`docs/inicio-rapido.md`](docs/inicio-rapido.md).
 ## CLI reference
 
 ```
+Guided:
+  agentbridge setup          (interactive, in Spanish — orchestrates everything below)
+
 Enrollment and permissions:
   agentbridge admin enroll-link --handle <h> --name <name> --relay <url> --admin-token <token>
   agentbridge enroll <link> [--device <name>]
@@ -295,7 +333,7 @@ Correlation deliberately never depends on the model copying an identifier: the r
 ```bash
 npm ci
 npm run db:up      # Postgres 16 in Docker on port 55432
-npm test           # 187 tests
+npm test           # 204 tests
 npm run typecheck
 npm run build
 npm run db:down

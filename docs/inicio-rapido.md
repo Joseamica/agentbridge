@@ -38,6 +38,34 @@ cada sentido. Cualquiera de los dos puede quitarlo cuando quiera.
 
 En esta guía **Ana pregunta** y **Dev contesta**. Cambia los nombres por los de ustedes.
 
+## Lo más rápido: un solo comando
+
+En cada computadora, en vez de seguir la lista de pasos de más abajo, puedes correr un único
+comando guiado, en español:
+
+```bash
+npx -y agentbridge@latest setup
+```
+
+Te pregunta lo necesario: si esta computadora ya está dada de alta (y si no, te pide el enlace),
+qué vas a hacer aquí — contestar, preguntar, o las dos cosas — y, si vas a contestar, qué carpeta
+vas a compartir. Antes de esa última pregunta te explica, otra vez y en el momento en que importa,
+lo mismo que dice la sección de arriba: todo lo que pongas en esa carpeta queda visible para quien
+te pueda preguntar. Si la carpeta que eliges se ve peligrosa — tu carpeta de usuario, un
+repositorio de trabajo (tiene `.git`), o archivos con pinta de credenciales — te lo dice y te pide
+escribir una confirmación exacta para seguir, o de plano se niega. Nunca la crea sin avisarte
+primero.
+
+Al final te dice, sin rodeos, qué quedó listo, qué falta, y cuál es el siguiente comando a correr.
+
+`setup` no reinventa nada: cada paso que da es uno de los comandos de esta misma guía (`enroll`,
+`setup-responder`, `doctor`, `claude mcp add`), nomás que encadenados y con las preguntas
+correctas. Si lo corres sin una terminal interactiva — por ejemplo dentro de un script — te lo
+dice de inmediato y te imprime los comandos equivalentes, en vez de quedarse esperando.
+
+El resto de esta guía explica qué hace cada paso por dentro, por si quieres entenderlo, hacer
+alguno a mano, automatizarlo, o algo te truena y necesitas saber dónde mirar.
+
 ## Antes de empezar
 
 Las dos computadoras necesitan Node 22.4 o más nuevo, solo para correr `npx`. Dev además necesita
@@ -76,6 +104,10 @@ npx -y agentbridge@latest admin enroll-link --handle ana --name "Ana"
 Mándale a cada quien su enlace, por donde ya se escriban normalmente.
 
 ## En la computadora de Dev, el que contesta
+
+`agentbridge setup` hace por ti los pasos 1, 3 y 5 de aquí abajo — con las mismas preguntas de
+seguridad sobre la carpeta compartida — y te dice qué falta. Esto es lo que hace, paso a paso, y
+cómo hacer cualquiera de ellos a mano.
 
 **1. Darse de alta.**
 
@@ -129,6 +161,10 @@ Mándale a Ana el enlace que imprime. Eso es lo que le da permiso de preguntarte
 quitar cuando quieras con `npx -y agentbridge@latest revoke ana`.
 
 ## En la computadora de Ana, la que pregunta
+
+`agentbridge setup` hace por ella el paso 1 de aquí abajo y, si se lo pide, también registra el
+servidor MCP del paso 3 — recordándole reiniciar Claude Code después. Esto es lo que hace, paso a
+paso, y cómo hacer cualquiera de ellos a mano.
 
 **1. Darse de alta con su propio enlace.**
 

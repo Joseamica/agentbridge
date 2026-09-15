@@ -93,7 +93,10 @@ const PROJECT_CONFIG_DIRS = ['.claude/agents', '.claude/skills', '.claude/comman
 // understate exactly the risk that made checking for them worth doing in the first place.
 const PROJECT_CONFIG_EXEC_RISK = new Set(['.claude/settings.json', '.claude/settings.local.json', '.mcp.json', '.claude/agents'])
 
-async function projectConfigArtifacts(shareDir: string): Promise<string[]> {
+// Exported so `setup` can reuse this exact detection when deciding whether a chosen shared
+// folder already looks like a project directory, instead of hand-rolling a second list of
+// artifact names that could drift from the one doctor actually checks.
+export async function projectConfigArtifacts(shareDir: string): Promise<string[]> {
   const found: string[] = []
   for (const rel of PROJECT_CONFIG_CANDIDATES) {
     const present = await access(join(shareDir, rel))

@@ -2,6 +2,7 @@ import { RelayError } from '@agentbridge/core'
 import { accept, adminEnrollLink, contacts, enroll, invite, revoke, whoami } from './commands/account'
 import { ask, ticket } from './commands/ask'
 import { doctorCommand } from './commands/doctor'
+import { setupCommand } from './commands/setup'
 import { setupResponderCommand } from './commands/setup-responder'
 import { CliError, type CliContext } from './context'
 import { mcp } from './mcp-asker'
@@ -10,6 +11,9 @@ import { isNetworkError, RELAY_UNREACHABLE_ES } from './spanish-errors'
 export type Command = (argv: string[], ctx: CliContext) => Promise<void>
 
 export const USAGE = `AgentBridge — pregúntale al agente de otra persona.
+
+Para empezar (recomendado):
+  agentbridge setup          (te hace las preguntas necesarias y deja todo listo)
 
 Alta y permisos:
   agentbridge admin enroll-link --handle <h> --name <nombre> --relay <url> --admin-token <token>
@@ -32,6 +36,7 @@ Responder desde esta computadora:
 Variables: AGENTBRIDGE_HOME (carpeta de la credencial), AGENTBRIDGE_RELAY_URL, AGENTBRIDGE_ADMIN_TOKEN`
 
 const COMMANDS: Record<string, Command> = {
+  setup: setupCommand,
   enroll,
   whoami,
   invite,
