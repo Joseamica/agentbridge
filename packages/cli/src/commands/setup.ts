@@ -40,6 +40,20 @@ export const NON_INTERACTIVE_ES = [
   'O sigue la guía completa: docs/inicio-rapido.md',
 ].join('\n')
 
+// Distinct from NON_INTERACTIVE_ES on purpose. That one means "there was never a terminal to ask
+// you anything in" (ctx.prompt was never even set — see setupCommand). This one means the
+// OPPOSITE: prompting was working fine, the person answered real questions, and the input
+// stream then ended partway through — a real Ctrl-D in their own terminal, most plausibly.
+// Telling that person their session "is not an interactive terminal (e.g. in CI)" would be
+// straightforwardly false: they were just typing in one. PromptEOF surfacing from inside
+// runGuidedSetup (as opposed to setupCommand's own upfront check) is exactly how this is told
+// apart from the genuinely-no-terminal case — see runSetup's catch below.
+const INPUT_CLOSED_ES = [
+  'Se cerró la entrada antes de terminar de contestar (¿Ctrl-D, o se cerró la terminal?).',
+  'No perdiste lo que ya llevabas avanzado, pero hacen falta las respuestas que faltan para dejarlo listo.',
+  'Vuelve a correr "agentbridge setup" cuando quieras seguir.',
+].join('\n')
+
 const SHARE_FOLDER_EXPLANATION_ES = [
   'Antes de pedirte la carpeta que vas a compartir, esto es lo importante:',
   '',
@@ -149,7 +163,11 @@ async function askWithRetries<T>(
 // the prompt and every doc show as the example) becomes a literal `~` subfolder of the current
 // working directory instead of the person's home. Only a LEADING `~`/`$HOME` is handled — not
 // `~user/...` — which covers the realistic case without pretending to be a full shell parser.
-function expandUserPath(raw: string): string {
+// Exported so tests can check this pure string logic directly against the REAL home directory
+// without ever creating anything on disk — an earlier test instead ran a full guided setup
+// against a path under the real `~/AgentBridge`, and a failing assertion partway through left a
+// stray folder in the owner's actual home when the cleanup at the end of the test never ran.
+export function expandUserPath(raw: string): string {
   const trimmed = raw.trim()
   if (trimmed === '~' || trimmed === '$HOME') return homedir()
   if (trimmed.startsWith('~/')) return join(homedir(), trimmed.slice(2))
@@ -196,24 +214,47 @@ const CREDENTIAL_NAME_PATTERNS = [/^\.env(\..*)?$/, /\.pem$/i, /\.key$/i, /^id_r
 const MAX_SCAN_DEPTH = 6
 const MAX_SCAN_ENTRIES = 20000
 
-type ShareDirScan = { gitDirs: string[]; suspiciousFiles: string[]; truncated: boolean }
+type ShareDirScan = {
+  gitDirs: string[]
+  suspiciousFiles: string[]
+  // Symlinks are never followed (no cycle risk, and no need to duplicate doctor's own escaping-
+  // symlink job) — but skipping one silently is exactly how a `repo -> /elsewhere/realrepo`
+  // symlink hiding a `.git` sailed through with no warning at all. Every symlink found is named
+  // here instead, which is what makes the CONFIRMAR gate fire on it.
+  symlinks: string[]
+  // node_modules is never descended into (same reasoning doctor.ts gives), but silently skipping
+  // it is exactly how `node_modules/pkg/.env` produced no warning even though Grep can still
+  // read it — named here so the gate can say so, the same way doctor.ts's own "skipped" list
+  // names it rather than claiming a clean sweep.
+  skippedNodeModules: string[]
+  // True only when at least one branch was too deeply nested to fully explore — its own
+  // recursion stops, but sibling directories elsewhere in the tree are still scanned. Kept
+  // separate from `truncated` below: an earlier version conflated the two, so hitting the depth
+  // cap in one deeply-nested branch silently gave up on scanning every OTHER sibling directory
+  // in the whole tree too, including ones holding a `.git` or `.env` that a full scan would have
+  // found immediately.
+  depthLimited: boolean
+  // True only when the total-entries safety cap was hit — a genuine, global stop (not merely
+  // "this one branch"), since by then real work has already been done and a pathologically large
+  // tree must not be allowed to hang `setup`. Whatever was already found before the cap is still
+  // returned, never discarded.
+  truncated: boolean
+}
 
 // Walks the whole tree, not just the top level: a single `readdir()` on the share folder's own
 // root let `share/project/.git` and `share/sub/.env` both through with zero warning — the
 // single most likely real mistake ("I'll share the folder where my projects live"). Mirrors the
 // traversal shape of doctor.ts's walkShareDir (skip node_modules; name a `.git` directory
 // instead of descending into it) without needing to also chase escaping symlinks — that is
-// doctor's own, separate job. This function never follows a symlink at all (Dirent's
-// isDirectory()/isFile() are both false for a symlink), which also means it cannot loop on a
-// symlink cycle. Bounded by both depth and total entries visited so a pathologically large or
-// deeply nested folder cannot make `setup` hang; hitting either bound is reported back as
-// `truncated` so the caller treats "I couldn't finish looking" as a reason to ask for
-// confirmation rather than silently declaring the folder clean.
+// doctor's own, separate job.
 async function scanShareDirForDanger(root: string): Promise<ShareDirScan> {
   const gitDirs: string[] = []
   const suspiciousFiles: string[] = []
+  const symlinks: string[] = []
+  const skippedNodeModules: string[] = []
   let visited = 0
   let truncated = false
+  let depthLimited = false
 
   async function walk(dir: string, rel: string, depth: number): Promise<void> {
     if (truncated) return
@@ -231,26 +272,37 @@ async function scanShareDirForDanger(root: string): Promise<ShareDirScan> {
         return
       }
       const entryRel = rel ? `${rel}/${entry.name}` : entry.name
-      if (entry.isSymbolicLink()) continue
+      if (entry.isSymbolicLink()) {
+        symlinks.push(entryRel)
+        continue
+      }
       if (entry.isDirectory()) {
-        if (entry.name === 'node_modules') continue
+        if (entry.name === 'node_modules') {
+          skippedNodeModules.push(entryRel)
+          continue
+        }
         if (entry.name === '.git') {
           gitDirs.push(entryRel)
           continue
         }
         if (depth >= MAX_SCAN_DEPTH) {
-          truncated = true
+          // Only this branch stops here — NOT the whole walk. Elsewhere in the tree (siblings,
+          // shallower directories not yet visited) keeps being scanned normally.
+          depthLimited = true
           continue
         }
         await walk(join(dir, entry.name), entryRel, depth + 1)
-      } else if (entry.isFile() && CREDENTIAL_NAME_PATTERNS.some((re) => re.test(entry.name))) {
-        suspiciousFiles.push(entryRel)
+      } else if (entry.isFile()) {
+        // A `.git` FILE (not a directory) is what a git worktree or a submodule checkout has
+        // instead of a full `.git` directory — still a working repo, and previously undetected.
+        if (entry.name === '.git') gitDirs.push(entryRel)
+        else if (CREDENTIAL_NAME_PATTERNS.some((re) => re.test(entry.name))) suspiciousFiles.push(entryRel)
       }
     }
   }
 
   await walk(root, '', 0)
-  return { gitDirs, suspiciousFiles, truncated }
+  return { gitDirs, suspiciousFiles, symlinks, skippedNodeModules, depthLimited, truncated }
 }
 
 type PathKind = 'missing' | 'directory' | 'not-a-directory' | 'broken-symlink' | 'error'
@@ -330,10 +382,31 @@ export async function assessShareDir(
       const shown = scan.suspiciousFiles.slice(0, 5).join(', ') + (scan.suspiciousFiles.length > 5 ? ', …' : '')
       reasons.push(`tiene archivos que parecen credenciales: ${shown}`)
     }
+    if (scan.symlinks.length > 0) {
+      const shown = scan.symlinks.slice(0, 5).join(', ') + (scan.symlinks.length > 5 ? ', …' : '')
+      reasons.push(
+        `tiene enlaces simbólicos que no revisé por dentro: ${shown} — podrían apuntar a cualquier cosa, incluido otro repositorio de trabajo`,
+      )
+    }
+    if (scan.skippedNodeModules.length > 0) {
+      const shown = scan.skippedNodeModules.slice(0, 5).join(', ') + (scan.skippedNodeModules.length > 5 ? ', …' : '')
+      reasons.push(`no revisé dentro de node_modules (${shown}) — Grep no está bloqueado, así que un .env ahí adentro seguiría siendo legible`)
+    }
     const projectConfig = await projectConfigArtifacts(shareDir)
     if (projectConfig.length > 0) reasons.push(`ya tiene configuración de proyecto que doctor vigila: ${projectConfig.join(', ')}`)
+    // Both of these lead with the actual danger (a repo or credentials might be hiding in what
+    // wasn't fully checked), not with a performance-sounding note about size — a real reviewer
+    // read the size-first wording as "just slow," when their folder genuinely held a git repo
+    // and a .env.
+    if (scan.depthLimited) {
+      reasons.push(
+        'tiene carpetas anidadas demasiado profundo para revisarlas por completo — podría haber un repositorio de trabajo o un archivo de credenciales más adentro que no alcancé a ver; revísala tú antes de confirmar',
+      )
+    }
     if (scan.truncated) {
-      reasons.push('la carpeta es muy grande o profunda; no la pude revisar por completo — revísala tú antes de confirmar')
+      reasons.push(
+        'es tan grande que no terminé de revisarla — podría haber un repositorio de trabajo o un archivo de credenciales que no alcancé a ver; revísala tú antes de confirmar',
+      )
     }
   }
   return { exists, isHome, credentialConflict, problem, reasons }
@@ -343,18 +416,18 @@ const MCP_YESNO_GIVEUP_ES =
   'No entendí tu respuesta. Puedes registrarlo tú cuando quieras con: claude mcp add agentbridge --scope user -- npx -y agentbridge@latest mcp'
 
 // The public entry point tests and setupCommand call. It's a thin wrapper around
-// `runGuidedSetup`: its only job is to turn a `PromptEOF` that escapes the whole flow into the
-// same Spanish "needs an interactive terminal" message `setupCommand` already gives when there
-// is no prompt at all (see NON_INTERACTIVE_ES) — reached whenever stdin closes or a test's
-// scripted answers run out partway through, not just when there was never a prompt to begin
-// with. Every other error (a normal CliError from a validation or a give-up message, a relay
-// error, …) passes through unchanged.
+// `runGuidedSetup`: its only job is to turn a `PromptEOF` that escapes the whole flow into
+// INPUT_CLOSED_ES — reached whenever stdin closes or a test's scripted answers run out partway
+// through a run that had already asked at least one real question, as opposed to
+// setupCommand's own upfront check, which uses NON_INTERACTIVE_ES for a session that never had
+// a prompt to begin with. Every other error (a normal CliError from a validation or a give-up
+// message, a relay error, …) passes through unchanged.
 export async function runSetup(ctx: SetupContext): Promise<void> {
   try {
     await runGuidedSetup(ctx)
   } catch (err) {
     if (err instanceof PromptEOF) {
-      throw new CliError(NON_INTERACTIVE_ES)
+      throw new CliError(INPUT_CLOSED_ES)
     }
     throw err
   }
@@ -451,7 +524,7 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
 
     let setupResult: Awaited<ReturnType<typeof setupResponder>>
     try {
-      setupResult = await setupResponder({ shareDir, repoDir, home: responderHome, run: ctx.run, out })
+      setupResult = await setupResponder({ shareDir, repoDir, home: responderHome, run: ctx.run, out, printNextSteps: false })
     } catch (err) {
       if (err instanceof CliError) throw err
       throw new CliError(
@@ -477,6 +550,16 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
       out.log(
         `Ojo: el perfil dedicado (${responderHome}) ya tenía otra identidad (@${existingResponderConfig.handle}); no la reemplacé. Si quieres usar @${config.handle} ahí, hazlo a mano.`,
       )
+    } else if (existingResponderConfig.deviceToken !== config.deviceToken) {
+      // Same person (same handle), but a token that no longer matches the one this device just
+      // used — e.g. this identity was re-enrolled since the last time `setup` ran. Left alone,
+      // the responder would keep authenticating with a token the relay may no longer honor,
+      // with nothing said about it. Refreshing is safe here specifically because the handle
+      // already matches: this is the same identity's current credential, not a different one.
+      await writeConfig(config, responderHome)
+      out.log(
+        `Actualicé la credencial del perfil dedicado (${responderHome}): tenía un token distinto para la misma identidad (@${config.handle}).`,
+      )
     }
     out.log('')
 
@@ -485,10 +568,18 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     for (const c of checks) out.log(`${c.ok ? '[ok]    ' : '[falta] '}${c.name}: ${c.detail}`)
     out.log('')
 
+    // Doctor already said so a few lines above — repeating "log in" here when it just reported
+    // "Sesión activa" would be telling the person to redo something that is already done.
+    const alreadyLoggedIn = checks.some((c) => c.name === 'Sesión iniciada en el perfil dedicado' && c.ok)
+    const remainingSteps = [
+      ...(alreadyLoggedIn
+        ? []
+        : [`Inicia sesión una vez en el perfil dedicado:  CLAUDE_CONFIG_DIR='${setupResult.claudeConfigDir}' claude   (usa /login y sal)`]),
+      `Arráncalo:  ${setupResult.startScriptPath}`,
+      'Deja entrar a quien va a preguntarte:  agentbridge invite   (y mándale el enlace que imprime)',
+    ]
     out.log('Para terminar de dejarlo contestando, en este orden:')
-    out.log(`  1. Inicia sesión una vez en el perfil dedicado:  CLAUDE_CONFIG_DIR='${setupResult.claudeConfigDir}' claude   (usa /login y sal)`)
-    out.log(`  2. Arráncalo:  ${setupResult.startScriptPath}`)
-    out.log('  3. Deja entrar a quien va a preguntarte:  agentbridge invite   (y mándale el enlace que imprime)')
+    remainingSteps.forEach((step, i) => out.log(`  ${i + 1}. ${step}`))
     out.log('')
 
     // The verdict must reflect what doctor actually found, not just one check picked out of

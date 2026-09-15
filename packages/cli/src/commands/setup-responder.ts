@@ -157,6 +157,15 @@ export async function setupResponder(o: {
   effort?: string
   run: CommandRunner
   out: Output
+  // `agentbridge setup` calls this as one orchestrated step among several, and — unlike a
+  // standalone `setup-responder` run — has ALREADY handled identity (its own step 1, done
+  // before this function is ever called) and prints its own accurate "what's left" summary
+  // right after this returns. The "Siguientes pasos" block below is correct advice for someone
+  // who ran `setup-responder` directly, but its own step 1 ("da de alta este dispositivo")
+  // names the single-use enrollment link a `setup` caller already redeemed — printing it there
+  // would tell them to spend a link they no longer have. Defaults to true so every existing
+  // (standalone) caller is unaffected.
+  printNextSteps?: boolean
 }): Promise<{ startScriptPath: string; claudeConfigDir: string; settingsPath: string }> {
   const shareDir = resolve(o.shareDir)
   const repoDir = resolve(o.repoDir)
@@ -233,11 +242,13 @@ export async function setupResponder(o: {
   }
 
   o.out.log(`Respondedor preparado en ${home}`)
-  o.out.log('Siguientes pasos:')
-  o.out.log(`  1. Da de alta este dispositivo:  AGENTBRIDGE_HOME=${quote(home)} agentbridge enroll <enlace>`)
-  o.out.log(`  2. Inicia sesión una vez en el perfil dedicado:  CLAUDE_CONFIG_DIR=${quote(claudeConfigDir)} claude   (usa /login y sal)`)
-  o.out.log(`  3. Arranca el respondedor:  ${startScriptPath}   (acepta la confirmación del canal de desarrollo)`)
-  o.out.log(`  4. Verifica:  agentbridge doctor --home ${quote(home)} --share ${quote(shareDir)} --repo ${quote(repoDir)}`)
+  if (o.printNextSteps ?? true) {
+    o.out.log('Siguientes pasos:')
+    o.out.log(`  1. Da de alta este dispositivo:  AGENTBRIDGE_HOME=${quote(home)} agentbridge enroll <enlace>`)
+    o.out.log(`  2. Inicia sesión una vez en el perfil dedicado:  CLAUDE_CONFIG_DIR=${quote(claudeConfigDir)} claude   (usa /login y sal)`)
+    o.out.log(`  3. Arranca el respondedor:  ${startScriptPath}   (acepta la confirmación del canal de desarrollo)`)
+    o.out.log(`  4. Verifica:  agentbridge doctor --home ${quote(home)} --share ${quote(shareDir)} --repo ${quote(repoDir)}`)
+  }
   return { startScriptPath, claudeConfigDir, settingsPath }
 }
 
