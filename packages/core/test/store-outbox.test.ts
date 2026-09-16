@@ -104,6 +104,47 @@ describe('claims', () => {
   })
 })
 
+describe('byte caps enforced at claim time', () => {
+  const big = (n: number, overrides: Partial<EnqueueInput> = {}) =>
+    input(n, { rumor: { ...input(n).rumor, content: 'x'.repeat(300_000) }, ...overrides })
+
+  it('keeps postponing an over-cap row while the older rows it would exceed the cap with remain pending', () => {
+    expect([1, 2, 3].map((n) => enqueue(store, big(n)))).toEqual(['enqueued', 'enqueued', 'enqueued'])
+    expect(enqueue(store, big(4))).toBe('postponed_cap')
+    expect(claimOne('a', T0).map((i) => i.rumorId)).toEqual([hex(1), hex(2), hex(3)])
+    // 'a' never publishes rows 1-3: their claims expire just as row 4 becomes due for the first time.
+    const t1 = T0 + NOSTR.capPostponeSeconds
+    expect(claimDue(store, { owner: 'b', now: t1, limit: 10, authorize: allow }).map((i) => i.rumorId)).toEqual([hex(1), hex(2), hex(3)])
+    expect(rowState(4)?.next_attempt_at).toBe(t1 + NOSTR.capPostponeSeconds)
+    for (const n of [1, 2, 3]) markPublished(store, { recipient: RECIPIENT, rumorId: hex(n), owner: 'b', now: t1 })
+    expect(claimDue(store, { owner: 'b', now: t1 + NOSTR.capPostponeSeconds, limit: 10, authorize: allow }).map((i) => i.rumorId)).toEqual([hex(4)])
+  })
+
+  it('always claims the oldest pending row of a scope even if it alone exceeds the per-recipient cap', () => {
+    const huge = input(1, { rumor: { ...input(1).rumor, content: 'x'.repeat(1_100_000) } })
+    expect(enqueue(store, huge)).toBe('postponed_cap')
+    expect(claimOne('a', T0)).toHaveLength(0)
+    expect(claimOne('a', T0 + NOSTR.capPostponeSeconds)).toHaveLength(1)
+  })
+
+  it('does not let regenerating a published message bypass the per-recipient byte cap', () => {
+    expect([1, 2, 3].map((n) => enqueue(store, big(n)))).toEqual(['enqueued', 'enqueued', 'enqueued'])
+    expect(claimOne('a', T0)).toHaveLength(3)
+    for (const n of [1, 2, 3]) markPublished(store, { recipient: RECIPIENT, rumorId: hex(n), owner: 'a', now: T0 })
+
+    expect(enqueue(store, big(5))).toBe('enqueued')
+    expect(claimOne('b', T0)).toHaveLength(1)
+    markPublished(store, { recipient: RECIPIENT, rumorId: hex(5), owner: 'b', now: T0 })
+
+    const t1 = T0 + NOSTR.regenerationIntervalSeconds
+    for (const n of [1, 2, 3, 5]) expect(enqueue(store, big(n, { now: t1 }))).toBe('regenerated')
+
+    expect(claimDue(store, { owner: 'c', now: t1, limit: 10, authorize: allow }).map((i) => i.rumorId)).toEqual([hex(1), hex(2), hex(3)])
+    expect(rowState(5)).toMatchObject({ state: 'pending', next_attempt_at: t1 + NOSTR.capPostponeSeconds })
+    for (const n of [1, 2, 3]) expect(rowState(n)?.state).toBe('pending')
+  })
+})
+
 describe('publish reservations', () => {
   it('allows at most 60 publishes per minute, reserved right before publishing', () => {
     for (let n = 1; n <= 70; n++) enqueue(store, input(n))

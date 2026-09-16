@@ -50,6 +50,8 @@ type OutboxRow = {
   updated_at: number
 }
 
+type OutboxCandidate = OutboxRow & { rowid: number }
+
 const HEX_64 = /^[0-9a-f]{64}$/
 
 const selectRow = (store: Store, recipient: string, rumorId: string) =>
@@ -133,16 +135,42 @@ export function claimDue(
       .run(input.now, input.now - NOSTR.retryWindowSeconds, input.now - NOSTR.decisionRetentionSeconds)
     const rows = store.db
       .prepare(
-        `SELECT * FROM outbox WHERE state = 'pending' AND next_attempt_at <= ? AND (claimed_until IS NULL OR claimed_until <= ?)
+        `SELECT rowid, * FROM outbox WHERE state = 'pending' AND next_attempt_at <= ? AND (claimed_until IS NULL OR claimed_until <= ?)
          ORDER BY next_attempt_at, rowid LIMIT ?`,
       )
-      .all(input.now, input.now, input.limit) as OutboxRow[]
+      .all(input.now, input.now, input.limit) as OutboxCandidate[]
     const abandon = store.db.prepare(
       "UPDATE outbox SET state = 'abandoned', claimed_by = NULL, claimed_until = NULL, updated_at = ? WHERE recipient = ? AND rumor_id = ?",
     )
     const claim = store.db.prepare('UPDATE outbox SET claimed_by = ?, claimed_until = ?, updated_at = ? WHERE recipient = ? AND rumor_id = ?')
+    const postponeForCap = store.db.prepare('UPDATE outbox SET next_attempt_at = ?, updated_at = ? WHERE recipient = ? AND rumor_id = ?')
+    // Bytes of pending rows that arrived (by first_enqueued_at, then rowid) strictly before this
+    // candidate, scoped to its recipient or to the whole identity. The candidate's own bytes are
+    // never counted here, so the oldest pending row of a scope always has zero "older" rows and
+    // therefore always passes — a single oversized row can never deadlock the queue.
+    const olderPendingForRecipient = store.db.prepare(
+      `SELECT count(*) AS n, coalesce(sum(bytes), 0) AS b FROM outbox
+         WHERE state = 'pending' AND recipient = ?
+           AND (first_enqueued_at < ? OR (first_enqueued_at = ? AND rowid < ?))`,
+    )
+    const olderPendingForIdentity = store.db.prepare(
+      `SELECT count(*) AS n, coalesce(sum(bytes), 0) AS b FROM outbox
+         WHERE state = 'pending'
+           AND (first_enqueued_at < ? OR (first_enqueued_at = ? AND rowid < ?))`,
+    )
     const granted: OutboxItem[] = []
     for (const row of rows) {
+      const recipientOlder = olderPendingForRecipient.get(row.recipient, row.first_enqueued_at, row.first_enqueued_at, row.rowid) as {
+        n: number
+        b: number
+      }
+      const identityOlder = olderPendingForIdentity.get(row.first_enqueued_at, row.first_enqueued_at, row.rowid) as { n: number; b: number }
+      const overRecipientCap = Number(recipientOlder.n) > 0 && Number(recipientOlder.b) + row.bytes > NOSTR.maxPendingBytesPerRecipient
+      const overIdentityCap = Number(identityOlder.n) > 0 && Number(identityOlder.b) + row.bytes > NOSTR.maxPendingBytesPerIdentity
+      if (overRecipientCap || overIdentityCap) {
+        postponeForCap.run(input.now + NOSTR.capPostponeSeconds, input.now, row.recipient, row.rumor_id)
+        continue
+      }
       const item = toItem(row)
       if (!input.authorize(item)) {
         abandon.run(input.now, row.recipient, row.rumor_id)
