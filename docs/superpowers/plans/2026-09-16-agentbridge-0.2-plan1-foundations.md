@@ -16,7 +16,7 @@
 - `nostr-tools` pinned to exactly `2.25.2`; `ws` pinned to exactly `8.21.3`; `@types/ws` as a dev dependency. No other new runtime dependency.
 - Protocol: own application on NIP-59. Wrap kind `1059`, seal kind `13`, rumor kind `8059` (arbitrary, never published). **Not** NIP-17: never publish kind 10050, never use kind 14.
 - Proof of work (NIP-13), fixed in the protocol: **16 bits** on every wrap, **22 bits** on wraps carrying `connect_request`. Not configurable.
-- Size caps per layer: wrap event ≤ 64 KB (65 536 bytes, serialized JSON) and the outgoing `["EVENT",…]` frame ≤ 64 KB; seal ≤ 48 KB (49 152 bytes); rumor ≤ 32 KB (32 768 bytes); every text field ≤ 16 KB (16 384 bytes) in UTF-8 **and** within `LIMITS` (`questionMaxChars` 4000, `answerMaxChars` 8000, `sourceMaxChars` 500).
+- Size caps per layer: wrap event ≤ 64 KB (65 536 bytes, serialized JSON) and the outgoing `["EVENT",…]` frame ≤ 64 KB; seal ≤ 40 KB (40 960 bytes); rumor ≤ 28 KB (28 672 bytes); every text field ≤ 16 KB (16 384 bytes) in UTF-8 **and** within `LIMITS` (`questionMaxChars` 4000, `answerMaxChars` 8000, `sourceMaxChars` 500).
 - Time rules: any `created_at` (wrap or rumor) may be at most **10 minutes** in the future. A question expires at `rumor.created_at + 24 h`. A `connect_request` is accepted only if its `rumor.created_at` is at most **7 days** old. NIP-59 randomizes seal and wrap `created_at` up to **2 days** back. Every wrap carries a NIP-40 `expiration` tag at publish time + 7 days.
 - Retention: message content 7 days; message decisions (including request records) 9 days; contact state (generation counter, permission state, max observed generation, relays) never expires.
 - Contacts: at most 5 relays per contact; one pending inbound request per public key; at most 20 pending inbound requests (evict the oldest); a key rejected in the last 7 days is ignored; permission changes need a generation **greater** than the max observed; questions need a generation **equal** to the current approved one.
@@ -449,8 +449,8 @@ export const NOSTR = {
   powMessageBits: 16,
   powRequestBits: 22,
   maxWrapBytes: 64 * 1024,
-  maxSealBytes: 48 * 1024,
-  maxRumorBytes: 32 * 1024,
+  maxSealBytes: 40 * 1024,
+  maxRumorBytes: 28 * 1024,
   maxTextBytes: 16 * 1024,
   futureToleranceSeconds: 10 * MINUTE,
   randomizationSeconds: 2 * DAY,

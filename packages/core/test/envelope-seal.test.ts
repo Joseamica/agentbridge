@@ -1,7 +1,7 @@
 import { decrypt, getConversationKey } from 'nostr-tools/nip44'
 import { getEventHash, verifyEvent, type NostrEvent } from 'nostr-tools/pure'
 import { describe, expect, it } from 'vitest'
-import { EnvelopeSizeError, NOSTR, createRumor, leadingZeroBits, wrapRumor, type Message } from '@agentbridge/core'
+import { EnvelopeSizeError, NOSTR, createRumor, leadingZeroBits, wrapRumor, type Message, type Rumor } from '@agentbridge/core'
 import { testIdentity } from './support/keys'
 
 const sender = testIdentity(1)
@@ -97,6 +97,31 @@ describe('wrapRumor', () => {
     const attempt = async () => wrapRumor(createRumor(answer, sender, NOW), sender, recipient.publicKey, { now: NOW })
     await expect(attempt()).rejects.toThrow(EnvelopeSizeError)
   })
+
+  it(
+    'accepts a quote-heavy rumor right up to the byte cap and refuses just past it, and the last accepted rumor still wraps under 64 KB',
+    { timeout: 60_000 },
+    async () => {
+      let lastAccepted: Rumor | null = null
+      let threwAt: number | null = null
+      for (let n = 7000; n < 8000; n++) {
+        const answer: Message = { v: 1, type: 'answer', questionId, text: '"'.repeat(n), source: 's', confidence: 'creo' }
+        try {
+          lastAccepted = createRumor(answer, sender, NOW)
+        } catch (err) {
+          expect(err).toBeInstanceOf(EnvelopeSizeError)
+          threwAt = n
+          break
+        }
+      }
+      expect(threwAt).not.toBeNull()
+      expect(threwAt).toBeLessThan(8000)
+      expect(lastAccepted).not.toBeNull()
+      expect(Buffer.byteLength(JSON.stringify(lastAccepted))).toBeLessThanOrEqual(NOSTR.maxRumorBytes)
+      const wrap = await wrapRumor(lastAccepted as Rumor, sender, recipient.publicKey, { now: NOW })
+      expect(Buffer.byteLength(JSON.stringify(['EVENT', wrap]))).toBeLessThanOrEqual(NOSTR.maxWrapBytes)
+    },
+  )
 
   it('refuses to wrap a rumor written by someone else', async () => {
     const rumor = createRumor(question, sender, NOW)

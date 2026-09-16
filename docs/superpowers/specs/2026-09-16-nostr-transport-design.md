@@ -228,8 +228,8 @@ Cada paso es más caro que el anterior; un sobre que falla un paso no llega al s
 4. Firma del sobre válida.
 5. Entrada en la **cola de descifrado**: acotada a 200 sobres, un descifrado a la vez. Si la cola está
    llena, `boards` deja de leer de ese tablero (contrapresión) en lugar de descartar.
-6. Descifrado del sobre; el sello ≤ 48 KB, kind 13, hash y firma válidos.
-7. Descifrado del sello; el rumor ≤ 32 KB, kind interno correcto, `id` recalculado,
+6. Descifrado del sobre; el sello ≤ 40 KB, kind 13, hash y firma válidos.
+7. Descifrado del sello; el rumor ≤ 28 KB, kind interno correcto, `id` recalculado,
    `rumor.pubkey === seal.pubkey`, fecha válida.
 8. Contenido JSON validado con zod, `v === 1`, textos dentro de `LIMITS` y ≤ 16 KB en UTF-8.
 9. Si es `connect_request`: prueba de trabajo del sobre ≥ 22 bits.
