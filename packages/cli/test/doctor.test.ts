@@ -1,4 +1,4 @@
-import { writeConfig } from '@agentbridge/core'
+import { CLI_COMMAND, writeConfig } from '@agentbridge/core'
 import type { FastifyInstance } from 'fastify'
 import { access, chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -199,7 +199,7 @@ describe('runDoctor', () => {
     const checks = await runDoctor({ home, shareDir, repoDir, run: loggedInRun })
     const check = checks.find((c) => c.name === 'Alta del dispositivo')!
     expect(check.ok).toBe(false)
-    expect(check.detail).toContain('agentbridge enroll')
+    expect(check.detail).toContain(`${CLI_COMMAND} enroll`)
     assertNoTokenLeak(checks)
   })
 

@@ -33,7 +33,7 @@ afterAll(async () => {
 async function person(handle: string, name: string) {
   const admin: CliContext & { out: ReturnType<typeof memoryOutput> } = { home: await mkdtemp(join(tmpdir(), 'ab-adm-')), out: memoryOutput(), env: {} }
   await run(['admin', 'enroll-link', '--handle', handle, '--name', name, '--relay', relayUrl, '--admin-token', ADMIN_TOKEN], admin)
-  const link = admin.out.lines.join('\n').match(/agentbridge enroll (\S+)/)![1]!
+  const link = admin.out.lines.join('\n').match(/ enroll (\S+)/)![1]!
   const ctx: CliContext & { out: ReturnType<typeof memoryOutput> } = { home: await mkdtemp(join(tmpdir(), 'ab-cli-')), out: memoryOutput(), env: {} }
   expect(await run(['enroll', link], ctx)).toBe(0)
   return ctx
@@ -60,7 +60,7 @@ describe('agentbridge ask', () => {
     const dev = await person('dev', 'Dev Ejemplo')
     const amieva = await person('amieva', 'Amieva')
     await run(['invite'], dev)
-    await run(['accept', dev.out.lines.join('\n').match(/agentbridge accept (\S+)/)![1]!], amieva)
+    await run(['accept', dev.out.lines.join('\n').match(/ accept (\S+)/)![1]!], amieva)
 
     const socket = new FakeSocket()
     const conn = hub.handleOpen(socket)
@@ -88,7 +88,7 @@ describe('agentbridge ask', () => {
     const dev = await person('dev', 'Dev')
     const amieva = await person('amieva', 'Amieva')
     await run(['invite'], dev)
-    await run(['accept', dev.out.lines.join('\n').match(/agentbridge accept (\S+)/)![1]!], amieva)
+    await run(['accept', dev.out.lines.join('\n').match(/ accept (\S+)/)![1]!], amieva)
     expect(await run(['ask', 'dev', 'hola', '--no-wait'], amieva)).toBe(0)
     expect(amieva.out.lines.join('\n')).toMatch(/ticket_id: [0-9a-f-]{36}/)
   })
@@ -111,7 +111,7 @@ describe('agentbridge ticket', () => {
     const dev = await person('dev', 'Dev')
     const amieva = await person('amieva', 'Amieva')
     await run(['invite'], dev)
-    await run(['accept', dev.out.lines.join('\n').match(/agentbridge accept (\S+)/)![1]!], amieva)
+    await run(['accept', dev.out.lines.join('\n').match(/ accept (\S+)/)![1]!], amieva)
     expect(await run(['ask', 'dev', 'hola', '--no-wait'], amieva)).toBe(0)
     const ticketId = amieva.out.lines.join('\n').match(/ticket_id: (\S+)/)![1]!
 
@@ -123,7 +123,7 @@ describe('agentbridge ticket', () => {
     const dev = await person('dev', 'Dev Ejemplo')
     const amieva = await person('amieva', 'Amieva')
     await run(['invite'], dev)
-    await run(['accept', dev.out.lines.join('\n').match(/agentbridge accept (\S+)/)![1]!], amieva)
+    await run(['accept', dev.out.lines.join('\n').match(/ accept (\S+)/)![1]!], amieva)
     expect(await run(['ask', 'dev', 'hola', '--no-wait'], amieva)).toBe(0)
     const ticketId = amieva.out.lines.join('\n').match(/ticket_id: (\S+)/)![1]!
 

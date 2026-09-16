@@ -1,3 +1,4 @@
+import { CLI_COMMAND } from '@agentbridge/core'
 import type { FastifyInstance } from 'fastify'
 import { mkdtemp, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -35,7 +36,8 @@ const lastLine = (lines: string[]) => lines.join('\n')
 async function enrolledAs(handle: string, name: string) {
   const admin = await newContext()
   expect(await run(['admin', 'enroll-link', '--handle', handle, '--name', name, '--relay', relayUrl, '--admin-token', ADMIN_TOKEN], admin)).toBe(0)
-  const link = lastLine(admin.out.lines).match(/agentbridge enroll (\S+)/)![1]!
+  expect(lastLine(admin.out.lines)).toContain(`  ${CLI_COMMAND} enroll ${relayUrl}/e/`)
+  const link = lastLine(admin.out.lines).match(/ enroll (\S+)/)![1]!
   const ctx = await newContext()
   expect(await run(['enroll', link, '--device', `${handle}-mac`], ctx)).toBe(0)
   return ctx
@@ -69,7 +71,9 @@ describe('CLI account commands', () => {
     const amieva = await enrolledAs('amieva', 'Amieva')
 
     expect(await run(['invite'], dev)).toBe(0)
-    const link = lastLine(dev.out.lines).match(/agentbridge accept (\S+)/)![1]!
+    // Pasted as-is by someone who ran everything through npx, so it has to be the npx form.
+    expect(lastLine(dev.out.lines)).toContain(`  ${CLI_COMMAND} accept ${relayUrl}/c/`)
+    const link = lastLine(dev.out.lines).match(/ accept (\S+)/)![1]!
     expect(await run(['accept', link], amieva)).toBe(0)
     expect(lastLine(amieva.out.lines)).toContain('Ya puedes preguntarle a Dev Ejemplo (@dev)')
 
@@ -87,7 +91,7 @@ describe('CLI account commands', () => {
   it('tells the user to enroll first when there is no config', async () => {
     const ctx = await newContext()
     expect(await run(['whoami'], ctx)).toBe(1)
-    expect(lastLine(ctx.out.errors)).toContain('agentbridge enroll')
+    expect(lastLine(ctx.out.errors)).toContain(`${CLI_COMMAND} enroll`)
   })
 
   it('translates a mistyped flag into spanish instead of the raw node:util parseArgs error', async () => {

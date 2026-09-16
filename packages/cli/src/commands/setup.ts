@@ -1,4 +1,4 @@
-import { writeConfig } from '@agentbridge/core'
+import { CLI_ARGV, CLI_COMMAND, writeConfig } from '@agentbridge/core'
 import type { Dirent } from 'node:fs'
 import { access, lstat, readdir, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -27,15 +27,15 @@ export type SetupContext = CliContext & {
 }
 
 export const NON_INTERACTIVE_ES = [
-  'agentbridge setup necesita una terminal interactiva para hacerte preguntas, y esta no lo es',
+  'Este asistente necesita una terminal interactiva para hacerte preguntas, y esta no lo es',
   '(por ejemplo, se está corriendo dentro de un script, con la entrada redirigida, o en CI).',
   '',
   'Corre el equivalente a mano, en este orden:',
-  '  AGENTBRIDGE_HOME=~/.agentbridge-responder agentbridge enroll <tu enlace de alta>',
-  '  agentbridge setup-responder --share <carpeta compartida> --home ~/.agentbridge-responder',
-  '  agentbridge doctor --home ~/.agentbridge-responder --share <carpeta compartida>',
-  '  AGENTBRIDGE_HOME=~/.agentbridge-responder agentbridge invite',
-  '  claude mcp add agentbridge --scope user -- npx -y agentbridge@latest mcp',
+  `  AGENTBRIDGE_HOME=~/.agentbridge-responder ${CLI_COMMAND} enroll <tu enlace de alta>`,
+  `  ${CLI_COMMAND} setup-responder --share <carpeta compartida> --home ~/.agentbridge-responder`,
+  `  ${CLI_COMMAND} doctor --home ~/.agentbridge-responder --share <carpeta compartida>`,
+  `  AGENTBRIDGE_HOME=~/.agentbridge-responder ${CLI_COMMAND} invite`,
+  `  claude mcp add agentbridge --scope user -- ${CLI_COMMAND} mcp`,
   '',
   'O sigue la guía completa: docs/inicio-rapido.md',
 ].join('\n')
@@ -51,7 +51,7 @@ export const NON_INTERACTIVE_ES = [
 const INPUT_CLOSED_ES = [
   'Se cerró la entrada antes de terminar de contestar (¿Ctrl-D, o se cerró la terminal?).',
   'No perdiste lo que ya llevabas avanzado, pero hacen falta las respuestas que faltan para dejarlo listo.',
-  'Vuelve a correr "agentbridge setup" cuando quieras seguir.',
+  `Vuelve a correr "${CLI_COMMAND} setup" cuando quieras seguir.`,
 ].join('\n')
 
 const SHARE_FOLDER_EXPLANATION_ES = [
@@ -203,7 +203,7 @@ async function chooseShareDir(prompt: Prompt, out: Output, defaultShare: string)
     if (proceed) return shareDir
     if (attempt < MAX_FOLDER_ATTEMPTS) out.log('Bien, dime otra carpeta.')
   }
-  throw new CliError('No pude confirmar una carpeta para compartir después de 3 intentos. Vuelve a correr "agentbridge setup".')
+  throw new CliError(`No pude confirmar una carpeta para compartir después de 3 intentos. Vuelve a correr "${CLI_COMMAND} setup".`)
 }
 
 // Patterns a fresh, curated share folder should never contain. Matched against bare file
@@ -413,7 +413,7 @@ export async function assessShareDir(
 }
 
 const MCP_YESNO_GIVEUP_ES =
-  'No entendí tu respuesta. Puedes registrarlo tú cuando quieras con: claude mcp add agentbridge --scope user -- npx -y agentbridge@latest mcp'
+  `No entendí tu respuesta. Puedes registrarlo tú cuando quieras con: claude mcp add agentbridge --scope user -- ${CLI_COMMAND} mcp`
 
 // The public entry point tests and setupCommand call. It's a thin wrapper around
 // `runGuidedSetup`: its only job is to turn a `PromptEOF` that escapes the whole flow into
@@ -447,14 +447,14 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
   let config = await tryReadConfig(ctx)
   if (!config) {
     out.log('Esta computadora todavía no está dada de alta.')
-    out.log('Pide un enlace de alta a quien opere el relay (o créalo tú con: agentbridge admin enroll-link).')
+    out.log(`Pide un enlace de alta a quien opere el relay (o créalo tú con: ${CLI_COMMAND} admin enroll-link).`)
     const link = await askWithRetries(
       prompt,
       out,
       'Enlace de alta: ',
       parseNonEmpty,
       'Necesito el enlace que te mandaron para darte de alta.',
-      'No diste un enlace de alta. Vuelve a correr "agentbridge setup" cuando lo tengas, o da de alta a mano: agentbridge enroll <enlace>',
+      `No diste un enlace de alta. Vuelve a correr "${CLI_COMMAND} setup" cuando lo tengas, o da de alta a mano: ${CLI_COMMAND} enroll <enlace>`,
     )
     await enroll([link], ctx)
     config = await requireConfig(ctx)
@@ -470,7 +470,7 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     ROLE_QUESTION_ES,
     parseRole,
     'Escribe 1, 2 o 3.',
-    'No pude entender qué ibas a hacer. Vuelve a correr "agentbridge setup" y responde 1, 2 o 3.',
+    `No pude entender qué ibas a hacer. Vuelve a correr "${CLI_COMMAND} setup" y responde 1, 2 o 3.`,
   )
   const willAnswer = role === 'responder' || role === 'ambas'
   const willAsk = role === 'preguntar' || role === 'ambas'
@@ -491,16 +491,16 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
 
     const assessment = await assessShareDir(shareDir, { identityHome: ctx.home, responderHome })
     if (assessment.problem) {
-      throw new CliError(`No puedo usar ${shareDir}: ${assessment.problem}. Elige otra ruta y vuelve a correr "agentbridge setup".`)
+      throw new CliError(`No puedo usar ${shareDir}: ${assessment.problem}. Elige otra ruta y vuelve a correr "${CLI_COMMAND} setup".`)
     }
     if (assessment.isHome) {
       throw new CliError(
-        `No puedo usar ${shareDir} como carpeta compartida: es tu carpeta de usuario (home) y dejaría visible todo lo que tienes en la computadora. Vuelve a correr "agentbridge setup" con otra carpeta.`,
+        `No puedo usar ${shareDir} como carpeta compartida: es tu carpeta de usuario (home) y dejaría visible todo lo que tienes en la computadora. Vuelve a correr "${CLI_COMMAND} setup" con otra carpeta.`,
       )
     }
     if (assessment.credentialConflict) {
       throw new CliError(
-        `No puedo usar ${shareDir} como carpeta compartida: ahí dentro está ${assessment.credentialConflict}, que guarda el token del dispositivo — cualquier pregunta podría leerlo y hacerse pasar por ti en el relay. Vuelve a correr "agentbridge setup" con otra carpeta.`,
+        `No puedo usar ${shareDir} como carpeta compartida: ahí dentro está ${assessment.credentialConflict}, que guarda el token del dispositivo — cualquier pregunta podría leerlo y hacerse pasar por ti en el relay. Vuelve a correr "${CLI_COMMAND} setup" con otra carpeta.`,
       )
     }
     if (assessment.reasons.length > 0) {
@@ -515,7 +515,7 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
         `Escribe ${CONFIRM_WORD} para continuar: `,
         parseConfirmation,
         `Para seguir con esta carpeta, escribe exactamente la palabra ${CONFIRM_WORD} (sin comillas; mayúsculas o minúsculas da igual).`,
-        `No escribiste "${CONFIRM_WORD}". No se tocó ${shareDir}. Vuelve a correr "agentbridge setup" con otra carpeta si quieres, o confirma esta de nuevo.`,
+        `No escribiste "${CONFIRM_WORD}". No se tocó ${shareDir}. Vuelve a correr "${CLI_COMMAND} setup" con otra carpeta si quieres, o confirma esta de nuevo.`,
       )
     }
     // Never create the folder silently: say so before setupResponder does it.
@@ -528,7 +528,7 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     } catch (err) {
       if (err instanceof CliError) throw err
       throw new CliError(
-        `No pude preparar la carpeta compartida o el perfil dedicado: ${describeFsError(err)}. No se completó la instalación; revisa la ruta y vuelve a correr "agentbridge setup".`,
+        `No pude preparar la carpeta compartida o el perfil dedicado: ${describeFsError(err)}. No se completó la instalación; revisa la ruta y vuelve a correr "${CLI_COMMAND} setup".`,
       )
     }
 
@@ -576,7 +576,7 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
         ? []
         : [`Inicia sesión una vez en el perfil dedicado:  CLAUDE_CONFIG_DIR='${setupResult.claudeConfigDir}' claude   (usa /login y sal)`]),
       `Arráncalo:  ${setupResult.startScriptPath}`,
-      'Deja entrar a quien va a preguntarte:  agentbridge invite   (y mándale el enlace que imprime)',
+      `Deja entrar a quien va a preguntarte:  ${CLI_COMMAND} invite   (y mándale el enlace que imprime)`,
     ]
     out.log('Para terminar de dejarlo contestando, en este orden:')
     remainingSteps.forEach((step, i) => out.log(`  ${i + 1}. ${step}`))
@@ -591,16 +591,16 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
       if (!c.ok) pending.push(`${c.name}: ${c.detail}`)
     }
     pending.push(`Arranca el respondedor: ${setupResult.startScriptPath}`)
-    pending.push('Invita a quien va a preguntarte: agentbridge invite')
+    pending.push(`Invita a quien va a preguntarte: ${CLI_COMMAND} invite`)
   }
 
   // 4. Asking side
   if (willAsk) {
     out.log('Para poder preguntar, alguien tiene que haberte invitado antes. Si ya tienes su enlace, acéptalo con:')
-    out.log('  agentbridge accept <enlace de invitación>')
-    out.log('(Si no lo tienes, pídeselo — lo consigue con: agentbridge invite)')
+    out.log(`  ${CLI_COMMAND} accept <enlace de invitación>`)
+    out.log(`(Si no lo tienes, pídeselo — lo consigue con: ${CLI_COMMAND} invite)`)
     out.log('')
-    pending.push('Acepta la invitación de quien vas a preguntar: agentbridge accept <enlace de invitación>')
+    pending.push(`Acepta la invitación de quien vas a preguntar: ${CLI_COMMAND} accept <enlace de invitación>`)
 
     out.log('Para preguntar desde tu propio Claude Code hace falta además registrar el servidor MCP de AgentBridge una vez.')
     let wantsMcp: boolean
@@ -621,7 +621,7 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     if (wantsMcp) {
       const result = await ctx.run(
         'claude',
-        ['mcp', 'add', 'agentbridge', '--scope', 'user', '--', 'npx', '-y', 'agentbridge@latest', 'mcp'],
+        ['mcp', 'add', 'agentbridge', '--scope', 'user', '--', ...CLI_ARGV, 'mcp'],
         { env: ctx.env },
       )
       if (result.code === 0) {
@@ -631,23 +631,23 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
         out.log(
           `No pude registrar el servidor MCP automáticamente (${result.stderr || result.stdout || 'sin más detalle'}). Hazlo a mano:`,
         )
-        out.log('  claude mcp add agentbridge --scope user -- npx -y agentbridge@latest mcp')
+        out.log(`  claude mcp add agentbridge --scope user -- ${CLI_COMMAND} mcp`)
       }
     } else {
       out.log('Está bien. Cuando quieras, corre:')
-      out.log('  claude mcp add agentbridge --scope user -- npx -y agentbridge@latest mcp')
+      out.log(`  claude mcp add agentbridge --scope user -- ${CLI_COMMAND} mcp`)
     }
     out.log('')
     out.log('Importante: si ya tenías una sesión de Claude Code abierta, ciérrala y ábrela de nuevo — la herramienta nueva')
     out.log('no aparece hasta que reinicias la sesión.')
-    out.log('Para preguntar desde la terminal en cualquier momento: agentbridge ask <handle> "<pregunta>"')
+    out.log(`Para preguntar desde la terminal en cualquier momento: ${CLI_COMMAND} ask <handle> "<pregunta>"`)
     out.log('')
 
     if (mcpRegistered) {
       done.push('Servidor MCP registrado en Claude Code.')
       pending.push('Reinicia (o abre) tu sesión de Claude Code para que aparezca la herramienta nueva.')
     } else {
-      pending.push('Registra el servidor MCP: claude mcp add agentbridge --scope user -- npx -y agentbridge@latest mcp')
+      pending.push(`Registra el servidor MCP: claude mcp add agentbridge --scope user -- ${CLI_COMMAND} mcp`)
     }
   }
 

@@ -1,3 +1,4 @@
+import { CLI_COMMAND } from '@agentbridge/core'
 import { spawn } from 'node:child_process'
 import { access, chmod, mkdir, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -244,10 +245,10 @@ export async function setupResponder(o: {
   o.out.log(`Respondedor preparado en ${home}`)
   if (o.printNextSteps ?? true) {
     o.out.log('Siguientes pasos:')
-    o.out.log(`  1. Da de alta este dispositivo:  AGENTBRIDGE_HOME=${quote(home)} agentbridge enroll <enlace>`)
+    o.out.log(`  1. Da de alta este dispositivo:  AGENTBRIDGE_HOME=${quote(home)} ${CLI_COMMAND} enroll <enlace>`)
     o.out.log(`  2. Inicia sesión una vez en el perfil dedicado:  CLAUDE_CONFIG_DIR=${quote(claudeConfigDir)} claude   (usa /login y sal)`)
     o.out.log(`  3. Arranca el respondedor:  ${startScriptPath}   (acepta la confirmación del canal de desarrollo)`)
-    o.out.log(`  4. Verifica:  agentbridge doctor --home ${quote(home)} --share ${quote(shareDir)} --repo ${quote(repoDir)}`)
+    o.out.log(`  4. Verifica:  ${CLI_COMMAND} doctor --home ${quote(home)} --share ${quote(shareDir)} --repo ${quote(repoDir)}`)
   }
   return { startScriptPath, claudeConfigDir, settingsPath }
 }

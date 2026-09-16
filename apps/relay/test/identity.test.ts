@@ -1,3 +1,4 @@
+import { CLI_COMMAND } from '@agentbridge/core'
 import type { FastifyInstance } from 'fastify'
 import type pg from 'pg'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
@@ -103,6 +104,7 @@ describe('identity routes', () => {
   it('serves plain-text instructions for an enrollment link', async () => {
     const res = await app.inject({ method: 'GET', url: '/e/abc123' })
     expect(res.headers['content-type']).toContain('text/plain')
-    expect(res.body).toContain('agentbridge enroll http://relay.test/e/abc123')
+    // Someone opening their link in a browser copies this line straight into a terminal.
+    expect(res.body).toContain(`${CLI_COMMAND} enroll http://relay.test/e/abc123`)
   })
 })

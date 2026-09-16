@@ -1,4 +1,4 @@
-import { HandleSchema, LIMITS, hashSecret, newSecret } from '@agentbridge/core'
+import { CLI_COMMAND, HandleSchema, LIMITS, hashSecret, newSecret } from '@agentbridge/core'
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import type { RouteContext } from '../app'
@@ -97,6 +97,6 @@ export function registerContactRoutes(app: FastifyInstance, ctx: RouteContext): 
   app.get('/c/:code', async (req, reply) =>
     reply
       .type('text/plain; charset=utf-8')
-      .send(`Esta es una invitación de contacto de AgentBridge.\nEjecuta en tu computadora:\n\n  agentbridge accept ${ctx.publicUrl}${req.url}\n`),
+      .send(`Esta es una invitación de contacto de AgentBridge.\nEjecuta en tu computadora:\n\n  ${CLI_COMMAND} accept ${ctx.publicUrl}${req.url}\n`),
   )
 }

@@ -1,4 +1,4 @@
-import { HandleSchema, LIMITS, hashSecret, newSecret } from '@agentbridge/core'
+import { CLI_COMMAND, HandleSchema, LIMITS, hashSecret, newSecret } from '@agentbridge/core'
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import type { RouteContext } from '../app'
@@ -58,6 +58,6 @@ export function registerIdentityRoutes(app: FastifyInstance, ctx: RouteContext):
   app.get('/e/:code', async (req, reply) =>
     reply
       .type('text/plain; charset=utf-8')
-      .send(`Este es un enlace de alta de AgentBridge.\nEjecuta en tu computadora:\n\n  agentbridge enroll ${ctx.publicUrl}${req.url}\n`),
+      .send(`Este es un enlace de alta de AgentBridge.\nEjecuta en tu computadora:\n\n  ${CLI_COMMAND} enroll ${ctx.publicUrl}${req.url}\n`),
   )
 }

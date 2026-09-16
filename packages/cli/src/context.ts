@@ -1,4 +1,4 @@
-import { RelayHttpClient, readConfig, type ClientConfig } from '@agentbridge/core'
+import { CLI_COMMAND, RelayHttpClient, readConfig, type ClientConfig } from '@agentbridge/core'
 import { createInterface } from 'node:readline/promises'
 
 export type Output = { log(message: string): void; error(message: string): void }
@@ -155,7 +155,7 @@ export async function tryReadConfig(ctx: { home: string }): Promise<ClientConfig
     return await readConfig(ctx.home)
   } catch {
     throw new CliError(
-      `No se pudo leer la configuración en ${ctx.home}/config.json (el archivo está dañado). Bórralo y vuelve a dar de alta este dispositivo con: agentbridge enroll <enlace>`,
+      `No se pudo leer la configuración en ${ctx.home}/config.json (el archivo está dañado). Bórralo y vuelve a dar de alta este dispositivo con: ${CLI_COMMAND} enroll <enlace>`,
     )
   }
 }
@@ -163,7 +163,7 @@ export async function tryReadConfig(ctx: { home: string }): Promise<ClientConfig
 export async function requireConfig(ctx: CliContext): Promise<ClientConfig> {
   const config = await tryReadConfig(ctx)
   if (!config) {
-    throw new CliError(`Este dispositivo no está dado de alta en ${ctx.home}. Pide un enlace y ejecuta: agentbridge enroll <enlace>`)
+    throw new CliError(`Este dispositivo no está dado de alta en ${ctx.home}. Pide un enlace y ejecuta: ${CLI_COMMAND} enroll <enlace>`)
   }
   return config
 }

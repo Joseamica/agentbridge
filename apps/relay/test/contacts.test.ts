@@ -1,3 +1,4 @@
+import { CLI_COMMAND } from '@agentbridge/core'
 import type { FastifyInstance } from 'fastify'
 import type pg from 'pg'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
@@ -98,6 +99,6 @@ describe('contact routes', () => {
 
   it('serves plain-text instructions for an invite link', async () => {
     const res = await app.inject({ method: 'GET', url: '/c/xyz789' })
-    expect(res.body).toContain('agentbridge accept http://relay.test/c/xyz789')
+    expect(res.body).toContain(`${CLI_COMMAND} accept http://relay.test/c/xyz789`)
   })
 })

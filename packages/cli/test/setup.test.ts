@@ -1,3 +1,4 @@
+import { CLI_ARGV, CLI_COMMAND } from '@agentbridge/core'
 import type { FastifyInstance } from 'fastify'
 import { access, mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
@@ -70,7 +71,14 @@ async function createEnrollLink(handle: string, name: string): Promise<string> {
   expect(
     await run(['admin', 'enroll-link', '--handle', handle, '--name', name, '--relay', relayUrl, '--admin-token', ADMIN_TOKEN], admin),
   ).toBe(0)
-  return admin.out.lines.join('\n').match(/agentbridge enroll (\S+)/)![1]!
+  return admin.out.lines.join('\n').match(/ enroll (\S+)/)![1]!
+}
+
+// People run setup through npx, so nothing named `agentbridge` is on their PATH: a printed
+// `agentbridge invite` is a step they cannot actually run. Every command setup tells a person to
+// type has to be the npx form.
+function expectOnlyRunnableCommands(text: string): void {
+  expect(text).not.toMatch(/(^|[\s"'`:])agentbridge (enroll|accept|invite|ask|doctor|setup|setup-responder|revoke|contacts|whoami|mcp)\b/m)
 }
 
 async function newBaseContext(): Promise<{ home: string; out: ReturnType<typeof memoryOutput>; env: NodeJS.ProcessEnv; repoDir: string }> {
@@ -93,9 +101,11 @@ describe('agentbridge setup — non-interactive safety', () => {
     const ctx = { home: await mkdtemp(join(tmpdir(), 'ab-setup-noninteractive-2-')), out: memoryOutput(), env: {} }
     await run(['setup'], ctx)
     const err = ctx.out.errors.join('\n')
-    expect(err).toContain('agentbridge enroll')
-    expect(err).toContain('agentbridge setup-responder')
-    expect(err).toContain('agentbridge doctor')
+    expect(err).toContain(`${CLI_COMMAND} enroll`)
+    expect(err).toContain(`${CLI_COMMAND} setup-responder`)
+    expect(err).toContain(`${CLI_COMMAND} doctor`)
+    expect(err).toContain(`claude mcp add agentbridge --scope user -- ${CLI_COMMAND} mcp`)
+    expectOnlyRunnableCommands(err)
   })
 })
 
@@ -130,7 +140,14 @@ describe('agentbridge setup — dangerous shared folder', () => {
     // confirm-the-resolved-path step) — the isHome hard refusal fires right after that, inside
     // assessShareDir, so no CONFIRMAR prompt is ever reached.
     const prompt = scriptedPrompt([link, '1', homedir(), ''])
-    await expect(runSetup({ ...base, prompt, run: runner })).rejects.toThrow(/es tu carpeta de usuario/i)
+    const err = await runSetup({ ...base, prompt, run: runner }).then(
+      () => new Error('expected setup to refuse'),
+      (e: Error) => e,
+    )
+    expect(err.message).toMatch(/es tu carpeta de usuario/i)
+    // "Vuelve a correr …" has to name a command the person can actually run again.
+    expect(err.message).toContain(`${CLI_COMMAND} setup`)
+    expectOnlyRunnableCommands(err.message)
     expect(calls).toEqual([])
   })
 
@@ -422,7 +439,8 @@ describe('agentbridge setup — happy path, answering', () => {
     expect(text).toContain('Sesión iniciada en el perfil dedicado')
     // The manual steps that remain, in order, with concrete paths.
     expect(text).toContain(join(responderHome, 'start.sh'))
-    expect(text).toContain('agentbridge invite')
+    expect(text).toContain(`${CLI_COMMAND} invite`)
+    expectOnlyRunnableCommands(text)
     expect(text).toMatch(/CLAUDE_CONFIG_DIR.*claude/)
     // Verdict names the pending login as the next step, since the fake `claude auth status` said not logged in.
     expect(text).toContain('Pendiente')
@@ -585,17 +603,22 @@ describe('agentbridge setup — happy path, asking', () => {
     await runSetup({ ...base, prompt, run: runner })
 
     const text = base.out.lines.join('\n')
+    // The registered server must be the package we publish. 0.1.0 registered the unscoped
+    // `agentbridge@latest`, which is not ours on npm: the tool never appeared, and whoever
+    // claimed that name would have run their code inside the asker's Claude Code.
     expect(calls).toEqual([
-      { command: 'claude', args: ['mcp', 'add', 'agentbridge', '--scope', 'user', '--', 'npx', '-y', 'agentbridge@latest', 'mcp'], env: base.env },
+      { command: 'claude', args: ['mcp', 'add', 'agentbridge', '--scope', 'user', '--', ...CLI_ARGV, 'mcp'], env: base.env },
     ])
+    expect(calls[0]!.args).toContain('@joseamica/agentbridge@latest')
     expect(text).toContain('MCP')
     expect(text).toMatch(/reinicia|reinici/i)
-    expect(text).toContain('agentbridge ask')
+    expect(text).toContain(`${CLI_COMMAND} ask`)
     expect(text).toContain('Pendiente')
     // I7: the asker is told to redeem an invite — without it they have no contacts and every
     // `ask` fails.
-    expect(text).toContain('agentbridge accept')
+    expect(text).toContain(`${CLI_COMMAND} accept`)
     expect(text).toContain('Acepta la invitación')
+    expectOnlyRunnableCommands(text)
   })
 
   it('still explains how to ask, and names the manual command, when the person declines registering the MCP server', async () => {
@@ -608,9 +631,10 @@ describe('agentbridge setup — happy path, asking', () => {
 
     expect(calls).toEqual([])
     const text = base.out.lines.join('\n')
-    expect(text).toContain('claude mcp add agentbridge')
-    expect(text).toContain('agentbridge ask')
-    expect(text).toContain('agentbridge accept')
+    expect(text).toContain(`claude mcp add agentbridge --scope user -- ${CLI_COMMAND} mcp`)
+    expect(text).toContain(`${CLI_COMMAND} ask`)
+    expect(text).toContain(`${CLI_COMMAND} accept`)
+    expectOnlyRunnableCommands(text)
   })
 
   it('treats an unrecognized MCP answer, exhausted 3 times, as "no" and still prints the full summary (I8)', async () => {

@@ -1,3 +1,4 @@
+import { CLI_COMMAND } from '@agentbridge/core'
 import { access, chmod, mkdir, mkdtemp, readFile, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -73,6 +74,15 @@ describe('responderSettings', () => {
 })
 
 describe('setupResponder', () => {
+  it('prints next steps as npx commands, since the published CLI is not on the PATH', async () => {
+    const out = memoryOutput()
+    await setupResponder({ shareDir, repoDir, home, run: runner, out })
+    const text = out.lines.join('\n')
+    expect(text).toContain(`AGENTBRIDGE_HOME='${home}' ${CLI_COMMAND} enroll <enlace>`)
+    expect(text).toContain(`${CLI_COMMAND} doctor --home '${home}'`)
+    expect(text).not.toMatch(/(^|\s)agentbridge (enroll|doctor)\b/m)
+  })
+
   it('writes locked-down settings, the persona and an executable start script', async () => {
     const result = await setupResponder({ shareDir, repoDir, home, run: runner, out: memoryOutput() })
 

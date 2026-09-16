@@ -1,4 +1,4 @@
-import { RelayHttpClient, codeFromUrl, writeConfig } from '@agentbridge/core'
+import { CLI_COMMAND, RelayHttpClient, codeFromUrl, writeConfig } from '@agentbridge/core'
 import { hostname } from 'node:os'
 import { parseArgs } from 'node:util'
 import { CliError, clientFor, requireConfig, tryReadConfig, type CliContext } from '../context'
@@ -39,7 +39,7 @@ export async function adminEnrollLink(argv: string[], ctx: CliContext): Promise<
   const client = new RelayHttpClient({ relayUrl, fetchImpl: ctx.fetchImpl })
   const { enrollUrl, expiresAt } = await client.adminCreateEnrollment(adminToken, values.handle, values.name)
   ctx.out.log(`Enlace de alta para ${values.name} (@${values.handle}). Sirve una sola vez y caduca ${expiresAt}.`)
-  ctx.out.log(`Esa persona debe ejecutar:\n  agentbridge enroll ${enrollUrl}`)
+  ctx.out.log(`Esa persona debe ejecutar:\n  ${CLI_COMMAND} enroll ${enrollUrl}`)
 }
 
 export async function enroll(argv: string[], ctx: CliContext): Promise<void> {
@@ -72,7 +72,7 @@ export async function invite(_argv: string[], ctx: CliContext): Promise<void> {
   const config = await requireConfig(ctx)
   const { acceptUrl, expiresAt } = await clientFor(ctx, config).createInvite()
   ctx.out.log(`Mándale esto a la persona que quieres que te pueda preguntar. Sirve una sola vez y caduca ${expiresAt}:`)
-  ctx.out.log(`  agentbridge accept ${acceptUrl}`)
+  ctx.out.log(`  ${CLI_COMMAND} accept ${acceptUrl}`)
 }
 
 export async function accept(argv: string[], ctx: CliContext): Promise<void> {
