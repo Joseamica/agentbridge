@@ -1,7 +1,6 @@
 # AgentBridge 0.2 — sin servidor propio, sobre tableros públicos (Nostr)
 
-Fecha: 2026-09-16 · Estado: revisión 2, tras la auditoría de Codex (15 hallazgos incorporados).
-Pendiente de revisión escrita.
+Fecha: 2026-09-16 · Estado: revisión 3, tras dos auditorías de Codex. Pendiente de revisión escrita.
 
 ## Objetivo
 
@@ -20,16 +19,13 @@ administración de turnos a la computadora de quien contesta.
 
 1. Dos personas en redes distintas, sin servidor propio, completan: compartir enlace → solicitud →
    aprobación → pregunta → acuse → respuesta.
-2. Si la computadora de quien contesta está apagada, una pregunta admitida se contesta al prenderse,
-   siempre que algún tablero haya conservado el sobre. Si la de quien pregunta está apagada, la
-   respuesta se recupera al prenderse con la misma condición. Los reintentos cubren pérdidas
-   parciales.
-3. Revocar un permiso es atómico: después de `revoke` no se entrega a Claude ninguna pregunta de esa
-   persona ni se publica ninguna respuesta nueva para ella.
+2. Si la computadora de quien contesta está apagada, una pregunta enviada en las últimas 24 h se
+   contesta al prenderse, siempre que algún tablero haya conservado el sobre. Si la de quien pregunta
+   está apagada, la respuesta se recupera al volver a usar cualquier cliente, con la misma condición.
+3. Revocar cumple el contrato de "Revocación" sin excepciones fuera de la ventana documentada.
 4. Ningún tablero ni quien mantiene el proyecto puede leer el contenido, y el evento público no
-   revela al remitente (ver los límites exactos en "Privacidad: qué se garantiza y qué no").
-5. Dos o más procesos (canal, servidor MCP, CLI) usando la misma identidad no pierden ni duplican
-   estado.
+   revela al remitente, con los límites de "Privacidad: qué se garantiza y qué no".
+5. Canal, servidor MCP y CLI usando la misma identidad no pierden, duplican ni contradicen estado.
 6. Las pruebas automáticas corren sin internet y sin Docker.
 7. El servicio y la base de datos de Render se borran y dejan de cobrar.
 
@@ -48,8 +44,8 @@ gratuitos, usando `nostr-tools` 2.25.2. El código de la prueba no se conserva.
 | ¿Se verifica quién lo mandó? | Sí, el remitente del sello coincide con el de adentro |
 | Tamaño en red | 1 KB de texto → 4 KB; 30 KB → 64 KB (rechazado por 3 tableros con tope de 65 536 bytes); 90 KB → 214 KB (solo 3 lo aceptan) |
 
-Veinte minutos **no** validan retención de 24 horas o días. Eso se comprueba en la aceptación
-(ver "Migración"), y el diseño asume que un tablero puede perder cualquier sobre.
+Veinte minutos **no** validan retención de 24 horas o días. Eso se comprueba en la aceptación, y el
+diseño asume que un tablero puede perder cualquier sobre.
 
 Tableros que funcionaron: `relay.primal.net`, `relay.snort.social`, `relay.nostr.net`,
 `nostr.oxtr.dev`, `nos.lol`, `offchain.pub`, `nostr.mom`.
@@ -60,14 +56,14 @@ Tableros que funcionaron: `relay.primal.net`, `relay.snort.social`, `relay.nostr
 |---|---|
 | Punto de encuentro | Tableros públicos Nostr. Sin servidor propio. |
 | Relay de Render | Se reemplaza por completo. Se borra el código en la rama 0.2; el despliegue sigue vivo hasta la aceptación. |
-| Protocolo | Aplicación propia sobre NIP-59 (seal + gift wrap) con kind interno propio. **No** es NIP-17: no publica kind 10050 ni es legible por apps de chat Nostr. |
-| Conexión entre personas | Solicitud y aprobación explícita de quien contesta, con generación de permiso. |
-| Enlace para agregarte | Público, no secreto. Localizador sin firma, no prueba de nada. |
-| Estado local | SQLite local (`node:sqlite`, incluido en Node) con transacciones. Node mínimo 22.13. |
-| Turnos | Un único despachador por identidad, con cola persistente, intentos, tiempo límite y recuperación. |
-| Antispam | Prueba de trabajo NIP-13 en todo sobre, verificada antes de descifrar; límites de ritmo y de almacenamiento. |
+| Protocolo | Aplicación propia sobre NIP-59 (seal + gift wrap) con kind interno propio. **No** es NIP-17. |
+| Conexión entre personas | Solicitud y aprobación explícita de quien contesta, con generaciones de permiso estrictamente crecientes. |
+| Enlace para agregarte | Público, no secreto. Localizador sin firma. |
+| Estado local | SQLite local (`node:sqlite`) con transacciones. Node mínimo 22.13. |
+| Turnos | **Un solo canal por identidad**, con bloqueo exclusivo durante toda su vida. Un segundo canal se niega a arrancar. |
+| Antispam | Prueba de trabajo NIP-13 **fija en el protocolo**: 16 bits en todo sobre y 22 bits en solicitudes de conexión. No configurable en 0.2. |
 | AUTH | Soporte NIP-42 para leer y publicar. |
-| Disponibilidad | Se contesta solo con la computadora de quien contesta prendida. Admisión de preguntas: 24 h. |
+| Disponibilidad | Se contesta solo con la computadora de quien contesta prendida. Admisión de preguntas: 24 h desde su creación. |
 | Piloto actual | Sigue con la 0.1.1; Render sigue prendido hasta validar la 0.2. |
 
 ## Privacidad: qué se garantiza y qué no
@@ -86,8 +82,9 @@ Tableros que funcionaron: `relay.primal.net`, `relay.snort.social`, `relay.nostr
 - **Secreto hacia adelante.** Si alguien roba tu llave, puede descifrar cualquier sobre dirigido a
   ti que algún tablero haya conservado.
 - **Borrado.** La etiqueta NIP-40 pide a los tableros borrar a los 7 días, pero no los obliga.
-- **Disponibilidad bajo ataque dirigido.** Los límites de este diseño contienen el abuso casual; un
-  atacante con recursos puede degradar el servicio para una llave concreta.
+- **Disponibilidad bajo ataque dirigido.** Los límites contienen el abuso casual; un atacante con
+  recursos puede degradar el servicio para una llave concreta, incluido desplazar solicitudes
+  legítimas.
 - **Protección de la llave frente a programas del mismo usuario.** Los permisos 0600 impiden que la
   lean otros usuarios del sistema, no otros programas tuyos. La sesión encerrada no la lee por sus
   reglas de permisos, igual que hoy con el token del dispositivo; una sesión normal de Claude Code sí
@@ -98,16 +95,16 @@ Tableros que funcionaron: `relay.primal.net`, `relay.snort.social`, `relay.nostr
 ```
 Quien pregunta                          Tableros públicos (Nostr)            Quien contesta
 ──────────────                          ─────────────────────────            ──────────────
-CLI / servidor MCP ── sobres nuevos ──► [ hasta 5 tableros por destino ] ──► canal (plugin) en la
-     │                  por intento                                          sesión encerrada
-     │                                                                            │
-~/.agentbridge/                                                        ~/.agentbridge/
-  identity.json   (llave)                                                identity.json
-  agentbridge.db  (contactos, preguntas enviadas,                        agentbridge.db (aprobados,
-                   cursores)                                              solicitudes, cola, intentos,
-                                                                          respuestas, cursores)
-                                                                       ~/.agentbridge-responder/
-                                                                          perfil de Claude Code
+CLI (sincroniza y cierra) ── sobres ──► [ hasta 5 tableros por destino ] ──► canal (plugin) en la
+servidor MCP (persistente)                                                   sesión encerrada:
+     │                                                                       dueño exclusivo del
+~/.agentbridge/                                                              despacho
+  identity.json                                                                   │
+  agentbridge.db                                                         ~/.agentbridge/
+                                                                           identity.json
+                                                                           agentbridge.db
+                                                                         ~/.agentbridge-responder/
+                                                                           perfil de Claude Code
 ```
 
 El relay era el archivero y el coordinador de turnos. En la 0.2 cada computadora lleva su propio
@@ -118,9 +115,9 @@ archivero (SQLite) y el canal de quien contesta asume la coordinación de turnos
 `apps/relay` completo con sus pruebas y helpers de Postgres, su entrada en `workspaces`,
 `render.yaml`, el botón "Deploy to Render", `ADMIN_TOKEN`, `admin enroll-link`, `enroll`, `invite`,
 `accept`, `RelayHttpClient` (`packages/core/src/http.ts`), `RelayWsClient`
-(`packages/channel/src/relay-client.ts`), `TicketView` y los mensajes de servidor de
-`packages/core/src/protocol.ts`, y el script `db:up`. Con ellos desaparecen los pendientes de
-`docs/known-gaps.md` que solo existen en el relay.
+(`packages/channel/src/relay-client.ts`), `InFlight` (`packages/channel/src/inflight.ts`),
+`TicketView` y los mensajes de servidor de `packages/core/src/protocol.ts`, y el script `db:up`. Con
+ellos desaparecen los pendientes de `docs/known-gaps.md` que solo existen en el relay.
 
 ### Qué se queda igual
 
@@ -131,7 +128,7 @@ su código de 4 caracteres, `LIMITS.questionMaxChars`, `answerMaxChars`, `source
 `maxOpenTicketsPerPair`, `maxTicketsPerPairPerDay` y `attemptTimeoutMs`, y el traductor de errores
 `packages/cli/src/spanish-errors.ts`.
 
-### Qué cambia en código existente (no "se queda igual")
+### Qué cambia en código existente
 
 - **`setup-responder` y `doctor`:** hoy `startScript()` y `runDoctor()` usan un solo `home` para la
   credencial y para el perfil de Claude Code (`setup-responder.ts:87`, `doctor.ts:150`). Se separan
@@ -139,43 +136,46 @@ su código de 4 caracteres, `LIMITS.questionMaxChars`, `answerMaxChars`, `source
   en sus opciones de línea de comandos y en `start.sh`, que exporta
   `AGENTBRIDGE_HOME=<identityHome>` y `CLAUDE_CONFIG_DIR=<profileHome>/claude`. Las dos rutas se
   verifican fuera de la carpeta compartida. Desaparece la copia de credenciales entre carpetas que
-  hoy hace `setup` (errores C2 y token rancio).
-- **Canal:** `RelayConnection` e `InFlight` no bastan, porque `InFlight.start()` sobrescribe la
-  pregunta activa (`inflight.ts:25`) y la cola, los tiempos límite y la recuperación vivían en el
-  relay. El canal pasa a usar la unidad `dispatcher` (abajo). El texto de `reply` deja de decir
-  "Respuesta entregada" (`channel.ts:99`): dice que la respuesta quedó guardada y en envío, porque
-  un `OK` de un tablero no significa que la otra persona la recibió. Perder algunos tableros ya no
-  cancela la pregunta activa.
+  hoy hace `setup`.
+- **Canal:** el estado en memoria que `reply` consulta hoy antes de enviar (`channel.ts:89`) se
+  sustituye por transacciones en SQLite (ver "Despacho"). El texto de `reply` deja de decir
+  "Respuesta entregada" (`channel.ts:99`): dice que la respuesta quedó guardada y en envío. Perder
+  tableros no cancela la pregunta activa.
 - **Servidor MCP de quien pregunta:** `AskerApi` hoy es `Pick<RelayHttpClient, …>` con estados
   `queued/dispatched/…` y `online: boolean` (`mcp-asker.ts:10`, `protocol.ts:24`). Se reemplaza por
-  la interfaz `AskerService` con los estados nuevos y sin presencia: Nostr no permite saber si
-  alguien está en línea, y las herramientas lo dicen así. Se agrega la herramienta `connect`.
+  `AskerService`, con los estados nuevos y sin presencia: Nostr no permite saber si alguien está en
+  línea y las herramientas lo dicen así. Se agrega la herramienta `connect`.
+- **CLI:** `ask` y `ticket` (`ask.ts:61`) usan el ciclo de sincronización de "Clientes de corta
+  vida".
+- **Empaquetado:** `scripts/pack.mjs:90` fija hoy `engines` por su cuenta en `>=22.4`; pasa a
+  `>=22.13`, igual que el `package.json` raíz.
 
 ### Unidades nuevas
 
 Cada una con un solo propósito y probable por separado:
 
-1. **`identity`** (`packages/core`): crea la llave secp256k1 en `identity.json` con creación
-   exclusiva (`wx`, 0600, carpeta 0700), de modo que dos `setup` simultáneos no generen identidades
-   distintas; lee la llave; produce y lee el enlace (`agentbridge:` + `nprofile` NIP-19).
-2. **`relay-url`** (`packages/core`): valida direcciones de tableros como entrada hostil.
-3. **`envelope`** (`packages/core`): arma y abre sobres, con la tubería de validación y los topes por
-   capa de la sección "Protocolo", incluida la prueba de trabajo.
-4. **`boards`** (`packages/core`): conexiones a tableros con AUTH NIP-42, publicación, suscripción,
-   paginación, límites de ritmo y manejo de `CLOSED`.
-5. **`store`** (`packages/core`): SQLite con esquema versionado y transacciones; las máquinas de
-   estados se aplican aquí.
-6. **`dispatcher`** (`packages/channel`): cola persistente, un único despachador por identidad,
-   intentos, tiempo límite y recuperación.
-7. **`asker-service`** (`packages/cli`): `AskerService` para CLI y servidor MCP, con reintentos.
+1. **`identity`** (`packages/core`): crea la llave secp256k1 escribiendo un archivo temporal completo
+   (0600) y enlazándolo con `link()` a `identity.json`, que falla si ya existe: dos `setup`
+   simultáneos no generan identidades distintas ni dejan un archivo a medias. Lee la llave; produce y
+   lee el enlace (`agentbridge:` + `nprofile` NIP-19).
+2. **`relay-url`** (`packages/core`): valida direcciones de tableros como entrada hostil y provee la
+   función de resolución que usa el propio socket.
+3. **`envelope`** (`packages/core`): arma y abre sobres con la tubería de recepción y los topes por
+   capa. La prueba de trabajo corre en un `worker_thread`.
+4. **`boards`** (`packages/core`): conexiones con AUTH NIP-42, publicación, suscripción en vivo,
+   recuperación histórica paginada, contrapresión y manejo de `CLOSED`.
+5. **`store`** (`packages/core`): SQLite con esquema versionado; las máquinas de estados, las claves
+   únicas y los reclamos transaccionales viven aquí.
+6. **`dispatcher`** (`packages/channel`): bloqueo exclusivo del canal, cola, intentos, tiempo límite
+   y recuperación.
+7. **`asker-service`** (`packages/cli`): `AskerService` para CLI y servidor MCP.
 
 ## Protocolo
 
 ### Mensajes
 
-Todo mensaje es el contenido JSON de un rumor (kind interno propio, fijo) dentro de un sello
-(kind 13) dentro de un sobre (kind 1059). El contenido lleva `v: 1`, `type` y `msgId` (uuid del
-mensaje lógico, igual en todos sus reintentos).
+Todo mensaje es el contenido JSON de un **rumor** (kind interno propio, fijo) dentro de un sello
+(kind 13) dentro de un sobre (kind 1059). El contenido lleva `v: 1` y `type`.
 
 | `type` | Dirección | Campos propios |
 |---|---|---|
@@ -183,47 +183,60 @@ mensaje lógico, igual en todos sus reintentos).
 | `connect_approved` | contesta → pregunta | `requestId`, `generation`, `name`, `relays` |
 | `connect_rejected` | contesta → pregunta | `requestId` |
 | `connect_revoked` | contesta → pregunta | `generation` |
-| `question` | pregunta → contesta | `questionId`, `generation`, `text`, `expiresAt` |
+| `question` | pregunta → contesta | `questionId`, `generation`, `text` |
 | `receipt` | contesta → pregunta | `questionId` |
 | `answer` | contesta → pregunta | `questionId`, `text`, `source`, `confidence` |
 | `rejected` | contesta → pregunta | `questionId`, `reason`: `expired` \| `limit` \| `unanswered` \| `stale_generation` |
+
+### Identidad de mensajes y reintentos
+
+- **Identidad del mensaje:** `(senderPubkey, rumor.id)`. El `id` del rumor cubre contenido, tipo,
+  autor y `created_at`.
+- **Un reintento reusa el mismo rumor** (mismo `id`, misma fecha) dentro de un sello y un sobre
+  **nuevos** (llave desechable nueva, prueba de trabajo nueva). Así ningún tablero ni cliente descarta
+  el reintento como duplicado de sobre, y el receptor lo reconoce como el mismo mensaje.
+- **Identidad de la entidad:** `(senderPubkey, questionId)` para una pregunta y
+  `(senderPubkey, requestId)` para una solicitud. Sus campos inmutables son el `rumor.id` de la
+  pregunta o solicitud original, su texto y su `generation`. Si llega otro rumor distinto con la misma
+  identidad de entidad, se descarta y se registra; no altera nada.
+- **Respuestas de quien contesta:** una sola decisión por pregunta, guardada antes de enviarse:
+  `receipt` puede coexistir con exactamente una de `answer` o `rejected`, nunca con ambas. Los
+  rumores de respuesta se guardan y cada regeneración reenvía **el mismo rumor** en sobre nuevo.
+
+### Fechas
+
+- `created_at` del sobre ≤ ahora + 10 min.
+- `rumor.created_at` ≤ ahora + 10 min al recibirlo por primera vez.
+- Una pregunta vence en `rumor.created_at` + 24 h. El remitente no puede elegir otra fecha: el campo
+  no existe. Como `rumor.created_at` no puede estar en el futuro y los reintentos reusan el rumor, los
+  reintentos no renuevan el plazo.
+- Las decisiones (claves de entidad, `generation` máxima observada, decisión final de cada pregunta)
+  se conservan **9 días** (7 de retención más 2 de fechas aleatorias de NIP-59). El contenido de
+  preguntas y respuestas se borra a los 7 días. Un reintento que llegue después de 9 días cae fuera
+  del plazo por su propia fecha.
 
 ### Tubería de recepción, en este orden
 
 Cada paso es más caro que el anterior; un sobre que falla un paso no llega al siguiente.
 
-1. Tamaño del evento ≤ 64 KB; `kind` 1059; etiqueta `p` igual a mi llave; `created_at` no mayor a
-   ahora + 10 min.
-2. `id` recalculado igual al declarado, y prueba de trabajo NIP-13 de ese `id` ≥ la dificultad
-   configurada (16 bits por defecto).
-3. Límite de ritmo: como máximo 120 sobres por minuto por tablero; el excedente se ignora y se
-   registra.
+1. Tamaño del evento ≤ 64 KB; `kind` 1059; etiqueta `p` igual a mi llave; `created_at` válido.
+2. `id` recalculado igual al declarado y prueba de trabajo NIP-13 de ese `id` ≥ 16 bits.
+3. Deduplicación de sobre por `id` en una caché acotada.
 4. Firma del sobre válida.
-5. Descifrado del sobre; el sello resultante ≤ 48 KB, kind 13, hash y firma válidos.
-6. Descifrado del sello; el rumor resultante ≤ 32 KB, kind interno correcto, `id` recalculado,
-   `rumor.pubkey === seal.pubkey`.
-7. Contenido JSON validado con zod, `v === 1`, campos de texto dentro de `LIMITS` y ≤ 16 KB en UTF-8.
-8. Autorización según `type` y remitente (ver "Conexión" y "Entrega"). Cualquier mensaje que no sea
-   `connect_request` de una llave sin relación se descarta sin guardar nada.
+5. Entrada en la **cola de descifrado**: acotada a 200 sobres, un descifrado a la vez. Si la cola está
+   llena, `boards` deja de leer de ese tablero (contrapresión) en lugar de descartar.
+6. Descifrado del sobre; el sello ≤ 48 KB, kind 13, hash y firma válidos.
+7. Descifrado del sello; el rumor ≤ 32 KB, kind interno correcto, `id` recalculado,
+   `rumor.pubkey === seal.pubkey`, fecha válida.
+8. Contenido JSON validado con zod, `v === 1`, textos dentro de `LIMITS` y ≤ 16 KB en UTF-8.
+9. Si es `connect_request`: prueba de trabajo del sobre ≥ 22 bits.
+10. Autorización según `type` y remitente. Cualquier mensaje que no sea `connect_request` de una llave
+    sin relación se descarta sin guardar nada.
 
 El envío verifica los mismos topes por capa antes de publicar y devuelve un error en español si se
 exceden. Estos topes son propios y pequeños; no dependemos del formato extendido de NIP-44 para
 mensajes de más de 65 535 bytes. `nostr-tools` se fija en versión exacta y el plan incluye vectores
 de prueba con Unicode y escapes JSON.
-
-### Reintentos y deduplicación
-
-- Cada reintento de un mensaje lógico es un **sobre nuevo** (llave desechable nueva, `created_at`
-  nuevo, prueba de trabajo nueva) con el mismo `msgId`. Así un tablero o cliente que ya vio un sobre
-  no descarta el reintento.
-- La deduplicación de efectos se hace por mensaje lógico con remitente: `(senderPubkey, questionId)`
-  para preguntas y sus respuestas, `(senderPubkey, requestId)` para solicitudes. Si llega el mismo
-  identificador con contenido distinto, se rechaza y se registra.
-- Un reintento de algo ya procesado no repite el efecto, pero **sí regenera** la contestación
-  correspondiente como sobre nuevo: `receipt`, `answer` guardada, `rejected`, `connect_approved` o
-  `connect_rejected`.
-- `expiresAt` debe ser ≤ `rumor.created_at` + 24 h + 10 min de tolerancia de reloj; si no, se
-  rechaza con `expired`.
 
 ## Direcciones de tableros
 
@@ -232,30 +245,34 @@ dirección solo si:
 
 - el esquema es `wss://`, sin usuario, contraseña, consulta ni fragmento, y mide ≤ 200 caracteres;
 - el host es un nombre de dominio, no una IP literal;
-- al momento de conectar, el nombre resuelve solo a direcciones públicas: se rechazan loopback,
-  privadas, link-local, CGNAT, ULA y multicast;
 - la conexión no sigue redirecciones.
 
+La resolución DNS se valida **dentro de la función `lookup` que usa el propio socket**: se rechazan
+loopback, privadas, link-local, CGNAT, ULA y multicast, y el socket se conecta a la misma dirección
+validada, sin una segunda resolución que permita DNS rebinding. TLS se verifica contra el nombre del
+host.
+
 Máximo 5 por contacto. Las direcciones de un `nprofile` son un localizador sin firma. Solo cambian
-por un mensaje autenticado del propio contacto (`connect_request` o `connect_approved`).
+por un mensaje autenticado del contacto cuya `generation` sea ≥ la máxima observada (o por su
+`connect_request` mientras está pendiente).
 
 ## Tableros: conexión, lectura y cursores
 
-- **AUTH NIP-42:** al recibir un reto `AUTH`, se responde firmando con la llave propia. Un `CLOSED`
-  o `OK false` con prefijo `auth-required:` provoca autenticación y un reintento de la suscripción o
-  publicación.
-- **Éxito de publicación:** al menos 1 tablero respondió `OK true`. Si ninguno, el mensaje queda en
-  la bandeja de salida (`outbox`) y se reintenta con espera creciente.
-- **Cursores:** uno por tablero y por papel (pregunta, contesta), en SQLite. El cursor guarda la hora
-  local de la última `EOSE` cuyos eventos ya se persistieron; nunca avanza antes de persistir. La
-  siguiente suscripción usa `since = cursor − 2 días − 10 min`, porque NIP-59 pone fechas al azar
-  hasta 2 días atrás. `since` filtra por `created_at`, no por hora de llegada al tablero, así que la
-  deduplicación hace inofensivo releer.
-- **Recuperación larga:** en la primera ejecución o tras más de 2 días sin cursor, se lee hacia atrás
-  por ventanas de 1 día con `until` y `limit`, hasta 7 días, para que el límite de resultados de un
-  tablero no trunque el historial.
+- **AUTH NIP-42:** al recibir un reto `AUTH`, se responde firmando con la llave propia. Un `CLOSED` o
+  `OK false` con prefijo `auth-required:` provoca autenticación y un reintento.
+- **Éxito de publicación:** al menos 1 tablero respondió `OK true`.
+- **Recepción en vivo:** suscripción con `since = ahora − 2 días − 10 min` al conectar. Nunca descarta
+  por ritmo: aplica contrapresión.
+- **Recuperación histórica**, separada de la recepción en vivo: cubre hasta 9 días hacia atrás por
+  ventanas de 1 día. Dentro de cada ventana pagina con `until` y `limit` = 200: si llegan 200
+  resultados, repite con `until` = la fecha más antigua recibida (incluida; el traslape se
+  deduplica). Si los 200 comparten el mismo segundo, repite con `limit` 400 y luego 800; si aún no
+  alcanza, la ventana queda marcada **incompleta** y se reintenta más tarde.
+- **Cursores:** uno por tablero y por papel, en SQLite. Registran qué ventanas están completas. Una
+  ventana solo se marca completa después de persistir todo lo recibido en ella; `EOSE` por sí solo no
+  demuestra que esté completa.
 - **`doctor`:** por cada tablero, publica un sobre dirigido a la propia llave y lo vuelve a leer.
-  "Responde" significa que se pudo publicar **y** leer, no solo conectar.
+  "Responde" significa que se pudo publicar **y** leer.
 
 ## Conexión entre personas
 
@@ -263,41 +280,49 @@ por un mensaje autenticado del propio contacto (`connect_request` o `connect_app
 
 1. Quien contesta corre `setup`: se crea su llave y se muestra su enlace (también con `link`).
 2. Quien pregunta corre `connect <enlace> --note "…"` o se lo pide a su Claude Code (herramienta MCP
-   `connect`). Se genera `requestId`, se guarda el contacto como `pending` y se envía
-   `connect_request`, que se reintenta hasta recibir `connect_approved` o `connect_rejected`, o
-   durante 7 días.
+   `connect`). Se genera `requestId`, se guarda el contacto como `pending` y se encola
+   `connect_request` con prueba de trabajo de 22 bits (unos segundos, una vez). Se reintenta hasta
+   recibir `connect_approved` o `connect_rejected`, o durante 7 días.
 3. El canal de quien contesta guarda la solicitud y lanza una notificación del sistema con **texto
-   fijo** ("AgentBridge: tienes solicitudes nuevas"), sin interpolar nombre ni nota, invocada con
-   argumentos sin shell (macOS `osascript`; Linux `notify-send` si existe). Solicitudes del mismo
-   minuto producen un solo aviso.
+   fijo** ("AgentBridge: tienes solicitudes nuevas"), sin datos de terceros, invocada con argumentos
+   sin shell (macOS `osascript`; Linux `notify-send` si existe). Como máximo una cada 10 minutos.
 4. `requests` lista cada solicitud con un **identificador estable** (los primeros 8 caracteres de la
    llave del solicitante), nombre declarado, nota y el aviso "si lo apruebas, podrá leer tu carpeta
-   compartida". `approve <id>` o `reject <id>`; un índice numérico no se acepta porque la lista
-   puede cambiar entre listar y aprobar.
-5. Aprobar, en una transacción: incrementa la `generation` de ese contacto, lo marca `approved`,
-   asigna un nombre local válido para `HandleSchema` y encola `connect_approved`.
+   compartida". `approve <id>` o `reject <id>`; no se acepta un índice numérico.
+5. `approve` y `reject` son idempotentes por `requestId`. Un reintento de una solicitud ya decidida
+   regenera la misma decisión. En quien pregunta, `connect_rejected` y `connect_approved` solo se
+   aplican si su `requestId` es el de la solicitud pendiente actual; los demás se ignoran.
 
-### Revocación atómica
+### Generaciones
 
-`revoke <nombre>`, en una sola transacción: marca el contacto `revoked`, incrementa `generation`,
-cancela todas las preguntas de ese contacto que no estén contestadas y encola `connect_revoked`.
+Quien contesta lleva un contador `generation` por contacto que **solo crece**: cada `approve` y cada
+`revoke` lo incrementa, así que cada generación corresponde a exactamente un estado. Ambos lados
+guardan la **máxima generación observada** para cada contacto, en cualquier estado, incluido
+`pending`, e ignoran todo mensaje con `generation` menor o igual a esa marca. Un `connect_revoked(2)`
+retrasado que llega después de `connect_approved(3)` se ignora.
 
-- El despachador toma la siguiente pregunta **dentro de una transacción** que verifica que el
-  contacto sigue `approved` con la misma `generation` con la que se admitió la pregunta.
-- Antes de encolar una respuesta para publicar, otra transacción verifica lo mismo. Si falla, la
-  respuesta se descarta y la pregunta activa se cancela en Claude, como hoy con `cancel` por
-  `revoked`.
-- Volver a aprobar crea una `generation` nueva: las preguntas de la generación anterior no
-  resucitan y se contestan con `rejected` / `stale_generation` si llegan otra vez.
-- Las respuestas guardadas no se reenvían a un contacto revocado.
+### Revocación
+
+`revoke <nombre>`, en **una sola transacción**: marca el contacto `revoked`, incrementa
+`generation`, fija la decisión final `rejected` / `stale_generation` en sus preguntas no contestadas
+(sin encolarla; se regenera solo si llega un reintento), **borra de la bandeja de salida todo lo
+dirigido a ese contacto que no esté reclamado** y encola `connect_revoked`.
+
+El contrato exacto:
+
+- **Despacho a Claude:** la transacción que reserva una pregunta verifica `approved` y la misma
+  `generation` con la que se admitió. Si `revoke` confirma después de esa reserva y antes de que
+  Claude conteste, el canal le avisa a Claude que la pregunta fue cancelada, y la transacción de
+  `reply` la rechaza.
+- **Respuesta:** la transacción de `reply` es el punto de autorización final para crear una
+  respuesta. Si el permiso no sigue vigente, no se guarda ni se encola nada.
+- **Publicación:** el publicador **reclama** cada salida en una transacción que verifica permiso y
+  `generation`. La única ventana admitida: una salida ya reclamada antes de que `revoke` confirme
+  puede terminar de escribirse en el socket (milisegundos). No hay otra.
+- Las respuestas guardadas no se regeneran para un contacto revocado.
+- Volver a aprobar crea una `generation` nueva: las preguntas anteriores no resucitan y sus
+  reintentos reciben `rejected` / `stale_generation`.
 - Revocar **no** retira sobres ya publicados ni respuestas que la otra persona ya recibió.
-
-### Estados del contacto
-
-| Lado | Estados | Reglas |
-|---|---|---|
-| Quien contesta | `requested` → `approved(g)` \| `rejected`; `approved(g)` → `revoked(g+1)` → `approved(g+2)` | Solo `approve`, `reject` y `revoke` cambian el estado |
-| Quien pregunta | `pending` → `approved(g)` \| `rejected`; `approved(g)` → `revoked(g')` | Se ignora cualquier mensaje con `generation` menor o igual a la última revocación conocida |
 
 ## Entrega de preguntas y respuestas
 
@@ -305,37 +330,66 @@ cancela todas las preguntas de ese contacto que no estén contestadas y encola `
 
 Una transacción, al recibir un `question` válido de un contacto:
 
-1. Si `(senderPubkey, questionId)` ya existe: regenerar lo que corresponda a su estado (`receipt`,
-   `answer` guardada o `rejected`) y terminar.
-2. Si el contacto no está `approved` con esa `generation`: `rejected` / `stale_generation` si hubo
-   una generación anterior; si nunca hubo relación, descartar en silencio.
-3. Si expiró: `rejected` / `expired`.
-4. Si excede 5 abiertas o 20 por día para ese contacto: `rejected` / `limit`.
-5. Si no: persistir en la cola como `queued` y **después** encolar `receipt`.
+1. Si la entidad `(senderPubkey, questionId)` existe con el mismo `rumor.id`: regenerar exactamente lo
+   ya decidido (el mismo rumor de `receipt`, y el de `answer` o `rejected` si existe), sujeto al
+   límite de regeneración, y terminar. Para un contacto revocado solo se regenera un `rejected`, nunca
+   `receipt` ni `answer`. Si existe con otro `rumor.id`: descartar y registrar.
+2. Si el contacto no está `approved` con esa `generation`: decisión `rejected` / `stale_generation`
+   si hubo relación; descartar en silencio si nunca la hubo.
+3. Si venció: decisión `rejected` / `expired`.
+4. Si excede 5 abiertas o 20 por día para ese contacto: decisión `rejected` / `limit`.
+5. Si no: persistir la pregunta como `queued` con decisión `receipt`.
 
-### Despachador
+Toda decisión se **guarda antes de encolarse** y es final: un reintento posterior la repite, aunque
+las condiciones hayan cambiado (por ejemplo, ya no se excede el límite).
 
-- **Un solo despachador por identidad:** el proceso del canal toma un arrendamiento en SQLite
-  (`dispatcher_lease`, con dueño y latido cada 15 s, vencido a los 60 s). Otro canal con la misma
-  identidad sigue admitiendo y guardando, pero no entrega preguntas a Claude.
-- **Una a la vez:** toma la pregunta `queued` más antigua, crea un intento con `attemptId` y código de
-  4 caracteres, la marca `dispatched` y la manda a Claude.
-- **Tiempo límite:** si Claude no llama `reply` en `attemptTimeoutMs` (10 min), se cancela el intento
-  en Claude y la pregunta vuelve a `queued`. Tras 2 intentos fallidos pasa a `unanswered` y se encola
-  `rejected` / `unanswered`.
-- **Recuperación:** al arrancar, los intentos `dispatched` vencidos vuelven a `queued`.
-- **Respuesta:** `reply` valida el código, y en una transacción verifica el permiso, guarda la
-  respuesta, marca la pregunta `answered` y encola `answer`. La respuesta se guarda 7 días.
-- **Tableros caídos:** no cancelan la pregunta activa. Las respuestas esperan en `outbox` hasta
-  poder publicarse.
+### Despacho
+
+- **Bloqueo exclusivo del canal:** al arrancar, el canal toma el bloqueo de la identidad en SQLite
+  (`channel_lock`: PID, hora de inicio del proceso y un `epoch` que crece en cada toma). Si el dueño
+  registrado sigue vivo, el segundo canal **se niega a arrancar** con un error en español. Solo se
+  toma el bloqueo de un proceso que ya no existe. Toda escritura del despacho verifica su `epoch`
+  (fencing): un canal que despierta después de perder el bloqueo no puede confirmar nada.
+- **Una a la vez:** en una transacción, reserva la pregunta `queued` más antigua, crea un intento con
+  `attemptId`, código de 4 caracteres y `deadline` = ahora + `attemptTimeoutMs`, y la marca
+  `dispatched`. Después de confirmar, la manda a Claude.
+- **`reply`**, en una transacción: verifica código, que el intento sea el vigente, que no haya pasado
+  su `deadline`, el `epoch` del canal y el permiso; guarda la respuesta, marca la pregunta `answered`
+  y encola `answer`. Una respuesta tardía o de un intento viejo se rechaza con un mensaje a Claude.
+- **Tiempo límite:** al vencer el `deadline`, se cancela el intento en Claude y la pregunta vuelve a
+  `queued`. Tras 2 intentos vencidos, decisión `rejected` / `unanswered`.
+- **Recuperación:** al tomar el bloqueo, los intentos `dispatched` de un `epoch` anterior vuelven a
+  `queued`.
+
+### Bandeja de salida y límites de trabajo
+
+- **Una fila por mensaje lógico** (clave: destinatario + `rumor.id`); regenerar actualiza la fila, no
+  crea otra.
+- **Reclamo transaccional:** `claimed_by` y `claimed_until` (2 minutos). Una fila reclamada por un
+  proceso caído vuelve a estar disponible al vencer.
+- **Regeneración por reintentos:** como máximo una vez cada 10 minutos por mensaje lógico.
+- **Topes:** 1 MB en la bandeja por contacto y 20 MB por identidad; como máximo 60 publicaciones por
+  minuto por identidad. Al exceder, se pospone.
+
+### Clientes de corta vida
+
+`ask`, `ticket`, `contacts`, `connect`, `requests`, `approve`, `reject` y `revoke` siguen el ciclo
+**iniciar → sincronizar → operar → sincronizar → cerrar**:
+
+- **Sincronizar** (máximo 10 s): conectar a los tableros propios, leer desde el cursor, procesar lo
+  recibido, publicar las salidas vencidas (incluidos los reintentos que tocan) y persistir.
+- **`ask --wait N`** mantiene la conexión hasta N segundos esperando la respuesta; `ticket` sincroniza
+  y muestra el estado.
+- **Cerrar** termina conexiones y temporizadores, para que el comando siempre termine.
+- Solo el servidor MCP y el canal, que son persistentes, corren reintentos con temporizador. Quien
+  pregunta solo desde la terminal ve este aviso en español: los reintentos ocurren cada vez que corre
+  un comando.
 
 ### Reintentos de quien pregunta
 
-Mientras corre algún cliente (`ask`, `ticket`, `contacts` o el servidor MCP abierto), quien pregunta
-reenvía con sobre nuevo toda pregunta que no esté en un estado final: cada 5 min la primera hora,
-después cada 30 min, hasta 7 días desde el envío. **Recibir el acuse no detiene los reintentos**:
-solo los detiene `answer` o `rejected`. Si quien contesta ya respondió, cada reintento regenera la
-respuesta guardada, sin volver a llamar a Claude.
+Toda pregunta que no esté en un estado final se reintenta: cada 5 min la primera hora, después cada
+30 min, hasta 7 días desde su envío. **El acuse no detiene los reintentos**; solo los detiene `answer`
+o `rejected`.
 
 ### Estados de la pregunta, en quien pregunta
 
@@ -347,70 +401,67 @@ respuesta guardada, sin volver a llamar a Claude.
 | `sending` / `sent` / `received` | llega `rejected` autenticado | `rejected` (final) |
 | `sending` / `sent` / `received` | 7 días sin estado final | `lost` (final) |
 
-Las transiciones ocurren dentro de transacciones que leen el estado actual. Un estado final nunca
-cambia. Un `answer` válido gana aunque llegue después de las 24 h, porque la admisión la decide quien
-contesta. Los textos para Claude y la terminal distinguen "recibida" (llegó a su computadora) de
-"contestada".
+Las transiciones ocurren en transacciones que leen el estado actual; un estado final nunca cambia.
+Como quien contesta toma una sola decisión por pregunta, no pueden llegar `answer` y `rejected`
+auténticos para la misma pregunta; si llegara el segundo, se registra y se ignora. Los textos para
+Claude y la terminal distinguen "recibida" (llegó a su computadora) de "contestada".
 
 ## Estado local
 
-Una sola carpeta de identidad y estado, `~/.agentbridge` (o `AGENTBRIDGE_HOME`), 0700, para preguntar
-y contestar:
+Una sola carpeta de identidad y estado, `~/.agentbridge` (o `AGENTBRIDGE_HOME`), 0700:
 
-- `identity.json`, 0600, creado con `wx`.
-- `agentbridge.db`, SQLite en modo WAL con `busy_timeout`. Los archivos `-wal` y `-shm` se crean con
+- `identity.json`, 0600, creado con temporal + `link()`.
+- `agentbridge.db`, SQLite en modo WAL con `busy_timeout`; los archivos `-wal` y `-shm` se crean con
   `umask 077`.
-
-Tablas principales:
 
 | Tabla | Contenido |
 |---|---|
-| `contacts` | llave, nombre local, papel, estado, `generation`, tableros |
+| `contacts` | llave, nombre local, papel, estado, `generation` máxima observada, tableros |
 | `requests` | solicitudes entrantes pendientes |
-| `inbox_questions` | preguntas recibidas, estado, `generation`, respuesta guardada |
-| `attempts` | intentos del despachador |
+| `inbox_questions` | preguntas recibidas: `rumor.id`, texto, `generation`, estado, decisión final y rumores de respuesta |
+| `attempts` | intentos del despacho con `deadline` y `epoch` |
 | `outbox_questions` | preguntas enviadas y su estado |
-| `outbox` | mensajes por publicar, con reintentos |
-| `cursors` | último visto por tablero y papel |
-| `dispatcher_lease` | dueño actual del despacho |
+| `outbox` | mensajes por publicar: una fila por mensaje lógico, con reclamo |
+| `cursors` | ventanas completas por tablero y papel |
+| `channel_lock` | dueño actual del despacho y `epoch` |
 | `schema_version` | versión del esquema |
 
-Toda operación de lectura-modificación-escritura corre en una transacción `BEGIN IMMEDIATE`.
-`(senderPubkey, questionId)` y `(senderPubkey, requestId)` son claves únicas. Se requiere Node
-≥ 22.13, donde `node:sqlite` no necesita bandera; si Node emite un `ExperimentalWarning` de SQLite, el
-CLI filtra solo ese aviso. Una limpieza periódica borra respuestas guardadas, solicitudes y mensajes
-enviados de más de 7 días.
+Toda operación de lectura-modificación-escritura corre en `BEGIN IMMEDIATE`.
+`(senderPubkey, questionId)`, `(senderPubkey, requestId)` y `(recipient, rumor.id)` en `outbox` son
+claves únicas. Si Node emite un `ExperimentalWarning` de SQLite, el CLI filtra solo ese aviso. La
+limpieza borra contenido a los 7 días y decisiones a los 9.
 
 ## Seguridad y abuso
 
-- **Antes de descifrar:** tamaño, kind, destinatario, fecha, prueba de trabajo de 16 bits, firma y
-  límite de ritmo por tablero. Descifrar solo ocurre para sobres que pasan esos filtros.
-- **Solicitudes:** una pendiente por llave; máximo 20 en total. Si la lista está llena, **se desaloja
-  la más antigua** en vez de bloquear las nuevas. Una llave rechazada en los últimos 7 días se ignora.
-  Las solicitudes de más de 7 días se borran.
+- **Antes de descifrar:** tamaño, kind, destinatario, fecha, `id`, prueba de trabajo de 16 bits,
+  deduplicación y firma. Descifrar ocurre de a uno, en cola acotada con contrapresión.
+- **Solicitudes:** prueba de trabajo de 22 bits; una pendiente por llave; máximo 20 en total. Si la
+  lista está llena, se desaloja la más antigua. Una llave rechazada en los últimos 7 días se ignora.
+  Esto no impide que un atacante con recursos desplace solicitudes legítimas (ver "Privacidad").
 - **Sin relación:** cualquier mensaje que no sea `connect_request` de una llave sin relación se
-  descarta sin guardar ni contestar, así que no cuesta tokens y no sirve para rebotar spam.
-- **Memoria y disco acotados:** cachés de deduplicación en memoria con tope; filas acotadas por los
-  límites por contacto, el tope de solicitudes y la limpieza de 7 días.
-- **Suplantación y repetición:** tubería de recepción completa, claves únicas por remitente y
-  `expiresAt` acotado.
+  descarta sin guardar ni contestar.
+- **Trabajo acotado:** regeneración como máximo cada 10 minutos por mensaje, una fila de salida por
+  mensaje lógico, topes de bytes y de publicaciones por minuto, prueba de trabajo en `worker_thread`.
+- **Suplantación y repetición:** tubería de recepción completa, identidades de mensaje y de entidad,
+  decisiones persistentes durante 9 días y fechas acotadas.
 - **Direcciones de tableros:** ver "Direcciones de tableros".
-- **Notificaciones:** texto fijo, sin datos de terceros, sin shell.
+- **Notificaciones:** texto fijo, sin datos de terceros, sin shell, una cada 10 minutos como máximo.
 - **Instrucciones tramposas en preguntas:** sin cambios; la sesión encerrada sigue sin `Bash`, sin
   edición y sin lectura fuera de la carpeta.
-- **Errores:** ningún mensaje de error ni registro incluye la llave, contenido descifrado de
-  terceros ni rutas de la carpeta compartida.
+- **Errores:** ningún mensaje de error ni registro incluye la llave, contenido descifrado de terceros
+  ni rutas de la carpeta compartida.
 
 ## Cambios por componente
 
-- **CLI:** nuevos `link`, `connect`, `requests`, `approve <id>`, `reject <id>`; `revoke`,
-  `contacts`, `ask`, `ticket` y `whoami` pasan a SQLite y tableros; se borran `enroll`, `invite`,
-  `accept` y `admin`. `setup` ya no pide enlace de alta: crea la llave y, según el papel, muestra tu
-  enlace o pide el de la persona a quien quieres preguntar. Los comandos se nombran en inglés, como
-  hoy.
-- **`setup-responder` y `doctor`:** `identityHome` y `profileHome` separados. `doctor` revisa: llave
-  presente, 0600 y fuera de la carpeta compartida; carpeta 0700; base de datos accesible; por cada
-  tablero, publicar **y** leer; solicitudes pendientes; y lo que ya revisa de la sesión encerrada.
+- **CLI:** nuevos `link`, `connect`, `requests`, `approve <id>`, `reject <id>`; `revoke`, `contacts`,
+  `ask`, `ticket` y `whoami` pasan a SQLite, tableros y el ciclo de corta vida; se borran `enroll`,
+  `invite`, `accept` y `admin`. `setup` crea la llave y, según el papel, muestra tu enlace o pide el
+  de la persona a quien quieres preguntar. Toda instrucción impresa usa `CLI_COMMAND`, incluido el
+  aviso de `ask` que hoy dice `agentbridge ticket` (`ask.ts:73`). Los comandos se nombran en inglés.
+- **`setup-responder` y `doctor`:** `identityHome` y `profileHome` separados. `doctor` revisa llave
+  presente, 0600 y fuera de la carpeta compartida; carpeta 0700; base de datos accesible; bloqueo del
+  canal; por cada tablero, publicar **y** leer; solicitudes pendientes; y lo que ya revisa de la
+  sesión encerrada.
 - **Canal:** `dispatcher` en lugar de `RelayWsClient` + `InFlight`; notificación de solicitudes; texto
   de `reply` corregido.
 - **Servidor MCP de quien pregunta:** `AskerService`; herramientas `list_contacts` (sin presencia),
@@ -419,45 +470,58 @@ enviados de más de 7 días.
   `docs/known-gaps.md` reescritos para el flujo sin Render, con la sección de privacidad de este
   documento. El `CLAUDE.md` del proyecto deja de pedir Docker Postgres.
 - **Dependencias:** `nostr-tools` en versión exacta, empaquetada por esbuild en ambos bundles.
-  `engines.node` pasa a `>=22.13`.
+  `engines.node` pasa a `>=22.13` en el `package.json` raíz y en `scripts/pack.mjs`.
 - **Versión:** 0.2.0. Quien use 0.1.x vuelve a correr `setup`; no hay migración automática.
 
 ## Pruebas
 
 **Tablero falso en memoria** (NIP-01 sobre WebSocket) con: `EVENT`, `REQ` con `kinds`, `#p`,
 `since`, `until` y `limit`, `CLOSE`, `EOSE`, `OK`, `CLOSED`, AUTH NIP-42 obligatorio configurable,
-rechazo por tamaño, tope de resultados, y modos de falla para perder eventos, aceptar publicaciones
-sin permitir lectura y desconectar a mitad de una suscripción.
+rechazo por tamaño, tope de resultados, muchos eventos con el mismo `created_at`, y modos de falla
+para perder eventos, aceptar publicaciones sin permitir lectura, responder lento y desconectar a mitad
+de una suscripción.
 
-**Unitarias:** `identity` (enlace de ida y vuelta, creación exclusiva), `relay-url` (cada rango de
-direcciones prohibido, esquemas, longitudes), `envelope` (cada paso de la tubería de recepción en su
-orden, topes por capa con vectores Unicode y escapes JSON, prueba de trabajo), `store` (cada
-transición permitida y prohibida de las tablas de estados).
+**Unitarias:** `identity` (enlace de ida y vuelta, creación exclusiva sin archivo a medias),
+`relay-url` (cada rango prohibido, esquemas, longitudes, rebinding simulado en `lookup`), `envelope`
+(cada paso de la tubería en su orden, topes por capa con vectores Unicode y escapes JSON, 16 y 22 bits
+de prueba de trabajo, reintento que reusa el rumor), `store` (cada transición permitida y prohibida,
+claves únicas, reclamos y su vencimiento, generaciones que no retroceden).
 
 **Integración, sin internet:**
 - Flujo completo: solicitud → aprobación → pregunta → acuse → respuesta.
-- Quien contesta apagado y luego prendido; quien pregunta apagado y luego prendido.
+- Quien contesta apagado y luego prendido; quien pregunta solo con CLI, apagado y luego sincronizando.
 - Sobre perdido en 4 de 5 tableros; respuesta perdida en todos después del acuse (se recupera por
-  reintento); acuse perdido.
-- Caída del canal después del acuse y antes de contestar; caída después de guardar la respuesta y
-  antes de publicarla.
-- Revocación con preguntas en cola, con una pregunta activa y con una respuesta a punto de
-  publicarse; volver a aprobar sin resucitar preguntas.
-- Mismo `questionId` con contenido distinto; sobre de llave sin relación (no llega a Claude ni se
-  guarda); pregunta expirada; límites por contacto; lista de solicitudes llena (desalojo).
+  reintento); acuse perdido; pregunta que llega después de 24 h (`expired`); `rumor.created_at` en el
+  futuro (descartado).
+- Mismo `questionId` con otro rumor; `rejected` / `limit` repetido en un reintento posterior aunque
+  ya no se exceda el límite.
+- Caída del canal después del acuse y antes de contestar; después de guardar la respuesta y antes de
+  publicarla; con una fila de salida reclamada.
+- Revocación con preguntas en cola, con una pregunta activa, con respuesta encolada sin reclamar y con
+  respuesta reclamada; `connect_revoked` retrasado después de una aprobación más nueva; volver a
+  aprobar sin resucitar preguntas.
+- `reply` después del `deadline`; `reply` de un intento viejo tras un nuevo intento.
+- Sobre de llave sin relación (no llega a Claude ni se guarda); solicitud con 16 bits (rechazada);
+  lista de solicitudes llena (desalojo).
 - Tablero que exige AUTH para leer; tablero que acepta publicar pero rechaza leer (`doctor` lo marca);
-  tablero que rechaza por tamaño; recuperación larga con paginación y reloj simulado.
+  tablero que rechaza por tamaño; recuperación histórica de 9 días con paginación, empates de fecha y
+  una ventana incompleta; inundación que activa la contrapresión sin perder mensajes legítimos.
 - Dirección de tablero hostil en un enlace y en una solicitud.
+- Comandos de corta vida que siempre terminan, con tableros lentos o caídos.
 
-**Multiproceso:** dos procesos reales de Node sobre la misma carpeta: `approve` y `revoke`
-concurrentes con admisión; dos canales compitiendo por el arrendamiento; CLI y servidor MCP
-actualizando la misma pregunta; dos `setup` simultáneos creando identidad.
+**Multiproceso:** procesos reales de Node sobre la misma carpeta: `approve` y `revoke` concurrentes
+con admisión; un segundo canal que se niega a arrancar; un canal suspendido que despierta tras perder
+el bloqueo (fencing); CLI y servidor MCP actualizando la misma pregunta y reclamando la misma salida;
+dos `setup` simultáneos creando identidad.
 
 **Fallas de persistencia:** base de datos de solo lectura y disco lleno simulado: nada se publica sin
 haberse guardado antes.
 
 **En vivo, opcional** (`npm run test:live`, fuera de `npm test`): ida y vuelta completa contra
-tableros públicos reales y medición de límites de publicación al mandar 5 copias.
+tableros públicos reales y medición de límites de publicación.
+
+**Paquete:** antes de publicar, instalar el tarball de `npm run pack` y correr una prueba de humo con
+Node 22.13 y con Node 24.
 
 **Aceptación manual:** los 8 escenarios de seguridad de la sesión encerrada; prueba real entre dos
 personas en redes distintas; y una **prueba de 24 horas** con quien contesta apagado durante la noche
@@ -471,7 +535,7 @@ antes de apagar Render.
    `render.yaml`, `db:up`, y las suites que importan helpers de Postgres (por ejemplo
    `tests/e2e/pipe.test.ts`), para que `npm test` corra sin Docker desde el inicio.
 3. Construir la 0.2.0 unidad por unidad; `npm test` en verde en cada paso.
-4. `npm run test:live` en verde.
+4. `npm run test:live` en verde y prueba del paquete con Node 22.13 y 24.
 5. Aceptación manual, incluida la prueba de 24 horas.
 6. Publicar la 0.2.0 en npm y fusionar la rama.
 7. Borrar en Render el servicio `agentbridge-relay` y su base de datos (acción irreversible, se
@@ -481,22 +545,25 @@ antes de apagar Render.
 
 Respaldo de la llave y varios dispositivos por identidad; secreto hacia adelante; nombres legibles
 NIP-05; descubrimiento de tableros por kind 10050 y compatibilidad con apps NIP-17; quien contesta en
-la nube con la computadora apagada; tableros de pago; cliente web o móvil; ajuste automático de la
-dificultad de la prueba de trabajo.
+la nube con la computadora apagada; tableros de pago; cliente web o móvil; dificultad de prueba de
+trabajo configurable o negociada; más de un canal activo por identidad.
 
 ## Riesgos
 
 - **Tableros de la comunidad:** pueden cerrar, limitar o empezar a exigir pago para kind 1059.
   Mitigación: hasta 5 tableros por destino, lista configurable, AUTH soportado y `doctor` probando
   publicar y leer.
-- **Retención real desconocida más allá de 20 minutos.** Mitigación: reintentos con sobre nuevo
-  durante 7 días y la prueba de 24 horas antes de apagar Render.
+- **Retención real desconocida más allá de 20 minutos.** Mitigación: reintentos durante 7 días y la
+  prueba de 24 horas antes de apagar Render.
 - **Límites de publicación de los tableros** con 5 copias por mensaje y reintentos: se miden en
   `test:live`; si hace falta, bajar a 3 copias.
-- **`node:sqlite`** es relativamente nuevo en Node: se fija el mínimo en 22.13 y las pruebas
-  multiproceso lo cubren.
-- **Costo de la prueba de trabajo** en computadoras lentas: 16 bits por defecto; se mide en las
-  pruebas.
+- **`node:sqlite`** es relativamente nuevo: mínimo 22.13, pruebas multiproceso y prueba del paquete
+  con esa versión.
+- **Costo de la prueba de trabajo** en computadoras lentas: 16 bits por mensaje y 22 bits por
+  solicitud; se mide en las pruebas.
 - **Canal de Claude Code** sigue requiriendo `--dangerously-load-development-channels`, igual que en
   la 0.1.
 - **IP y llave visibles** para los tableros a los que te conectas (ver "Privacidad").
+- **Tamaño del cambio:** la 0.2 reemplaza el transporte, el estado y la coordinación de turnos a la
+  vez. El plan debe construirlo por unidades independientes, cada una con sus pruebas en verde antes
+  de la siguiente.
