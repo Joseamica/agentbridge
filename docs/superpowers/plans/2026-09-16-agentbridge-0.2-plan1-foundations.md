@@ -18,11 +18,12 @@
 - Proof of work (NIP-13), fixed in the protocol: **16 bits** on every wrap, **22 bits** on wraps carrying `connect_request`. Not configurable.
 - Size caps per layer: wrap event ≤ 64 KB (65 536 bytes, serialized JSON) and the outgoing `["EVENT",…]` frame ≤ 64 KB; seal ≤ 48 KB (49 152 bytes); rumor ≤ 32 KB (32 768 bytes); every text field ≤ 16 KB (16 384 bytes) in UTF-8 **and** within `LIMITS` (`questionMaxChars` 4000, `answerMaxChars` 8000, `sourceMaxChars` 500).
 - Time rules: any `created_at` (wrap or rumor) may be at most **10 minutes** in the future. A question expires at `rumor.created_at + 24 h`. A `connect_request` is accepted only if its `rumor.created_at` is at most **7 days** old. NIP-59 randomizes seal and wrap `created_at` up to **2 days** back. Every wrap carries a NIP-40 `expiration` tag at publish time + 7 days.
-- Retention: message content 7 days; message decisions 9 days; contact state (generation counter, permission state, max observed generation, relays) never expires.
+- Retention: message content 7 days; message decisions (including request records) 9 days; contact state (generation counter, permission state, max observed generation, relays) never expires.
 - Contacts: at most 5 relays per contact; one pending inbound request per public key; at most 20 pending inbound requests (evict the oldest); a key rejected in the last 7 days is ignored; permission changes need a generation **greater** than the max observed; questions need a generation **equal** to the current approved one.
-- Relay URLs are hostile input: `wss://` only, no credentials, query or fragment, ≤ 200 characters, host must be a domain name (not an IP literal), DNS answers validated inside the socket's own `lookup` (no loopback, private, link-local, CGNAT, ULA, multicast, documentation, benchmarking or reserved ranges, no IPv4-mapped or NAT64 IPv6), no redirects, TLS verified against the host name.
-- Receiving: bounded receive queue of 200, one decryption at a time, backpressure (pause reading) instead of dropping. Live subscription `since = now − 2 days − 10 min`. History recovery covers 9 days in 1-day windows, pages with `limit` 200, escalates to 400 then 800 when a full page shares one second, otherwise marks the window incomplete. A window is marked complete only after everything received in it is persisted **and** its end is older than `read time − 2 days − 10 min`.
-- Outbox: one row per logical message (`recipient` + `rumor_id`); claims last 2 minutes; regeneration at most once every 10 minutes per logical message; pending bytes ≤ 1 MB per recipient and ≤ 20 MB per identity (over the cap the row is stored but postponed 10 minutes); at most 60 publishes per minute per identity; asker retry schedule every 5 min during the first hour, then every 30 min, until 7 days after first enqueue.
+- Relay URLs are hostile input: `wss://` only, no credentials, query or fragment, ≤ 200 characters, host must be a domain name (not an IP literal), DNS answers validated inside the socket's own `lookup` (no loopback, private, link-local, CGNAT, ULA, multicast, documentation, benchmarking or reserved ranges, no IPv4-mapped or NAT64 IPv6), no redirects, TLS verified against the host name. The production socket factory re-validates every URL with `checkRelayUrl`, so no caller can bypass the rules with an IP literal.
+- Receiving: frames are read from each socket sequentially and every handler is awaited, so `ws`'s own flow control stops reading when AgentBridge falls behind; the receive queue holds at most 200 items (a push waits for room), with one decryption at a time and nothing dropped. Live subscription `since = now − 2 days − 10 min`. If processing fails after `precheckWrap`, the caller deletes the wrap id from `SeenIds`.
+- History recovery covers 9 days in 1-day windows, pages with `limit` 200 and escalates to 400 then 800 when a page that may be truncated shares one second; otherwise the window is incomplete. A page counts as possibly truncated when it holds at least `min(limit, trusted)` events, where `trusted = max(100, largest page this relay has returned)`. Short pages are confirmed with a strictly older query. Accepted limitation: a relay that caps filter limits below 100 can hide same-second ties from history recovery; NIP-59 randomizes seconds over two days, every message goes to up to 5 relays, and senders retry with fresh wraps for 7 days. A window is marked complete only after everything received in it is persisted **and** its end is older than `read time − 2 days − 10 min`.
+- Outbox: one row per logical message (`recipient` + `rumor_id`); `claimDue` abandons expired rows first and asks an `authorize` callback inside its transaction before claiming each row (unauthorized rows are abandoned); claims last 2 minutes; regeneration at most once every 10 minutes per logical message; pending bytes ≤ 1 MB per recipient and ≤ 20 MB per identity (over the cap the row is stored but postponed 10 minutes); at most 60 publishes per minute per identity, reserved with `reservePublish` immediately before publishing (one publish = one logical message sent to up to 5 relays); asker retry schedule every 5 min during the first hour, then every 30 min, until 7 days after first enqueue; content is purged 7 days after the rumor's creation, whatever the row's state.
 - Local files: identity and state live in `AGENTBRIDGE_HOME` (default `~/.agentbridge`), directory `0700`; `identity.json` `0600`, written to a temporary file and linked into place with `link()` so two concurrent creators never produce two identities or a half-written file; `agentbridge.db` pre-created `0600` so SQLite's WAL and SHM files inherit `0600`.
 - SQLite: WAL, `busy_timeout` 5000 ms, foreign keys on, every read-modify-write inside `BEGIN IMMEDIATE`; `node:sqlite` is imported dynamically **after** installing a filter that suppresses only SQLite's `ExperimentalWarning`.
 - `verifyEvent` from `nostr-tools` trusts an internal marker copied by object spread. Only verify objects freshly produced by `JSON.parse`, and build tamper tests with `JSON.parse(JSON.stringify(event))`.
@@ -47,9 +48,9 @@ packages/core/src/nostr-constants.ts           NOSTR: kinds, PoW bits, size caps
 packages/core/src/identity.ts                  identity.json create/load, agentbridge: link encode/decode
 packages/core/src/relay-url.ts                 checkRelayUrl, sanitizeRelayList, isForbiddenAddress, safeLookup
 packages/core/src/store/db.ts                  openStore, Store.tx (BEGIN IMMEDIATE, joins outer tx), migrations runner, warning filter
-packages/core/src/store/schema.ts              MIGRATIONS (v1: contacts, outbox, cursors)
-packages/core/src/store/contacts.ts            inbound requests/approve/reject/revoke, outbound request/approval/rejection/revocation, generation rules, local names
-packages/core/src/store/outbox.ts              enqueue/regenerate, claim, stillClaimed, markPublished, markFailed, resolveOutboxMessage, deleteUnclaimedFor
+packages/core/src/store/schema.ts              MIGRATIONS (v1: contacts, requests, outbox, publish_log, cursors)
+packages/core/src/store/contacts.ts            request records, inbound requests/approve/reject/revoke, outbound request/approval/rejection/revocation, generation rules, local names
+packages/core/src/store/outbox.ts              enqueue/regenerate, claimDue(authorize), stillClaimed, reservePublish, markPublished, markFailed, resolveOutboxMessage, deleteUnclaimedFor, purgeOutbox
 packages/core/src/store/cursors.ts             history windows per relay and role
 packages/core/src/envelope/messages.ts         zod schemas for the 8 protocol messages, byte checks
 packages/core/src/envelope/pow.ts              leading-zero bits, nonce mining in a worker thread
@@ -57,9 +58,9 @@ packages/core/src/envelope/seal.ts             createRumor, wrapRumor (seal, wra
 packages/core/src/envelope/open.ts             precheckWrap (steps 1–4), openWrap (steps 6–9)
 packages/core/src/envelope/dedupe.ts           bounded LRU set of seen wrap ids
 packages/core/src/envelope/time.ts             isFutureDated, questionExpiresAt, isQuestionExpired, isRequestTooOld
-packages/core/src/boards/connection.ts         BoardConnection: NIP-01 over ws, OK/EOSE/CLOSED/NOTICE, NIP-42 AUTH retry, pause/resume
-packages/core/src/boards/socket.ts             pinnedSocketFactory (wss + safeLookup), SocketFactory type
-packages/core/src/boards/receive-queue.ts      ReceiveQueue: sequential processing with pressure signals
+packages/core/src/boards/connection.ts         BoardConnection: sequential NIP-01 frame reader over ws, OK/EOSE/CLOSED/NOTICE, NIP-42 AUTH retry
+packages/core/src/boards/socket.ts             createPinnedSocketFactory / pinnedSocketFactory (checkRelayUrl + safeLookup), SocketFactory type
+packages/core/src/boards/receive-queue.ts      ReceiveQueue: bounded, push waits for room, one item at a time
 packages/core/src/boards/pool.ts               BoardPool: publish to ≤5 relays, live subscription with reconnect and backpressure, one-shot query
 packages/core/src/boards/history.ts            recoverHistory: windows, pagination, ties, completeness
 
@@ -475,6 +476,9 @@ export const NOSTR = {
   retryAfterFirstHourIntervalSeconds: 30 * MINUTE,
   retryWindowSeconds: 7 * DAY,
   liveSinceSeconds: 2 * DAY + 10 * MINUTE,
+  // History recovery assumes relays honor filter limits of at least this many events. A relay that
+  // caps lower can hide same-second ties from history (see Task 15).
+  minTrustedRelayLimit: 100,
 } as const
 
 export const nowSeconds = (): number => Math.floor(Date.now() / 1000)
@@ -801,25 +805,28 @@ export function sanitizeRelayList(inputs: readonly unknown[]): string[] {
   return out
 }
 
-const forbidden = new BlockList()
+// One list per family: a single BlockList treats IPv4 and IPv4-mapped IPv6 as equivalent, so an
+// ::ffff:0:0/96 rule in the same list would forbid every public IPv4 address too.
+const forbidden4 = new BlockList()
+const forbidden6 = new BlockList()
 for (const [network, prefix] of [
   ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12],
   ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['198.51.100.0', 24],
   ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4],
 ] as const) {
-  forbidden.addSubnet(network, prefix, 'ipv4')
+  forbidden4.addSubnet(network, prefix, 'ipv4')
 }
 for (const [network, prefix] of [
   ['::', 128], ['::1', 128], ['::ffff:0:0', 96], ['64:ff9b::', 96], ['100::', 64], ['2001:db8::', 32], ['fc00::', 7],
   ['fe80::', 10], ['ff00::', 8],
 ] as const) {
-  forbidden.addSubnet(network, prefix, 'ipv6')
+  forbidden6.addSubnet(network, prefix, 'ipv6')
 }
 
 export function isForbiddenAddress(address: string): boolean {
   const family = isIP(address)
-  if (family === 4) return forbidden.check(address, 'ipv4')
-  if (family === 6) return forbidden.check(address, 'ipv6')
+  if (family === 4) return forbidden4.check(address, 'ipv4')
+  if (family === 6) return forbidden6.check(address, 'ipv6')
   return true
 }
 
@@ -883,7 +890,7 @@ git commit -m "feat(core): treat relay URLs as hostile input and validate DNS in
 - Consumes: `UserFacingError`, `nowSeconds` (Task 2); `sanitizeRelayList` (Task 3); `CLI_COMMAND` (existing `packages/core/src/published.ts`).
 - Produces:
   - `DB_FILE = 'agentbridge.db'`
-  - `type Migration = { version: number; name: string; sql: string }` and `MIGRATIONS: readonly Migration[]` (v1: `contacts`, `outbox`, `publish_log`, `cursors`). Plans 2 and 3 append migrations v2 and v3.
+  - `type Migration = { version: number; name: string; sql: string }` and `MIGRATIONS: readonly Migration[]` (v1: `contacts`, `requests`, `outbox`, `publish_log`, `cursors`). Plans 2 and 3 append migrations v2 and v3.
   - `type RelayPolicy = (inputs: readonly unknown[]) => string[]`
   - `type Store = { readonly db: DatabaseSync; readonly path: string; readonly relayPolicy: RelayPolicy; tx<T>(fn: () => T): T; close(): void }`
   - `openStore(home: string, options?: { migrations?: readonly Migration[]; relayPolicy?: RelayPolicy }): Promise<Store>` — default `relayPolicy` is `sanitizeRelayList`. **Only tests** pass a permissive policy so contacts can point at local fake boards (`ws://127.0.0.1:…`).
@@ -1067,6 +1074,17 @@ CREATE TABLE contacts (
 CREATE UNIQUE INDEX contacts_local_name ON contacts (direction, local_name) WHERE local_name IS NOT NULL;
 CREATE INDEX contacts_requested ON contacts (direction, state, requested_at);
 
+CREATE TABLE requests (
+  sender_pubkey TEXT NOT NULL CHECK (length(sender_pubkey) = 64),
+  request_id TEXT NOT NULL,
+  rumor_id TEXT NOT NULL CHECK (length(rumor_id) = 64),
+  decision TEXT CHECK (decision IN ('approved', 'rejected')),
+  decision_generation INTEGER,
+  created_at INTEGER NOT NULL,
+  decided_at INTEGER,
+  PRIMARY KEY (sender_pubkey, request_id)
+);
+
 CREATE TABLE outbox (
   recipient TEXT NOT NULL CHECK (length(recipient) = 64),
   rumor_id TEXT NOT NULL CHECK (length(rumor_id) = 64),
@@ -1108,7 +1126,7 @@ CREATE TABLE cursors (
 ]
 ```
 
-The spec's `requests` table is realized as `contacts` rows with `direction = 'inbound'` and `state = 'requested'`: a request is the first state of an inbound contact, and keeping one row per person is what lets its generation counter survive eviction and re-requests.
+The visible pending request is a `contacts` row with `direction = 'inbound'` and `state = 'requested'` (one row per person, so the generation counter survives eviction and re-requests). The `requests` table is the spec's entity record: the immutable `(sender, requestId)` identity, its `rumor_id`, and the decision taken on it, kept 9 days so retries can repeat that decision.
 
 - [ ] **Step 4: Implement the store**
 
@@ -1241,7 +1259,7 @@ git commit -m "feat(core): private SQLite store with serialized transactions and
 
 ---
 
-### Task 5: Contacts — requests, approvals, revocations and generations
+### Task 5: Contacts — request records, approvals, revocations and generations
 
 **Files:**
 - Create: `packages/core/src/store/contacts.ts`
@@ -1255,10 +1273,14 @@ git commit -m "feat(core): private SQLite store with serialized transactions and
   - `type ContactState = 'requested' | 'pending' | 'approved' | 'rejected' | 'revoked'` (`requested` only inbound, `pending` only outbound).
   - `type Contact = { pubkey: string; direction: Direction; state: ContactState; generation: number; maxGenerationSeen: number; requestId: string | null; requestRumorId: string | null; localName: string | null; declaredName: string | null; note: string | null; relays: string[]; requestedAt: number | null; decidedAt: number | null; createdAt: number; updatedAt: number }`
   - Reads: `getContact(store, pubkey, direction): Contact | null`, `findContactByLocalName(store, direction, localName): Contact | null`, `listContacts(store, direction): Contact[]`, `listPendingRequests(store): Contact[]`, `findRequestsByPrefix(store, prefix): Contact[]`, `slugifyName(input): string`.
-  - Responder side: `recordIncomingRequest(store, input: IncomingRequest): IncomingRequestOutcome`; `approveRequest(store, { pubkey, now }): { contact: Contact; changed: boolean }`; `rejectRequest(store, { pubkey, now })` and `revokeInbound(store, { pubkey, now })` with the same return shape; `purgeExpiredRequests(store, now): number`; `isQuestionAllowed(store, pubkey, generation): boolean`.
-  - `type IncomingRequest = { pubkey: string; requestId: string; requestRumorId: string; declaredName: string; note: string; relays: readonly unknown[]; now: number }`
-  - `type IncomingRequestOutcome = { kind: 'stored'; evictedPubkey: string | null } | { kind: 'duplicate' } | { kind: 'approved_already'; contact: Contact } | { kind: 'rejected_already'; contact: Contact } | { kind: 'ignored_recently_rejected' } | { kind: 'ignored_stale' }`
-  - Asker side: `createOutboundRequest(store, { pubkey, requestId, relays, now }): { contact: Contact; created: boolean }`; `applyApproval(store, { pubkey, requestId, generation, name, relays, now }): 'applied' | 'ignored'`; `applyRejection(store, { pubkey, requestId, now }): 'applied' | 'ignored'`; `applyRevocation(store, { pubkey, generation, now }): 'applied' | 'ignored'`; `askPermission(store, pubkey): { generation: number } | null`.
+  - Responder side:
+    - `type IncomingRequest = { pubkey: string; requestId: string; requestRumorId: string; declaredName: string; note: string; relays: readonly unknown[]; now: number }`
+    - `type IncomingRequestOutcome = { kind: 'stored'; evictedPubkey: string | null } | { kind: 'duplicate' } | { kind: 'approved_already'; contact: Contact } | { kind: 'rejected_already'; contact: Contact } | { kind: 'ignored_recently_rejected' } | { kind: 'ignored_stale' } | { kind: 'conflict' }`
+    - `recordIncomingRequest(store, input: IncomingRequest): IncomingRequestOutcome` — first consults the request record `(pubkey, requestId)`: a different `rumor_id` is a `conflict`; a decided record repeats its decision (`approved_already` only while that approval is still the current permission, otherwise `ignored_stale`); an undecided record is a `duplicate` only while it is still the visible pending request, otherwise `ignored_stale`. A request never seen before from an approved person is recorded as approved with the current generation (`approved_already`), so a person who lost their local state gets the same answer.
+    - `approveRequest(store, { pubkey, now }): { contact: Contact; changed: boolean }`, `rejectRequest(store, { pubkey, now })`, `revokeInbound(store, { pubkey, now })` — same return shape; approve and reject also write the decision into the request record.
+    - `purgeRequests(store, now): { droppedPending: number; forgottenRecords: number }` — drops pending requests older than 7 days and request records older than 9 days (by decision time, or creation time if undecided).
+    - `isQuestionAllowed(store, pubkey, generation): boolean`
+  - Asker side: `createOutboundRequest(store, { pubkey, requestId, relays, now }): { contact: Contact; created: boolean }`; `applyApproval(store, { pubkey, requestId, generation, name, relays, now }): 'applied' | 'ignored'` (only for the **pending** request with that id and a higher generation); `applyRejection(store, { pubkey, requestId, now }): 'applied' | 'ignored'`; `applyRevocation(store, { pubkey, generation, now }): 'applied' | 'ignored'` (a higher generation always raises the max observed generation, but a pending request stays pending); `askPermission(store, pubkey): { generation: number } | null`.
   - Every writer runs inside `store.tx`, so plan 2 can compose `revokeInbound` with outbox and inbox changes in one outer transaction.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1284,7 +1306,7 @@ import {
   isQuestionAllowed,
   listPendingRequests,
   openStore,
-  purgeExpiredRequests,
+  purgeRequests,
   recordIncomingRequest,
   rejectRequest,
   revokeInbound,
@@ -1318,16 +1340,27 @@ function request(n: number, overrides: Partial<Parameters<typeof recordIncomingR
 describe('inbound requests', () => {
   it('stores a request with sanitized relays', () => {
     expect(request(1)).toEqual({ kind: 'stored', evictedPubkey: null })
-    const c = getContact(store, pk(1), 'inbound')!
-    expect(c).toMatchObject({ state: 'requested', generation: 0, requestId: uuid(1), relays: ['wss://relay.primal.net'] })
+    expect(getContact(store, pk(1), 'inbound')).toMatchObject({
+      state: 'requested',
+      generation: 0,
+      requestId: uuid(1),
+      relays: ['wss://relay.primal.net'],
+    })
   })
 
-  it('keeps one pending request per key: a retry is a duplicate, a newer request replaces it', () => {
+  it('keeps one pending request per key: a retry is a duplicate, a newer request replaces it, a retry of the replaced one is stale', () => {
     request(1)
     expect(request(1)).toEqual({ kind: 'duplicate' })
-    expect(request(1, { requestId: uuid(99), note: 'nueva' })).toEqual({ kind: 'stored', evictedPubkey: null })
+    expect(request(1, { requestId: uuid(99), requestRumorId: rumorId(99), note: 'nueva' })).toEqual({ kind: 'stored', evictedPubkey: null })
     expect(getContact(store, pk(1), 'inbound')).toMatchObject({ requestId: uuid(99), note: 'nueva' })
+    expect(request(1)).toEqual({ kind: 'ignored_stale' })
+    expect(getContact(store, pk(1), 'inbound')?.requestId).toBe(uuid(99))
     expect(listPendingRequests(store)).toHaveLength(1)
+  })
+
+  it('reports a conflict when a known request id arrives inside a different rumor', () => {
+    request(1)
+    expect(request(1, { requestRumorId: rumorId(500) })).toEqual({ kind: 'conflict' })
   })
 
   it('evicts the oldest pending request when the list is full instead of refusing new ones', () => {
@@ -1341,7 +1374,7 @@ describe('inbound requests', () => {
     request(1)
     approveRequest(store, { pubkey: pk(1), now: 2_000_000 })
     revokeInbound(store, { pubkey: pk(1), now: 2_000_001 })
-    request(1, { requestId: uuid(77), now: 2_000_002 })
+    request(1, { requestId: uuid(77), requestRumorId: rumorId(77), now: 2_000_002 })
     for (let n = 2; n <= NOSTR.maxPendingRequests + 1; n++) request(n, { now: 3_000_000 + n })
     expect(getContact(store, pk(1), 'inbound')).toMatchObject({ state: 'revoked', generation: 2, requestId: null })
   })
@@ -1353,26 +1386,27 @@ describe('inbound requests', () => {
     expect(first.changed).toBe(true)
     expect(first.contact).toMatchObject({ state: 'approved', generation: 1, maxGenerationSeen: 1, localName: 'ana' })
     expect(approveRequest(store, { pubkey: pk(2), now: 2_000_001 }).contact.localName).toBe('ana-2')
-    const again = approveRequest(store, { pubkey: pk(1), now: 2_000_002 })
-    expect(again).toMatchObject({ changed: false, contact: { generation: 1 } })
+    expect(approveRequest(store, { pubkey: pk(1), now: 2_000_002 })).toMatchObject({ changed: false, contact: { generation: 1 } })
   })
 
   it('refuses to approve when there is no request, in Spanish', () => {
     expect(() => approveRequest(store, { pubkey: pk(9), now: 1 })).toThrow(UserFacingError)
   })
 
-  it('answers a retried request from an approved person with approved_already', () => {
+  it('repeats the approval for a retried request and for a brand-new request from an approved person', () => {
     request(1)
     approveRequest(store, { pubkey: pk(1), now: 2_000_000 })
     expect(request(1)).toMatchObject({ kind: 'approved_already', contact: { generation: 1 } })
+    expect(request(1, { requestId: uuid(40), requestRumorId: rumorId(40) })).toMatchObject({ kind: 'approved_already', contact: { generation: 1 } })
+    expect(request(1, { requestId: uuid(40), requestRumorId: rumorId(40) })).toMatchObject({ kind: 'approved_already' })
   })
 
-  it('handles rejection: same request repeats the decision, others are ignored for 7 days, then accepted again', () => {
+  it('handles rejection: the same request repeats the decision, others are ignored for 7 days, then accepted again', () => {
     request(1, { now: 1_000_000 })
     expect(rejectRequest(store, { pubkey: pk(1), now: 1_000_100 }).contact.state).toBe('rejected')
     expect(request(1, { now: 1_000_200 })).toMatchObject({ kind: 'rejected_already' })
-    expect(request(1, { requestId: uuid(50), now: 1_000_300 })).toEqual({ kind: 'ignored_recently_rejected' })
-    expect(request(1, { requestId: uuid(51), now: 1_000_100 + 7 * DAY })).toEqual({ kind: 'stored', evictedPubkey: null })
+    expect(request(1, { requestId: uuid(50), requestRumorId: rumorId(50), now: 1_000_300 })).toEqual({ kind: 'ignored_recently_rejected' })
+    expect(request(1, { requestId: uuid(51), requestRumorId: rumorId(51), now: 1_000_100 + 7 * DAY })).toEqual({ kind: 'stored', evictedPubkey: null })
   })
 
   it('revokes with a strictly higher generation and only allows questions carrying the current one', () => {
@@ -1382,17 +1416,20 @@ describe('inbound requests', () => {
     expect(revokeInbound(store, { pubkey: pk(1), now: 2_000_001 })).toMatchObject({ changed: true, contact: { state: 'revoked', generation: 2 } })
     expect(isQuestionAllowed(store, pk(1), 1)).toBe(false)
     expect(revokeInbound(store, { pubkey: pk(1), now: 2_000_002 }).changed).toBe(false)
-    request(1, { requestId: uuid(60), now: 2_000_003 })
+    request(1, { requestId: uuid(60), requestRumorId: rumorId(60), now: 2_000_003 })
     expect(approveRequest(store, { pubkey: pk(1), now: 2_000_004 }).contact.generation).toBe(3)
     expect(isQuestionAllowed(store, pk(1), 3)).toBe(true)
     expect(isQuestionAllowed(store, pk(1), 1)).toBe(false)
   })
 
-  it('ignores a revoked person retrying the request that was approved before', () => {
+  it('never lets a retry of an old approved request displace a newer pending one', () => {
     request(1)
     approveRequest(store, { pubkey: pk(1), now: 2_000_000 })
     revokeInbound(store, { pubkey: pk(1), now: 2_000_001 })
     expect(request(1)).toEqual({ kind: 'ignored_stale' })
+    request(1, { requestId: uuid(70), requestRumorId: rumorId(70), now: 2_000_002 })
+    expect(request(1)).toEqual({ kind: 'ignored_stale' })
+    expect(getContact(store, pk(1), 'inbound')).toMatchObject({ state: 'requested', requestId: uuid(70) })
   })
 
   it('refuses to revoke someone who never had permission', () => {
@@ -1400,11 +1437,13 @@ describe('inbound requests', () => {
     expect(() => revokeInbound(store, { pubkey: pk(1), now: 1 })).toThrow(UserFacingError)
   })
 
-  it('purges pending requests older than 7 days', () => {
+  it('drops pending requests after 7 days and forgets request records after 9', () => {
     request(1, { now: 1_000_000 })
     request(2, { now: 1_000_000 + 6 * DAY })
-    expect(purgeExpiredRequests(store, 1_000_001 + 7 * DAY)).toBe(1)
+    expect(purgeRequests(store, 1_000_001 + 7 * DAY)).toEqual({ droppedPending: 1, forgottenRecords: 0 })
     expect(listPendingRequests(store).map((c) => c.pubkey)).toEqual([pk(2)])
+    expect(purgeRequests(store, 1_000_000 + 9 * DAY)).toEqual({ droppedPending: 0, forgottenRecords: 1 })
+    expect(request(1, { now: 1_000_000 + 9 * DAY })).toEqual({ kind: 'stored', evictedPubkey: null })
   })
 
   it('finds pending requests by a key prefix of at least 8 hex characters', () => {
@@ -1421,8 +1460,10 @@ describe('outbound requests', () => {
   it('creates one pending request per person and returns the same request id on retries', () => {
     const first = createOutboundRequest(store, { pubkey: pk(1), requestId: uuid(1), ...link, now: 10 })
     expect(first).toMatchObject({ created: true, contact: { state: 'pending', requestId: uuid(1), relays: ['wss://nos.lol'] } })
-    const again = createOutboundRequest(store, { pubkey: pk(1), requestId: uuid(2), ...link, now: 11 })
-    expect(again).toMatchObject({ created: false, contact: { requestId: uuid(1) } })
+    expect(createOutboundRequest(store, { pubkey: pk(1), requestId: uuid(2), ...link, now: 11 })).toMatchObject({
+      created: false,
+      contact: { requestId: uuid(1) },
+    })
   })
 
   it('refuses a link without any valid relay, in Spanish', () => {
@@ -1439,14 +1480,22 @@ describe('outbound requests', () => {
     expect(askPermission(store, pk(1))).toEqual({ generation: 3 })
     expect(applyRevocation(store, { pubkey: pk(1), generation: 4, now: 14 })).toBe('applied')
     expect(askPermission(store, pk(1))).toBeNull()
-    expect(applyApproval(store, { pubkey: pk(1), requestId: uuid(1), generation: 3, name: 'Dev', relays: [], now: 15 })).toBe('ignored')
+    expect(applyApproval(store, { pubkey: pk(1), requestId: uuid(1), generation: 5, name: 'Dev', relays: [], now: 15 })).toBe('ignored')
   })
 
-  it('applies a rejection only to the pending request it answers', () => {
+  it('never turns a rejected request into an approval', () => {
     createOutboundRequest(store, { pubkey: pk(1), requestId: uuid(1), ...link, now: 10 })
     expect(applyRejection(store, { pubkey: pk(1), requestId: uuid(2), now: 11 })).toBe('ignored')
     expect(applyRejection(store, { pubkey: pk(1), requestId: uuid(1), now: 12 })).toBe('applied')
+    expect(applyApproval(store, { pubkey: pk(1), requestId: uuid(1), generation: 1, name: 'Dev', relays: [], now: 13 })).toBe('ignored')
     expect(getContact(store, pk(1), 'outbound')?.state).toBe('rejected')
+  })
+
+  it('keeps a pending request pending when a late revocation of an older permission arrives', () => {
+    createOutboundRequest(store, { pubkey: pk(1), requestId: uuid(1), ...link, now: 10 })
+    expect(applyRevocation(store, { pubkey: pk(1), generation: 2, now: 11 })).toBe('applied')
+    expect(getContact(store, pk(1), 'outbound')).toMatchObject({ state: 'pending', maxGenerationSeen: 2 })
+    expect(applyApproval(store, { pubkey: pk(1), requestId: uuid(1), generation: 3, name: 'Dev', relays: [], now: 12 })).toBe('applied')
   })
 
   it('refuses a new request when permission already exists, and allows one after a rejection', () => {
@@ -1455,7 +1504,10 @@ describe('outbound requests', () => {
     expect(() => createOutboundRequest(store, { pubkey: pk(1), requestId: uuid(2), ...link, now: 12 })).toThrow(UserFacingError)
     createOutboundRequest(store, { pubkey: pk(2), requestId: uuid(3), ...link, now: 10 })
     applyRejection(store, { pubkey: pk(2), requestId: uuid(3), now: 11 })
-    expect(createOutboundRequest(store, { pubkey: pk(2), requestId: uuid(4), ...link, now: 12 })).toMatchObject({ created: true, contact: { requestId: uuid(4) } })
+    expect(createOutboundRequest(store, { pubkey: pk(2), requestId: uuid(4), ...link, now: 12 })).toMatchObject({
+      created: true,
+      contact: { requestId: uuid(4) },
+    })
   })
 })
 
@@ -1525,6 +1577,7 @@ export type IncomingRequestOutcome =
   | { kind: 'rejected_already'; contact: Contact }
   | { kind: 'ignored_recently_rejected' }
   | { kind: 'ignored_stale' }
+  | { kind: 'conflict' }
 
 type ContactRow = {
   pubkey: string
@@ -1542,6 +1595,16 @@ type ContactRow = {
   decided_at: number | null
   created_at: number
   updated_at: number
+}
+
+type RequestRow = {
+  sender_pubkey: string
+  request_id: string
+  rumor_id: string
+  decision: 'approved' | 'rejected' | null
+  decision_generation: number | null
+  created_at: number
+  decided_at: number | null
 }
 
 const HEX_64 = /^[0-9a-f]{64}$/
@@ -1570,8 +1633,16 @@ function toContact(row: ContactRow): Contact {
   }
 }
 
-function selectRow(store: Store, pubkey: string, direction: Direction): ContactRow | undefined {
-  return store.db.prepare('SELECT * FROM contacts WHERE pubkey = ? AND direction = ?').get(pubkey, direction) as ContactRow | undefined
+const selectRow = (store: Store, pubkey: string, direction: Direction) =>
+  store.db.prepare('SELECT * FROM contacts WHERE pubkey = ? AND direction = ?').get(pubkey, direction) as ContactRow | undefined
+
+const selectRequest = (store: Store, sender: string, requestId: string) =>
+  store.db.prepare('SELECT * FROM requests WHERE sender_pubkey = ? AND request_id = ?').get(sender, requestId) as RequestRow | undefined
+
+function decideRequest(store: Store, sender: string, requestId: string, decision: 'approved' | 'rejected', generation: number | null, now: number): void {
+  store.db
+    .prepare('UPDATE requests SET decision = ?, decision_generation = ?, decided_at = ? WHERE sender_pubkey = ? AND request_id = ?')
+    .run(decision, generation, now, sender, requestId)
 }
 
 export function getContact(store: Store, pubkey: string, direction: Direction): Contact | null {
@@ -1585,15 +1656,13 @@ export function findContactByLocalName(store: Store, direction: Direction, local
 }
 
 export function listContacts(store: Store, direction: Direction): Contact[] {
-  const rows = store.db.prepare('SELECT * FROM contacts WHERE direction = ? ORDER BY local_name, created_at').all(direction) as ContactRow[]
-  return rows.map(toContact)
+  return (store.db.prepare('SELECT * FROM contacts WHERE direction = ? ORDER BY local_name, created_at').all(direction) as ContactRow[]).map(toContact)
 }
 
 export function listPendingRequests(store: Store): Contact[] {
-  const rows = store.db
-    .prepare("SELECT * FROM contacts WHERE direction = 'inbound' AND state = 'requested' ORDER BY requested_at, rowid")
-    .all() as ContactRow[]
-  return rows.map(toContact)
+  return (
+    store.db.prepare("SELECT * FROM contacts WHERE direction = 'inbound' AND state = 'requested' ORDER BY requested_at, rowid").all() as ContactRow[]
+  ).map(toContact)
 }
 
 export function findRequestsByPrefix(store: Store, prefix: string): Contact[] {
@@ -1601,10 +1670,11 @@ export function findRequestsByPrefix(store: Store, prefix: string): Contact[] {
   if (!/^[0-9a-f]{8,64}$/.test(normalized)) {
     throw new UserFacingError('El identificador debe tener al menos 8 caracteres hexadecimales, tal como aparece en la lista de solicitudes.')
   }
-  const rows = store.db
-    .prepare("SELECT * FROM contacts WHERE direction = 'inbound' AND state = 'requested' AND pubkey LIKE ? ORDER BY requested_at")
-    .all(`${normalized}%`) as ContactRow[]
-  return rows.map(toContact)
+  return (
+    store.db
+      .prepare("SELECT * FROM contacts WHERE direction = 'inbound' AND state = 'requested' AND pubkey LIKE ? ORDER BY requested_at")
+      .all(`${normalized}%`) as ContactRow[]
+  ).map(toContact)
 }
 
 export function slugifyName(input: string): string {
@@ -1628,8 +1698,8 @@ function uniqueLocalName(store: Store, direction: Direction, declared: string): 
   throw new Error('contacts: could not allocate a local name')
 }
 
-// A person who was ever approved keeps their contact row forever (generation counter, max
-// observed generation): only the request itself goes away.
+// A person who was ever approved keeps their contact row forever (generation counter, max observed
+// generation): only the visible pending request goes away. Request records are left alone.
 function dropRequest(store: Store, pubkey: string, now: number): void {
   const row = selectRow(store, pubkey, 'inbound')
   if (!row) return
@@ -1658,27 +1728,40 @@ export function recordIncomingRequest(store: Store, input: IncomingRequest): Inc
   assertPubkey(input.pubkey)
   const declaredName = input.declaredName.trim().slice(0, 80)
   const note = input.note.slice(0, 500)
-  return store.tx(() => {
-    const relays = JSON.stringify(store.relayPolicy(input.relays))
+  return store.tx((): IncomingRequestOutcome => {
     const row = selectRow(store, input.pubkey, 'inbound')
-    if (row?.state === 'requested') {
-      if (row.request_id === input.requestId) return { kind: 'duplicate' } as const
+    const record = selectRequest(store, input.pubkey, input.requestId)
+
+    if (record) {
+      if (record.rumor_id !== input.requestRumorId) return { kind: 'conflict' }
+      if (record.decision === 'rejected') return row ? { kind: 'rejected_already', contact: toContact(row) } : { kind: 'ignored_stale' }
+      if (record.decision === 'approved') {
+        return row?.state === 'approved' && row.generation === record.decision_generation
+          ? { kind: 'approved_already', contact: toContact(row) }
+          : { kind: 'ignored_stale' }
+      }
+      return row?.state === 'requested' && row.request_id === input.requestId ? { kind: 'duplicate' } : { kind: 'ignored_stale' }
+    }
+
+    if (row?.state === 'approved') {
+      // The asker lost track of a permission it already has. Record this request as approved with the
+      // current generation, so its retries repeat the same answer.
       store.db
         .prepare(
-          "UPDATE contacts SET request_id = ?, request_rumor_id = ?, declared_name = ?, note = ?, relays = ?, requested_at = ?, updated_at = ? WHERE pubkey = ? AND direction = 'inbound'",
+          "INSERT INTO requests (sender_pubkey, request_id, rumor_id, decision, decision_generation, created_at, decided_at) VALUES (?, ?, ?, 'approved', ?, ?, ?)",
         )
-        .run(input.requestId, input.requestRumorId, declaredName, note, relays, input.now, input.now, input.pubkey)
-      return { kind: 'stored', evictedPubkey: null } as const
+        .run(input.pubkey, input.requestId, input.requestRumorId, row.generation, input.now, input.now)
+      return { kind: 'approved_already', contact: toContact(row) }
     }
-    if (row?.state === 'approved') return { kind: 'approved_already', contact: toContact(row) } as const
     if (row?.state === 'rejected' && row.decided_at !== null && input.now - row.decided_at < NOSTR.rejectedRequestCooldownSeconds) {
-      return row.request_id === input.requestId
-        ? ({ kind: 'rejected_already', contact: toContact(row) } as const)
-        : ({ kind: 'ignored_recently_rejected' } as const)
+      return { kind: 'ignored_recently_rejected' }
     }
-    if (row?.state === 'revoked' && row.request_id === input.requestId) return { kind: 'ignored_stale' } as const
 
-    const evictedPubkey = makeRoom(store, input.now)
+    store.db
+      .prepare('INSERT INTO requests (sender_pubkey, request_id, rumor_id, created_at) VALUES (?, ?, ?, ?)')
+      .run(input.pubkey, input.requestId, input.requestRumorId, input.now)
+    const relays = JSON.stringify(store.relayPolicy(input.relays))
+    const evictedPubkey = row?.state === 'requested' ? null : makeRoom(store, input.now)
     if (row) {
       store.db
         .prepare(
@@ -1692,7 +1775,7 @@ export function recordIncomingRequest(store: Store, input: IncomingRequest): Inc
         )
         .run(input.pubkey, input.requestId, input.requestRumorId, declaredName, note, relays, input.now, input.now, input.now)
     }
-    return { kind: 'stored', evictedPubkey } as const
+    return { kind: 'stored', evictedPubkey }
   })
 }
 
@@ -1700,7 +1783,7 @@ export function approveRequest(store: Store, input: { pubkey: string; now: numbe
   return store.tx(() => {
     const row = selectRow(store, input.pubkey, 'inbound')
     if (row?.state === 'approved') return { contact: toContact(row), changed: false }
-    if (row?.state !== 'requested') throw new UserFacingError('No hay una solicitud pendiente de esa persona.')
+    if (row?.state !== 'requested' || row.request_id === null) throw new UserFacingError('No hay una solicitud pendiente de esa persona.')
     const generation = row.generation + 1
     const localName = row.local_name ?? uniqueLocalName(store, 'inbound', row.declared_name ?? '')
     store.db
@@ -1708,6 +1791,7 @@ export function approveRequest(store: Store, input: { pubkey: string; now: numbe
         "UPDATE contacts SET state = 'approved', generation = ?, max_generation_seen = ?, local_name = ?, decided_at = ?, updated_at = ? WHERE pubkey = ? AND direction = 'inbound'",
       )
       .run(generation, generation, localName, input.now, input.now, input.pubkey)
+    decideRequest(store, input.pubkey, row.request_id, 'approved', generation, input.now)
     return { contact: toContact(selectRow(store, input.pubkey, 'inbound')!), changed: true }
   })
 }
@@ -1716,10 +1800,11 @@ export function rejectRequest(store: Store, input: { pubkey: string; now: number
   return store.tx(() => {
     const row = selectRow(store, input.pubkey, 'inbound')
     if (row?.state === 'rejected') return { contact: toContact(row), changed: false }
-    if (row?.state !== 'requested') throw new UserFacingError('No hay una solicitud pendiente de esa persona.')
+    if (row?.state !== 'requested' || row.request_id === null) throw new UserFacingError('No hay una solicitud pendiente de esa persona.')
     store.db
       .prepare("UPDATE contacts SET state = 'rejected', decided_at = ?, updated_at = ? WHERE pubkey = ? AND direction = 'inbound'")
       .run(input.now, input.now, input.pubkey)
+    decideRequest(store, input.pubkey, row.request_id, 'rejected', null, input.now)
     return { contact: toContact(selectRow(store, input.pubkey, 'inbound')!), changed: true }
   })
 }
@@ -1739,13 +1824,16 @@ export function revokeInbound(store: Store, input: { pubkey: string; now: number
   })
 }
 
-export function purgeExpiredRequests(store: Store, now: number): number {
+export function purgeRequests(store: Store, now: number): { droppedPending: number; forgottenRecords: number } {
   return store.tx(() => {
-    const rows = store.db
+    const stale = store.db
       .prepare("SELECT pubkey FROM contacts WHERE direction = 'inbound' AND state = 'requested' AND requested_at <= ?")
       .all(now - NOSTR.requestMaxAgeSeconds) as Array<{ pubkey: string }>
-    for (const { pubkey } of rows) dropRequest(store, pubkey, now)
-    return rows.length
+    for (const { pubkey } of stale) dropRequest(store, pubkey, now)
+    const forgotten = store.db
+      .prepare('DELETE FROM requests WHERE coalesce(decided_at, created_at) <= ?')
+      .run(now - NOSTR.decisionRetentionSeconds)
+    return { droppedPending: stale.length, forgottenRecords: Number(forgotten.changes) }
   })
 }
 
@@ -1790,7 +1878,7 @@ export function applyApproval(
 ): 'applied' | 'ignored' {
   return store.tx(() => {
     const row = selectRow(store, input.pubkey, 'outbound')
-    if (!row || row.request_id !== input.requestId || input.generation <= row.max_generation_seen) return 'ignored'
+    if (!row || row.state !== 'pending' || row.request_id !== input.requestId || input.generation <= row.max_generation_seen) return 'ignored'
     const sanitized = store.relayPolicy(input.relays)
     const relays = sanitized.length > 0 ? JSON.stringify(sanitized) : row.relays
     const declared = input.name.trim().slice(0, 80)
@@ -1815,13 +1903,16 @@ export function applyRejection(store: Store, input: { pubkey: string; requestId:
   })
 }
 
+// A newer revocation always raises the max observed generation. A request that is still pending
+// stays pending: the revocation is about an older permission, and the pending request may still be
+// approved with a higher generation.
 export function applyRevocation(store: Store, input: { pubkey: string; generation: number; now: number }): 'applied' | 'ignored' {
   return store.tx(() => {
     const row = selectRow(store, input.pubkey, 'outbound')
     if (!row || input.generation <= row.max_generation_seen) return 'ignored'
     store.db
       .prepare(
-        "UPDATE contacts SET state = 'revoked', max_generation_seen = ?, decided_at = ?, updated_at = ? WHERE pubkey = ? AND direction = 'outbound'",
+        "UPDATE contacts SET state = CASE WHEN state = 'pending' THEN 'pending' ELSE 'revoked' END, max_generation_seen = ?, decided_at = ?, updated_at = ? WHERE pubkey = ? AND direction = 'outbound'",
       )
       .run(input.generation, input.now, input.now, input.pubkey)
     return 'applied'
@@ -1849,12 +1940,12 @@ Expected: PASS.
 
 ```bash
 git add packages/core/src/store/contacts.ts packages/core/src/index.ts packages/core/test/store-contacts.test.ts
-git commit -m "feat(core): contacts with bounded requests, strictly increasing generations and ordered permission changes"
+git commit -m "feat(core): contacts with request records, bounded requests, strictly increasing generations and ordered permission changes"
 ```
 
 ---
 
-### Task 6: Outbox — one row per logical message, claims, schedules and caps
+### Task 6: Outbox — one row per logical message, authorized claims, publish reservations and caps
 
 **Files:**
 - Create: `packages/core/src/store/outbox.ts`
@@ -1870,13 +1961,15 @@ git commit -m "feat(core): contacts with bounded requests, strictly increasing g
   - `type EnqueueOutcome = 'enqueued' | 'postponed_cap' | 'already_pending' | 'regenerated' | 'regeneration_too_soon' | 'abandoned'`
   - `type OutboxItem = { recipient: string; rumorId: string; rumor: OutboxRumor; label: string; powBits: 16 | 22; relays: string[]; policy: OutboxPolicy; attempts: number; firstEnqueuedAt: number }`
   - `enqueue(store, input): EnqueueOutcome`
-  - `claimDue(store, { owner, now, limit }): OutboxItem[]`
-  - `stillClaimed(store, { recipient, rumorId, owner, now }): boolean` — call immediately before writing to a socket.
+  - `claimDue(store, { owner, now, limit, authorize }): OutboxItem[]` — in one transaction: abandons pending rows past their window (`retry_until_resolved` 7 days, `once` 9 days after first enqueue), then for each due, unclaimed row calls `authorize(item)`; refused rows are abandoned, accepted rows are claimed for 2 minutes. Plans 2 and 3 pass the permission and generation check as `authorize`.
+  - `stillClaimed(store, { recipient, rumorId, owner, now }): boolean`
+  - `reservePublish(store, { recipient, rumorId, owner, now }): 'reserved' | 'claim_lost' | 'over_budget'` — call immediately before `BoardPool.publish`; it re-checks the claim and takes one of the 60 publishes allowed per minute (one publish = one logical message to up to 5 relays).
+  - `postpone(store, { recipient, rumorId, owner, retryAt }): 'ok' | 'claim_lost'` — releases a claim without counting an attempt (use after `over_budget`).
   - `markPublished(store, { recipient, rumorId, owner, now }): 'ok' | 'claim_lost'`
   - `markFailed(store, { recipient, rumorId, owner, now }): 'ok' | 'claim_lost'`
   - `resolveOutboxMessage(store, { recipient, rumorId }): boolean`
   - `deleteUnclaimedFor(store, { recipient, now }): number`
-  - `purgeOutbox(store, now): number`
+  - `purgeOutbox(store, now): number` — deletes every row whose rumor was created more than 7 days ago, whatever its state, and old publish reservations.
 - Relay lists are **not** sanitized here: they come from contacts, which already applied `store.relayPolicy`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1896,7 +1989,9 @@ import {
   markFailed,
   markPublished,
   openStore,
+  postpone,
   purgeOutbox,
+  reservePublish,
   resolveOutboxMessage,
   stillClaimed,
   type EnqueueInput,
@@ -1905,7 +2000,9 @@ import {
 
 const hex = (n: number) => n.toString(16).padStart(64, '0')
 const RECIPIENT = hex(0xabc)
+const OTHER = hex(0xdef)
 const T0 = 2_000_000_000
+const allow = () => true
 let store: Store
 
 beforeEach(async () => {
@@ -1925,7 +2022,11 @@ function input(n: number, overrides: Partial<EnqueueInput> = {}): EnqueueInput {
   }
 }
 
-const claimOne = (owner: string, now: number) => claimDue(store, { owner, now, limit: 10 })
+const claimOne = (owner: string, now: number) => claimDue(store, { owner, now, limit: 10, authorize: allow })
+const rowState = (n: number, recipient = RECIPIENT) =>
+  store.db.prepare('SELECT state, attempts, next_attempt_at FROM outbox WHERE recipient = ? AND rumor_id = ?').get(recipient, hex(n)) as
+    | { state: string; attempts: number; next_attempt_at: number }
+    | undefined
 
 describe('enqueue', () => {
   it('stores one row per logical message', () => {
@@ -1972,28 +2073,65 @@ describe('claims', () => {
     expect(markPublished(store, { recipient: RECIPIENT, rumorId: hex(1), owner: 'b', now: expired + 1 })).toBe('ok')
   })
 
-  it('never hands out more than 60 publishes per minute', () => {
+  it('asks authorize inside the claim and abandons what it refuses', () => {
+    enqueue(store, input(1))
+    enqueue(store, input(2, { recipient: OTHER }))
+    const claimed = claimDue(store, { owner: 'a', now: T0, limit: 10, authorize: (item) => item.recipient === RECIPIENT })
+    expect(claimed.map((i) => i.recipient)).toEqual([RECIPIENT])
+    expect(rowState(2, OTHER)?.state).toBe('abandoned')
+    expect(claimDue(store, { owner: 'b', now: T0 + 1_000, limit: 10, authorize: allow }).map((i) => i.recipient)).toEqual([RECIPIENT])
+  })
+})
+
+describe('publish reservations', () => {
+  it('allows at most 60 publishes per minute, reserved right before publishing', () => {
     for (let n = 1; n <= 70; n++) enqueue(store, input(n))
-    expect(claimDue(store, { owner: 'a', now: T0, limit: 100 })).toHaveLength(NOSTR.maxPublishesPerMinute)
-    expect(claimDue(store, { owner: 'a', now: T0 + 30, limit: 100 })).toHaveLength(0)
-    expect(claimDue(store, { owner: 'a', now: T0 + 60, limit: 100 })).toHaveLength(10)
+    expect(claimDue(store, { owner: 'a', now: T0, limit: 100, authorize: allow })).toHaveLength(70)
+    const reserve = (n: number, now: number) => reservePublish(store, { recipient: RECIPIENT, rumorId: hex(n), owner: 'a', now })
+    const first = Array.from({ length: 70 }, (_, i) => reserve(i + 1, T0))
+    expect(first.filter((r) => r === 'reserved')).toHaveLength(60)
+    expect(first.filter((r) => r === 'over_budget')).toHaveLength(10)
+    expect(reserve(61, T0 + 60)).toBe('reserved')
+  })
+
+  it('refuses a reservation once the claim is lost', () => {
+    enqueue(store, input(1))
+    claimOne('a', T0)
+    claimOne('b', T0 + NOSTR.claimSeconds)
+    expect(reservePublish(store, { recipient: RECIPIENT, rumorId: hex(1), owner: 'a', now: T0 + NOSTR.claimSeconds })).toBe('claim_lost')
+  })
+
+  it('postpones a claimed row without counting an attempt', () => {
+    enqueue(store, input(1))
+    claimOne('a', T0)
+    expect(postpone(store, { recipient: RECIPIENT, rumorId: hex(1), owner: 'a', retryAt: T0 + 300 })).toBe('ok')
+    expect(claimOne('a', T0 + 299)).toHaveLength(0)
+    expect(claimOne('a', T0 + 300)).toHaveLength(1)
+    expect(rowState(1)?.attempts).toBe(0)
   })
 })
 
 describe('schedules', () => {
   const retry = (n: number) => input(n, { policy: 'retry_until_resolved', label: 'question' })
 
-  it('re-publishes retried messages every 5 minutes for an hour, then every 30 minutes, then abandons them after 7 days', () => {
+  it('re-publishes retried messages every 5 minutes for an hour, then every 30 minutes, and never after 7 days', () => {
     enqueue(store, retry(1))
     const publishAt = (now: number) => {
       expect(claimOne('a', now)).toHaveLength(1)
       expect(markPublished(store, { recipient: RECIPIENT, rumorId: hex(1), owner: 'a', now })).toBe('ok')
-      return store.db.prepare('SELECT state, next_attempt_at FROM outbox').get() as { state: string; next_attempt_at: number }
+      return rowState(1)
     }
-    expect(publishAt(T0)).toEqual({ state: 'pending', next_attempt_at: T0 + 300 })
+    expect(publishAt(T0)).toMatchObject({ state: 'pending', next_attempt_at: T0 + 300 })
     expect(claimOne('a', T0 + 299)).toHaveLength(0)
-    expect(publishAt(T0 + 3_600)).toEqual({ state: 'pending', next_attempt_at: T0 + 3_600 + 1_800 })
-    expect(publishAt(T0 + NOSTR.retryWindowSeconds).state).toBe('abandoned')
+    expect(publishAt(T0 + 3_600)).toMatchObject({ state: 'pending', next_attempt_at: T0 + 3_600 + 1_800 })
+    expect(claimOne('a', T0 + NOSTR.retryWindowSeconds)).toHaveLength(0)
+    expect(rowState(1)?.state).toBe('abandoned')
+  })
+
+  it('abandons a response nobody could deliver for 9 days instead of publishing it late', () => {
+    enqueue(store, input(1))
+    expect(claimOne('a', T0 + NOSTR.decisionRetentionSeconds)).toHaveLength(0)
+    expect(rowState(1)?.state).toBe('abandoned')
   })
 
   it('backs off failed attempts exponentially up to 30 minutes', () => {
@@ -2003,7 +2141,7 @@ describe('schedules', () => {
     for (let i = 0; i < 8; i++) {
       expect(claimOne('a', now)).toHaveLength(1)
       markFailed(store, { recipient: RECIPIENT, rumorId: hex(1), owner: 'a', now })
-      const next = store.db.prepare('SELECT next_attempt_at FROM outbox').get()?.next_attempt_at as number
+      const next = rowState(1)!.next_attempt_at
       delays.push(next - now)
       now = next
     }
@@ -2022,17 +2160,17 @@ describe('cleanup', () => {
     enqueue(store, input(1))
     enqueue(store, input(2))
     enqueue(store, input(3))
-    claimDue(store, { owner: 'a', now: T0, limit: 1 })
+    claimDue(store, { owner: 'a', now: T0, limit: 1, authorize: allow })
     expect(deleteUnclaimedFor(store, { recipient: RECIPIENT, now: T0 + 1 })).toBe(2)
     expect((store.db.prepare('SELECT rumor_id FROM outbox').all() as Array<{ rumor_id: string }>).map((r) => r.rumor_id)).toEqual([hex(1)])
   })
 
-  it('purges finished rows after 9 days', () => {
+  it('purges message content 7 days after the rumor was created, whatever the row state', () => {
     enqueue(store, input(1))
-    claimOne('a', T0)
-    markPublished(store, { recipient: RECIPIENT, rumorId: hex(1), owner: 'a', now: T0 })
-    expect(purgeOutbox(store, T0 + NOSTR.decisionRetentionSeconds - 1)).toBe(0)
-    expect(purgeOutbox(store, T0 + NOSTR.decisionRetentionSeconds)).toBe(1)
+    enqueue(store, input(2, { rumor: { ...input(2).rumor, created_at: T0 + 100 } }))
+    expect(purgeOutbox(store, T0 + NOSTR.contentRetentionSeconds - 1)).toBe(0)
+    expect(purgeOutbox(store, T0 + NOSTR.contentRetentionSeconds)).toBe(1)
+    expect(rowState(2)?.state).toBe('pending')
   })
 })
 ```
@@ -2076,6 +2214,8 @@ export type OutboxItem = {
   attempts: number
   firstEnqueuedAt: number
 }
+
+type ClaimRef = { recipient: string; rumorId: string; owner: string }
 
 type OutboxRow = {
   recipient: string
@@ -2121,7 +2261,7 @@ export function enqueue(store: Store, input: EnqueueInput): EnqueueOutcome {
   if (input.relays.length === 0 || input.relays.length > NOSTR.maxRelaysPerContact) {
     throw new Error('outbox: between 1 and 5 relays are required')
   }
-  return store.tx(() => {
+  return store.tx((): EnqueueOutcome => {
     const row = selectRow(store, input.recipient, input.rumor.id)
     if (row) {
       if (row.state === 'pending') return 'already_pending'
@@ -2136,10 +2276,10 @@ export function enqueue(store: Store, input: EnqueueInput): EnqueueOutcome {
     }
     const rumorJson = JSON.stringify(input.rumor)
     const bytes = Buffer.byteLength(rumorJson)
-    const pendingForRecipient = (store.db
-      .prepare("SELECT coalesce(sum(bytes), 0) AS b FROM outbox WHERE recipient = ? AND state = 'pending'")
-      .get(input.recipient)?.b ?? 0) as number
-    const pendingForIdentity = (store.db.prepare("SELECT coalesce(sum(bytes), 0) AS b FROM outbox WHERE state = 'pending'").get()?.b ?? 0) as number
+    const pendingForRecipient = Number(
+      store.db.prepare("SELECT coalesce(sum(bytes), 0) AS b FROM outbox WHERE recipient = ? AND state = 'pending'").get(input.recipient)?.b ?? 0,
+    )
+    const pendingForIdentity = Number(store.db.prepare("SELECT coalesce(sum(bytes), 0) AS b FROM outbox WHERE state = 'pending'").get()?.b ?? 0)
     const overCap =
       pendingForRecipient + bytes > NOSTR.maxPendingBytesPerRecipient || pendingForIdentity + bytes > NOSTR.maxPendingBytesPerIdentity
     store.db
@@ -2166,36 +2306,72 @@ export function enqueue(store: Store, input: EnqueueInput): EnqueueOutcome {
   })
 }
 
-export function claimDue(store: Store, input: { owner: string; now: number; limit: number }): OutboxItem[] {
+export function claimDue(
+  store: Store,
+  input: { owner: string; now: number; limit: number; authorize: (item: OutboxItem) => boolean },
+): OutboxItem[] {
   return store.tx(() => {
-    store.db.prepare('DELETE FROM publish_log WHERE at <= ?').run(input.now - 60)
-    const used = store.db.prepare('SELECT count(*) AS n FROM publish_log').get()?.n as number
-    const budget = Math.min(input.limit, NOSTR.maxPublishesPerMinute - used)
-    if (budget <= 0) return []
+    store.db
+      .prepare(
+        `UPDATE outbox SET state = 'abandoned', claimed_by = NULL, claimed_until = NULL, updated_at = ?
+         WHERE state = 'pending'
+           AND ((policy = 'retry_until_resolved' AND first_enqueued_at <= ?) OR (policy = 'once' AND first_enqueued_at <= ?))`,
+      )
+      .run(input.now, input.now - NOSTR.retryWindowSeconds, input.now - NOSTR.decisionRetentionSeconds)
     const rows = store.db
       .prepare(
         `SELECT * FROM outbox WHERE state = 'pending' AND next_attempt_at <= ? AND (claimed_until IS NULL OR claimed_until <= ?)
          ORDER BY next_attempt_at, rowid LIMIT ?`,
       )
-      .all(input.now, input.now, budget) as OutboxRow[]
+      .all(input.now, input.now, input.limit) as OutboxRow[]
+    const abandon = store.db.prepare(
+      "UPDATE outbox SET state = 'abandoned', claimed_by = NULL, claimed_until = NULL, updated_at = ? WHERE recipient = ? AND rumor_id = ?",
+    )
     const claim = store.db.prepare('UPDATE outbox SET claimed_by = ?, claimed_until = ?, updated_at = ? WHERE recipient = ? AND rumor_id = ?')
-    const log = store.db.prepare('INSERT INTO publish_log (at) VALUES (?)')
+    const granted: OutboxItem[] = []
     for (const row of rows) {
+      const item = toItem(row)
+      if (!input.authorize(item)) {
+        abandon.run(input.now, row.recipient, row.rumor_id)
+        continue
+      }
       claim.run(input.owner, input.now + NOSTR.claimSeconds, input.now, row.recipient, row.rumor_id)
-      log.run(input.now)
+      granted.push(item)
     }
-    return rows.map(toItem)
+    return granted
   })
 }
 
-export function stillClaimed(store: Store, input: { recipient: string; rumorId: string; owner: string; now: number }): boolean {
+export function stillClaimed(store: Store, input: ClaimRef & { now: number }): boolean {
   const row = selectRow(store, input.recipient, input.rumorId)
   return row?.state === 'pending' && row.claimed_by === input.owner && (row.claimed_until ?? 0) > input.now
 }
 
+export function reservePublish(store: Store, input: ClaimRef & { now: number }): 'reserved' | 'claim_lost' | 'over_budget' {
+  return store.tx(() => {
+    if (!stillClaimed(store, input)) return 'claim_lost'
+    store.db.prepare('DELETE FROM publish_log WHERE at <= ?').run(input.now - 60)
+    const used = Number(store.db.prepare('SELECT count(*) AS n FROM publish_log').get()?.n ?? 0)
+    if (used >= NOSTR.maxPublishesPerMinute) return 'over_budget'
+    store.db.prepare('INSERT INTO publish_log (at) VALUES (?)').run(input.now)
+    return 'reserved'
+  })
+}
+
+export function postpone(store: Store, input: ClaimRef & { retryAt: number }): 'ok' | 'claim_lost' {
+  return store.tx(() => {
+    const row = selectRow(store, input.recipient, input.rumorId)
+    if (!row || row.state !== 'pending' || row.claimed_by !== input.owner) return 'claim_lost'
+    store.db
+      .prepare('UPDATE outbox SET next_attempt_at = ?, claimed_by = NULL, claimed_until = NULL WHERE recipient = ? AND rumor_id = ?')
+      .run(input.retryAt, input.recipient, input.rumorId)
+    return 'ok'
+  })
+}
+
 function finish(
   store: Store,
-  input: { recipient: string; rumorId: string; owner: string; now: number },
+  input: ClaimRef & { now: number },
   decide: (row: OutboxRow, attempts: number) => { state: OutboxRow['state']; nextAttemptAt: number; published: boolean },
 ): 'ok' | 'claim_lost' {
   return store.tx(() => {
@@ -2213,7 +2389,7 @@ function finish(
   })
 }
 
-export function markPublished(store: Store, input: { recipient: string; rumorId: string; owner: string; now: number }): 'ok' | 'claim_lost' {
+export function markPublished(store: Store, input: ClaimRef & { now: number }): 'ok' | 'claim_lost' {
   return finish(store, input, (row) => {
     if (row.policy === 'once') return { state: 'published', nextAttemptAt: row.next_attempt_at, published: true }
     const age = input.now - row.first_enqueued_at
@@ -2223,7 +2399,7 @@ export function markPublished(store: Store, input: { recipient: string; rumorId:
   })
 }
 
-export function markFailed(store: Store, input: { recipient: string; rumorId: string; owner: string; now: number }): 'ok' | 'claim_lost' {
+export function markFailed(store: Store, input: ClaimRef & { now: number }): 'ok' | 'claim_lost' {
   return finish(store, input, (row, attempts) => {
     const age = input.now - row.first_enqueued_at
     const limit = row.policy === 'once' ? NOSTR.decisionRetentionSeconds : NOSTR.retryWindowSeconds
@@ -2247,12 +2423,14 @@ export function deleteUnclaimedFor(store: Store, input: { recipient: string; now
   return Number(result.changes)
 }
 
+// Rows carry full question and answer text, so they follow the 7-day content retention by the
+// rumor's own creation date — pending, published or abandoned alike.
 export function purgeOutbox(store: Store, now: number): number {
   return store.tx(() => {
     store.db.prepare('DELETE FROM publish_log WHERE at <= ?').run(now - 60)
     const result = store.db
-      .prepare("DELETE FROM outbox WHERE state IN ('published', 'abandoned') AND updated_at <= ?")
-      .run(now - NOSTR.decisionRetentionSeconds)
+      .prepare("DELETE FROM outbox WHERE json_extract(rumor_json, '$.created_at') <= ?")
+      .run(now - NOSTR.contentRetentionSeconds)
     return Number(result.changes)
   })
 }
@@ -2273,7 +2451,7 @@ Expected: PASS.
 
 ```bash
 git add packages/core/src/store/outbox.ts packages/core/src/index.ts packages/core/test/store-outbox.test.ts
-git commit -m "feat(core): outbox with one row per logical message, claims, retry schedules and publish caps"
+git commit -m "feat(core): outbox with authorized claims, publish reservations, retry schedules, caps and content retention"
 ```
 
 ---
@@ -2504,7 +2682,7 @@ describe('MessageSchema', () => {
     [{ v: 1, type: 'answer', questionId: id, text: 'ok', source: 's', confidence: 'quizas' }, 'bad confidence'],
     [{ v: 1, type: 'connect_request', requestId: id, name: 'Ana', note: '', relays: Array(6).fill('wss://a.example.com') }, 'too many relays'],
     [{ v: 1, type: 'rejected', questionId: id, reason: 'because' }, 'bad reason'],
-  ])('rejects %j (%s)', (message) => {
+  ])('rejects %j (%s)', (message, _description) => {
     expect(MessageSchema.safeParse(message).success).toBe(false)
   })
 
@@ -3038,7 +3216,8 @@ git commit -m "feat(core): NIP-59 sealing with fresh wraps per retry, expiration
 **Interfaces:**
 - Consumes: `Identity`, `NOSTR` (Task 2); `MessageSchema`, `Message`, `isFutureDated` (Task 8); `leadingZeroBits`, `mineEvent` (Task 9); `Rumor`, `createRumor`, `wrapRumor` (Task 10).
 - Produces:
-  - `class SeenIds { constructor(max?: number); has(id: string): boolean; add(id: string): void; readonly size: number }` — insertion-ordered, evicts the oldest past `max` (default 10 000).
+  - `class SeenIds { constructor(max?: number); has(id: string): boolean; add(id: string): void; delete(id: string): void; readonly size: number }` — insertion-ordered, evicts the oldest past `max` (default 10 000).
+  - **Contract for plans 2 and 3:** `precheckWrap` records the wrap id as seen. If anything after it fails before the message is persisted (decryption succeeded but the database write threw, the process was aborted), the caller must call `seen.delete(wrapId)` so a later copy or a history re-read can deliver it. Validation failures from `openWrap` stay in the cache.
   - `type OpenContext = { identity: Identity; now: number; seen: SeenIds }`
   - `type OpenFailureStage = 'size' | 'structure' | 'id' | 'pow' | 'duplicate' | 'signature' | 'seal' | 'rumor' | 'content' | 'request_pow'`
   - `type OpenFailure = { ok: false; stage: OpenFailureStage; detail: string }` — `detail` is an English log line that never contains decrypted content.
@@ -3234,6 +3413,13 @@ describe('SeenIds', () => {
     seen.add('c')
     expect([seen.has('a'), seen.has('b'), seen.has('c'), seen.size]).toEqual([false, true, true, 2])
   })
+
+  it('forgets an id on request, so a message whose persistence failed can be delivered again', () => {
+    const seen = new SeenIds()
+    seen.add('a')
+    seen.delete('a')
+    expect(seen.has('a')).toBe(false)
+  })
 })
 ```
 
@@ -3263,6 +3449,10 @@ export class SeenIds {
       const oldest = this.ids.values().next().value
       if (oldest !== undefined) this.ids.delete(oldest)
     }
+  }
+
+  delete(id: string): void {
+    this.ids.delete(id)
   }
 
   get size(): number {
@@ -3763,7 +3953,7 @@ git commit -m "test(core): in-memory NIP-01 relay with auth, caps, rejection and
 
 ---
 
-### Task 13: Board connection — NIP-01 over a pinned socket, with NIP-42 retry
+### Task 13: Board connection — a sequential NIP-01 reader over a validated, pinned socket, with NIP-42 retry
 
 **Files:**
 - Create: `packages/core/src/boards/socket.ts`, `packages/core/src/boards/connection.ts`
@@ -3771,14 +3961,15 @@ git commit -m "test(core): in-memory NIP-01 relay with auth, caps, rejection and
 - Test: `packages/core/test/boards-connection.test.ts`
 
 **Interfaces:**
-- Consumes: `Identity` (Task 2); `safeLookup` (Task 3); `startFakeBoard`, `plainSocketFactory` (Task 12, tests only).
+- Consumes: `Identity` (Task 2); `checkRelayUrl`, `safeLookup`, `createSafeLookup` (Task 3); `startFakeBoard`, `plainSocketFactory` (Task 12, tests only).
 - Produces:
-  - `type SocketFactory = (url: string) => WebSocket` (`ws` client) and `pinnedSocketFactory: SocketFactory` — `wss://` only, `lookup: safeLookup`, `followRedirects: false`, `maxPayload` 1 MiB, `handshakeTimeout` 10 s, no compression.
+  - `type SocketFactory = (url: string) => WebSocket` (`ws` client).
+  - `createPinnedSocketFactory(lookup?: LookupFunction): SocketFactory` and `pinnedSocketFactory = createPinnedSocketFactory()` — re-validates every URL with `checkRelayUrl` (so `wss://127.0.0.1` or `wss://localhost` throw before any socket exists), connects to the normalized URL with `lookup`, `followRedirects: false`, `maxPayload` 1 MiB, `handshakeTimeout` 10 s, no compression.
   - `type Filter = { kinds?: number[]; '#p'?: string[]; since?: number; until?: number; limit?: number }`
-  - `type SubscriptionHandlers = { onEvent(raw: unknown): void; onEose(): void; onClosed(reason: string): void }`
+  - `type SubscriptionHandlers = { onEvent(raw: unknown): void | Promise<void>; onEose(): void; onClosed(reason: string): void }`
   - `type PublishResult = { ok: boolean; message: string }`
-  - `class BoardConnection extends EventEmitter` with `constructor({ url, identity, createSocket?, timeoutMs?, log? })`, `readonly url`, `get isOpen(): boolean`, `connect(): Promise<void>`, `publish(event: NostrEvent): Promise<PublishResult>`, `subscribe(id: string, filters: Filter[], handlers: SubscriptionHandlers): void`, `unsubscribe(id: string): void`, `pause(): void`, `resume(): void`, `close(): void`; emits `'close'`.
-  - Behavior: `OK false` or `CLOSED` whose reason starts with `auth-required:` triggers **one** NIP-42 authentication (using the last `AUTH` challenge) and one retry; without a challenge, or if auth fails, the original result is returned. A closed socket resolves every pending publish with `{ ok: false, message: 'error: connection closed' }` and closes every subscription with that reason. Frames that are not JSON arrays are ignored.
+  - `class BoardConnection extends EventEmitter` with `constructor({ url, identity, createSocket?, timeoutMs?, log? })`, `readonly url`, `get isOpen(): boolean`, `connect(): Promise<void>`, `publish(event: NostrEvent): Promise<PublishResult>`, `subscribe(id: string, filters: Filter[], handlers: SubscriptionHandlers): void`, `unsubscribe(id: string): void`, `close(): void`; emits `'close'`.
+  - Behavior: frames are read through `createWebSocketStream(socket, { readableObjectMode: true })` one at a time, and `onEvent` is **awaited** before the next frame is read — so a slow consumer makes `ws` stop reading from the network instead of piling frames up in memory (while an `onEvent` is pending, `OK` frames for publishes on the same connection also wait). `OK false` or `CLOSED` whose reason starts with `auth-required:` triggers **one** NIP-42 authentication (using the last `AUTH` challenge) and one retry; without a challenge, or if auth fails, the original result is returned. A closed socket resolves every pending publish with `{ ok: false, message: 'error: connection closed' }` and closes every subscription with that reason. Frames that are not JSON arrays are ignored; an exception thrown by a handler is logged and does not stop the reader.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3787,8 +3978,8 @@ Create `packages/core/test/boards-connection.test.ts`:
 ```ts
 import { finalizeEvent, type NostrEvent } from 'nostr-tools/pure'
 import { afterEach, describe, expect, it } from 'vitest'
-import { BoardConnection, pinnedSocketFactory, type SubscriptionHandlers } from '@agentbridge/core'
-import { plainSocketFactory, startFakeBoard, type FakeBoard, type FakeBoardOptions } from './support/fake-board'
+import { BoardConnection, createPinnedSocketFactory, createSafeLookup, pinnedSocketFactory, type SubscriptionHandlers } from '@agentbridge/core'
+import { plainSocketFactory, startFakeBoard, type FakeBoardOptions } from './support/fake-board'
 import { testIdentity } from './support/keys'
 
 const me = testIdentity(5)
@@ -3809,11 +4000,18 @@ async function setup(options: FakeBoardOptions = {}) {
 const wrapFor = (content: string, created_at = 1_000): NostrEvent =>
   finalizeEvent({ kind: 1059, created_at, tags: [['p', me.publicKey]], content }, other.secretKey)
 
-function recorder() {
+function recorder(onEvent?: (raw: unknown) => void | Promise<void>) {
   const events: unknown[] = []
   let eose = 0
   const closed: string[] = []
-  const handlers: SubscriptionHandlers = { onEvent: (e) => events.push(e), onEose: () => eose++, onClosed: (r) => closed.push(r) }
+  const handlers: SubscriptionHandlers = {
+    onEvent: async (e) => {
+      events.push(e)
+      await onEvent?.(e)
+    },
+    onEose: () => eose++,
+    onClosed: (r) => closed.push(r),
+  }
   return { handlers, events, closed, eose: () => eose }
 }
 
@@ -3858,6 +4056,24 @@ describe('BoardConnection', () => {
     await until(() => r.events.length === 2)
   })
 
+  it('waits for a slow event handler before reading the next frame', async () => {
+    const { board, conn } = await setup()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    const r = recorder(async (raw) => {
+      if ((raw as NostrEvent).content === 'primero') await gate
+    })
+    conn.subscribe('s', [{ kinds: [1059] }], r.handlers)
+    await until(() => r.eose() === 1)
+    board.inject(wrapFor('primero', 700))
+    board.inject(wrapFor('segundo', 701))
+    await until(() => r.events.length === 1)
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect(r.events).toHaveLength(1)
+    release()
+    await until(() => r.events.length === 2)
+  })
+
   it('authenticates and re-subscribes when reading requires auth', async () => {
     const { board, conn } = await setup({ requireAuthToRead: true })
     board.inject(wrapFor('privado', 700))
@@ -3889,28 +4105,19 @@ describe('BoardConnection', () => {
     expect(conn.isOpen).toBe(false)
     expect(await conn.publish(wrapFor('tarde'))).toEqual({ ok: false, message: 'error: connection closed' })
   })
-
-  it('stops delivering events while paused and delivers them after resume', async () => {
-    const { board, conn } = await setup()
-    const r = recorder()
-    conn.subscribe('s', [{ kinds: [1059] }], r.handlers)
-    await until(() => r.eose() === 1)
-    conn.pause()
-    board.inject(wrapFor('en pausa', 800))
-    await new Promise((resolve) => setTimeout(resolve, 150))
-    expect(r.events).toHaveLength(0)
-    conn.resume()
-    await until(() => r.events.length === 1)
-  })
 })
 
-describe('pinnedSocketFactory', () => {
-  it('refuses anything but wss://', () => {
-    expect(() => pinnedSocketFactory('ws://relay.example.com')).toThrow(/wss/)
-  })
+describe('pinned socket factory', () => {
+  it.each(['ws://relay.example.com', 'wss://127.0.0.1:7777', 'wss://[::1]', 'wss://localhost:9', 'wss://relay.example.com/?x=1'])(
+    'refuses %s before opening any socket',
+    (url) => {
+      expect(() => pinnedSocketFactory(url)).toThrow(/tablero/)
+    },
+  )
 
-  it('refuses to connect when the name resolves to a forbidden address', async () => {
-    const socket = pinnedSocketFactory('wss://localhost:9')
+  it('refuses to connect when the validated name resolves to a forbidden address', async () => {
+    const factory = createPinnedSocketFactory(createSafeLookup(async () => [{ address: '10.0.0.1', family: 4 }]))
+    const socket = factory('wss://relay.example.com')
     const error = await new Promise<NodeJS.ErrnoException>((resolve) => socket.once('error', resolve))
     expect(error.code).toBe('EAGENTBRIDGE_FORBIDDEN_ADDRESS')
   })
@@ -3929,23 +4136,29 @@ Create `packages/core/src/boards/socket.ts`:
 ```ts
 import type { LookupFunction } from 'node:net'
 import WebSocket from 'ws'
-import { safeLookup } from '../relay-url'
+import { checkRelayUrl, safeLookup } from '../relay-url'
 
 export type SocketFactory = (url: string) => WebSocket
 
-// ws forwards `lookup` to tls.connect, so the socket connects with exactly the addresses safeLookup
-// validated: no second DNS resolution for a rebinding server to swap.
-export const pinnedSocketFactory: SocketFactory = (url) => {
-  if (!url.startsWith('wss://')) throw new Error('pinnedSocketFactory: only wss:// relays are allowed')
-  const options: WebSocket.ClientOptions & { lookup: LookupFunction } = {
-    lookup: safeLookup,
-    followRedirects: false,
-    maxPayload: 1024 * 1024,
-    handshakeTimeout: 10_000,
-    perMessageDeflate: false,
+// Every URL is re-validated here, whoever the caller is: an IP literal would skip `lookup`
+// entirely. ws forwards `lookup` to tls.connect, so the socket connects with exactly the addresses
+// that lookup validated — no second DNS resolution for a rebinding server to swap.
+export function createPinnedSocketFactory(lookup: LookupFunction = safeLookup): SocketFactory {
+  return (url) => {
+    const checked = checkRelayUrl(url)
+    if (!checked.ok) throw new Error(`pinnedSocketFactory: ${checked.reason}`)
+    const options: WebSocket.ClientOptions & { lookup: LookupFunction } = {
+      lookup,
+      followRedirects: false,
+      maxPayload: 1024 * 1024,
+      handshakeTimeout: 10_000,
+      perMessageDeflate: false,
+    }
+    return new WebSocket(checked.url, options)
   }
-  return new WebSocket(url, options)
 }
+
+export const pinnedSocketFactory: SocketFactory = createPinnedSocketFactory()
 ```
 
 - [ ] **Step 4: Implement the connection**
@@ -3956,12 +4169,12 @@ Create `packages/core/src/boards/connection.ts`:
 import { EventEmitter } from 'node:events'
 import { makeAuthEvent } from 'nostr-tools/nip42'
 import { finalizeEvent, type NostrEvent } from 'nostr-tools/pure'
-import type WebSocket from 'ws'
+import WebSocket, { createWebSocketStream } from 'ws'
 import type { Identity } from '../identity'
 import { pinnedSocketFactory, type SocketFactory } from './socket'
 
 export type Filter = { kinds?: number[]; '#p'?: string[]; since?: number; until?: number; limit?: number }
-export type SubscriptionHandlers = { onEvent(raw: unknown): void; onEose(): void; onClosed(reason: string): void }
+export type SubscriptionHandlers = { onEvent(raw: unknown): void | Promise<void>; onEose(): void; onClosed(reason: string): void }
 export type PublishResult = { ok: boolean; message: string }
 
 export type BoardConnectionOptions = {
@@ -3975,7 +4188,6 @@ export type BoardConnectionOptions = {
 type Subscription = { filters: Filter[]; handlers: SubscriptionHandlers; retriedAuth: boolean }
 
 const CLOSED_REASON = 'error: connection closed'
-const OPEN = 1
 
 export class BoardConnection extends EventEmitter {
   readonly url: string
@@ -4001,7 +4213,7 @@ export class BoardConnection extends EventEmitter {
   }
 
   get isOpen(): boolean {
-    return this.socket?.readyState === OPEN
+    return this.socket?.readyState === WebSocket.OPEN
   }
 
   connect(): Promise<void> {
@@ -4016,6 +4228,10 @@ export class BoardConnection extends EventEmitter {
         return
       }
       this.socket = socket
+      // The stream must exist before the first frame can arrive; it owns all reading from here on.
+      const stream = createWebSocketStream(socket, { readableObjectMode: true })
+      stream.on('error', (err) => this.log(`${this.url}: ${err.message}`))
+      void this.readFrames(stream)
       const timer = setTimeout(() => {
         socket.terminate()
         reject(new Error(`timed out connecting to ${this.url}`))
@@ -4026,10 +4242,8 @@ export class BoardConnection extends EventEmitter {
       })
       socket.on('error', (err) => {
         clearTimeout(timer)
-        this.log(`${this.url}: ${err.message}`)
         reject(err)
       })
-      socket.on('message', (data) => this.onFrame(data))
       socket.on('close', () => {
         clearTimeout(timer)
         reject(new Error(`connection to ${this.url} closed`))
@@ -4058,16 +4272,16 @@ export class BoardConnection extends EventEmitter {
     if (this.subs.delete(id)) this.send(['CLOSE', id])
   }
 
-  pause(): void {
-    this.socket?.pause()
-  }
-
-  resume(): void {
-    this.socket?.resume()
-  }
-
   close(): void {
     this.socket?.close()
+  }
+
+  private async readFrames(stream: AsyncIterable<unknown>): Promise<void> {
+    try {
+      for await (const chunk of stream) await this.onFrame(chunk)
+    } catch {
+      // Socket errors surface through the 'close' handler.
+    }
   }
 
   private send(frame: unknown[]): boolean {
@@ -4111,15 +4325,19 @@ export class BoardConnection extends EventEmitter {
         this.authenticated = result.ok
         resolve(result.ok)
       })
-      if (!this.send(['AUTH', auth])) resolve(false)
+      if (!this.send(['AUTH', auth])) {
+        clearTimeout(timer)
+        this.pendingOk.delete(auth.id)
+        resolve(false)
+      }
     }).finally(() => {
       this.authInFlight = null
     })
     return this.authInFlight
   }
 
-  private onFrame(data: WebSocket.RawData): void {
-    const text = Buffer.isBuffer(data) ? data.toString('utf8') : Array.isArray(data) ? Buffer.concat(data).toString('utf8') : Buffer.from(data).toString('utf8')
+  private async onFrame(chunk: unknown): Promise<void> {
+    const text = typeof chunk === 'string' ? chunk : Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
     let frame: unknown
     try {
       frame = JSON.parse(text)
@@ -4129,7 +4347,13 @@ export class BoardConnection extends EventEmitter {
     if (!Array.isArray(frame) || typeof frame[0] !== 'string') return
     switch (frame[0]) {
       case 'EVENT': {
-        this.subs.get(String(frame[1]))?.handlers.onEvent(frame[2])
+        const sub = this.subs.get(String(frame[1]))
+        if (!sub) return
+        try {
+          await sub.handlers.onEvent(frame[2])
+        } catch (err) {
+          this.log(`${this.url}: event handler failed: ${err instanceof Error ? err.message : String(err)}`)
+        }
         return
       }
       case 'EOSE': {
@@ -4196,18 +4420,18 @@ export * from './boards/connection'
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `npx vitest run packages/core/test/boards-connection.test.ts && npm run typecheck`
-Expected: PASS. The forbidden-address test needs no internet: `localhost` resolves from the hosts file.
+Expected: PASS. No test needs the internet: the forbidden-address case injects its resolver.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add packages/core/src/boards/socket.ts packages/core/src/boards/connection.ts packages/core/src/index.ts packages/core/test/boards-connection.test.ts
-git commit -m "feat(core): NIP-01 board connection over a DNS-pinned socket with a single NIP-42 retry"
+git commit -m "feat(core): sequential NIP-01 board connection over a validated, DNS-pinned socket with a single NIP-42 retry"
 ```
 
 ---
 
-### Task 14: Board pool — publish to several relays, one-shot queries, live subscription with backpressure
+### Task 14: Board pool — publish to several relays, one-shot queries, bounded live subscription
 
 **Files:**
 - Create: `packages/core/src/boards/receive-queue.ts`, `packages/core/src/boards/pool.ts`
@@ -4217,12 +4441,12 @@ git commit -m "feat(core): NIP-01 board connection over a DNS-pinned socket with
 **Interfaces:**
 - Consumes: `Identity`, `NOSTR`, `nowSeconds` (Task 2); `BoardConnection`, `Filter`, `SocketFactory` (Task 13); `startFakeBoard`, `plainSocketFactory` (Task 12, tests only).
 - Produces:
-  - `class ReceiveQueue<T>` with `constructor({ max, process(item, source): Promise<void>, onPressure(source, paused): void, onError?(err, source): void })`, `push(source: string, item: T): void`, `readonly length: number`, `idle(): Promise<void>`. Processes one item at a time, in order. When a push brings the length to `max`, it signals pressure for that source; once the length drops to `max / 2` it releases every paused source. It never drops items.
-  - `type PoolOptions = { identity: Identity; createSocket?: SocketFactory; timeoutMs?: number; reconnectDelaysMs?: readonly number[]; now?: () => number; log?: (line: string) => void; onPressure?: (relay: string, paused: boolean) => void }`
+  - `class ReceiveQueue<T>` with `constructor({ max, process(item, source): Promise<void>, onPressure?(source, waiting): void, onError?(err, source): void })`, `push(source: string, item: T): Promise<void>` (waits while the queue holds `max` items), `readonly length: number` (never above `max`), `idle(): Promise<void>`. Processes one item at a time, in arrival order; never drops items; `onPressure(source, true)` when a push has to wait and `(source, false)` when it gets room.
+  - `type PoolOptions = { identity: Identity; createSocket?: SocketFactory; timeoutMs?: number; reconnectDelaysMs?: readonly number[]; now?: () => number; log?: (line: string) => void; onPressure?: (relay: string, waiting: boolean) => void }`
   - `type PublishOutcome = { accepted: string[]; rejected: Array<{ relay: string; reason: string }> }`
   - `type QueryResult = { events: unknown[]; complete: boolean; closedReason: string | null }` — `complete` means `EOSE` arrived.
-  - `type LiveHandlers<T> = { precheck(raw: unknown, relay: string): T | null; process(item: T, relay: string): Promise<void> }`
-  - `class BoardPool` with `publish(relays, event): Promise<PublishOutcome>` (at most 5 distinct relays, in parallel, never throws), `query(relay, filter, timeoutMs?): Promise<QueryResult>` (never throws), `subscribeLive<T>(relays, handlers): { close(): Promise<void> }` (filter `{ kinds: [1059], '#p': [me], since: now() − NOSTR.liveSinceSeconds }`, precheck runs synchronously on arrival, `process` runs through one shared `ReceiveQueue` of `NOSTR.receiveQueueMax`, pressure pauses and resumes that relay's socket, reconnects with `reconnectDelaysMs` — default `[1000, 2000, 5000, 10000, 30000, 60000]` — and resets the delay after each `EOSE`), `close(): Promise<void>`.
+  - `type LiveHandlers<T> = { precheck(raw: unknown, relay: string): T | null; process(item: T, relay: string): Promise<void> }` — **contract:** if `process` fails after `precheckWrap` recorded the wrap id, `process` must call `seen.delete(wrapId)` before rethrowing (Task 11).
+  - `class BoardPool` with `publish(relays, event): Promise<PublishOutcome>` (at most 5 distinct relays, in parallel, never throws; callers reserve with `reservePublish` first), `query(relay, filter, timeoutMs?): Promise<QueryResult>` (never throws), `subscribeLive<T>(relays, handlers): { close(): Promise<void> }` (filter `{ kinds: [1059], '#p': [me], since: now() − NOSTR.liveSinceSeconds }`; each frame's `precheck` runs on arrival and the connection waits for `queue.push`, so a full queue stops reading from that relay; reconnects with `reconnectDelaysMs` — default `[1000, 2000, 5000, 10000, 30000, 60000]` — resetting the delay after each `EOSE`), and `close(): Promise<void>` (first closes every live subscription created by this pool, then the connections).
 
 - [ ] **Step 1: Write the failing queue tests**
 
@@ -4241,7 +4465,6 @@ describe('ReceiveQueue', () => {
     const seen: number[] = []
     const queue = new ReceiveQueue<number>({
       max: 100,
-      onPressure: () => {},
       process: async (n) => {
         running++
         maxRunning = Math.max(maxRunning, running)
@@ -4250,29 +4473,35 @@ describe('ReceiveQueue', () => {
         running--
       },
     })
-    for (let n = 0; n < 20; n++) queue.push('a', n)
+    for (let n = 0; n < 20; n++) await queue.push('a', n)
     await queue.idle()
     expect(seen).toEqual([...Array(20).keys()])
     expect(maxRunning).toBe(1)
   })
 
-  it('signals pressure for the source that filled it, releases at half, and never drops items', async () => {
+  it('never holds more than max items: producers wait for room, and nothing is dropped', async () => {
     const signals: Array<[string, boolean]> = []
     let processed = 0
+    let longest = 0
     const queue = new ReceiveQueue<number>({
       max: 10,
-      onPressure: (source, paused) => signals.push([source, paused]),
+      onPressure: (source, waiting) => signals.push([source, waiting]),
       process: async () => {
+        longest = Math.max(longest, queue.length)
         await sleep(1)
         processed++
       },
     })
-    for (let n = 0; n < 15; n++) queue.push(n < 12 ? 'a' : 'b', n)
+    const producer = async (source: string, count: number) => {
+      for (let n = 0; n < count; n++) await queue.push(source, n)
+    }
+    await Promise.all([producer('a', 40), producer('b', 40)])
     await queue.idle()
-    expect(processed).toBe(15)
+    expect(processed).toBe(80)
+    expect(longest).toBeLessThanOrEqual(10)
+    expect(queue.length).toBe(0)
     expect(signals).toContainEqual(['a', true])
     expect(signals).toContainEqual(['a', false])
-    expect(signals.findIndex((s) => s[1] === false)).toBeGreaterThan(signals.findIndex((s) => s[1] === true))
   })
 
   it('reports processing errors and keeps going', async () => {
@@ -4280,14 +4509,13 @@ describe('ReceiveQueue', () => {
     const done: number[] = []
     const queue = new ReceiveQueue<number>({
       max: 10,
-      onPressure: () => {},
       onError: (err) => errors.push((err as Error).message),
       process: async (n) => {
         if (n === 1) throw new Error('boom')
         done.push(n)
       },
     })
-    ;[0, 1, 2].forEach((n) => queue.push('a', n))
+    for (const n of [0, 1, 2]) await queue.push('a', n)
     await queue.idle()
     expect(errors).toEqual(['boom'])
     expect(done).toEqual([0, 2])
@@ -4300,8 +4528,7 @@ describe('ReceiveQueue', () => {
 Create `packages/core/test/boards-pool.test.ts`:
 
 ```ts
-import type { NostrEvent } from 'nostr-tools/pure'
-import { finalizeEvent } from 'nostr-tools/pure'
+import { finalizeEvent, type NostrEvent } from 'nostr-tools/pure'
 import { afterEach, describe, expect, it } from 'vitest'
 import { BoardPool, NOSTR, type PoolOptions } from '@agentbridge/core'
 import { plainSocketFactory, startFakeBoard, type FakeBoard, type FakeBoardOptions } from './support/fake-board'
@@ -4344,6 +4571,7 @@ const until = async (check: () => boolean, tries = 500) => {
   for (let i = 0; i < tries && !check(); i++) await new Promise((r) => setTimeout(r, 10))
   expect(check()).toBe(true)
 }
+const reqCount = (b: FakeBoard) => b.frames.filter((f) => f[0] === 'REQ').length
 
 describe('BoardPool.publish', () => {
   it('reports each relay separately and never throws', async () => {
@@ -4395,9 +4623,8 @@ describe('BoardPool.subscribeLive', () => {
         processed.push(e.content)
       },
     })
-    await until(() => b.frames.some((f) => f[0] === 'REQ'))
-    const req = b.frames.find((f) => f[0] === 'REQ')!
-    expect(req[2]).toEqual({ kinds: [1059], '#p': [me.publicKey], since: NOW - NOSTR.liveSinceSeconds })
+    await until(() => reqCount(b) === 1)
+    expect(b.frames.find((f) => f[0] === 'REQ')![2]).toEqual({ kinds: [1059], '#p': [me.publicKey], since: NOW - NOSTR.liveSinceSeconds })
     b.inject(fake(1))
     b.inject({ ...fake(2), content: 'skip' })
     b.inject(fake(3))
@@ -4406,22 +4633,23 @@ describe('BoardPool.subscribeLive', () => {
     await live.close()
   })
 
-  it('applies backpressure under a flood without losing anything', async () => {
+  it('holds a flood at the queue limit without losing anything', async () => {
     const b = await board()
-    const pressure: boolean[] = []
+    const waiting: boolean[] = []
     let processed = 0
-    const live = pool({ onPressure: (_relay, paused) => pressure.push(paused) }).subscribeLive<NostrEvent>([b.url], {
+    const total = NOSTR.receiveQueueMax * 2 + 50
+    const live = pool({ onPressure: (_relay, w) => waiting.push(w) }).subscribeLive<NostrEvent>([b.url], {
       precheck: (raw) => raw as NostrEvent,
       process: async () => {
         await new Promise((r) => setTimeout(r, 2))
         processed++
       },
     })
-    await until(() => b.frames.some((f) => f[0] === 'REQ'))
-    for (let n = 1; n <= NOSTR.receiveQueueMax * 2 + 50; n++) b.inject(fake(n))
-    await until(() => processed === NOSTR.receiveQueueMax * 2 + 50, 3_000)
-    expect(pressure).toContain(true)
-    expect(pressure.at(-1)).toBe(false)
+    await until(() => reqCount(b) === 1)
+    for (let n = 1; n <= total; n++) b.inject(fake(n))
+    await until(() => processed === total, 3_000)
+    expect(waiting).toContain(true)
+    expect(waiting.at(-1)).toBe(false)
     await live.close()
   })
 
@@ -4434,22 +4662,32 @@ describe('BoardPool.subscribeLive', () => {
         processed.push(e.content)
       },
     })
-    await until(() => b.frames.filter((f) => f[0] === 'REQ').length === 1)
+    await until(() => reqCount(b) === 1)
     b.disconnectAll()
-    await until(() => b.frames.filter((f) => f[0] === 'REQ').length === 2)
+    await until(() => reqCount(b) === 2)
     b.inject(fake(9))
     await until(() => processed.includes('9'))
     await live.close()
   })
 
-  it('stops reconnecting once closed', async () => {
+  it('stops reconnecting once the subscription is closed', async () => {
     const b = await board()
     const live = pool().subscribeLive<NostrEvent>([b.url], { precheck: () => null, process: async () => {} })
-    await until(() => b.frames.some((f) => f[0] === 'REQ'))
+    await until(() => reqCount(b) === 1)
     await live.close()
     b.disconnectAll()
     await new Promise((r) => setTimeout(r, 200))
-    expect(b.frames.filter((f) => f[0] === 'REQ')).toHaveLength(1)
+    expect(reqCount(b)).toBe(1)
+  })
+
+  it('closes its live subscriptions when the pool itself is closed', async () => {
+    const b = await board()
+    const p = pool()
+    p.subscribeLive<NostrEvent>([b.url], { precheck: () => null, process: async () => {} })
+    await until(() => reqCount(b) === 1)
+    await p.close()
+    await new Promise((r) => setTimeout(r, 200))
+    expect(reqCount(b)).toBe(1)
   })
 })
 ```
@@ -4467,18 +4705,19 @@ Create `packages/core/src/boards/receive-queue.ts`:
 export type ReceiveQueueOptions<T> = {
   max: number
   process: (item: T, source: string) => Promise<void>
-  onPressure: (source: string, paused: boolean) => void
+  onPressure?: (source: string, waiting: boolean) => void
   onError?: (err: unknown, source: string) => void
 }
 
-// Step 5 of the receive pipeline: decryption and everything after it happen one item at a time.
-// A full queue pauses the relay that filled it instead of dropping anything; frames already in
-// flight when the pause lands are still accepted, so `max` is a trigger, not a hard ceiling.
+// Step 5 of the receive pipeline: decryption and everything after it happen one item at a time, and
+// the queue never holds more than `max` items. A producer that finds it full waits; because the
+// board connection awaits this push before reading its next frame, a slow consumer stops the socket
+// from reading instead of dropping or buffering without bound.
 export class ReceiveQueue<T> {
   private readonly items: Array<{ source: string; item: T }> = []
-  private readonly paused = new Set<string>()
+  private readonly capacityWaiters: Array<() => void> = []
+  private readonly idleWaiters: Array<() => void> = []
   private draining = false
-  private readonly waiters: Array<() => void> = []
 
   constructor(private readonly options: ReceiveQueueOptions<T>) {}
 
@@ -4486,18 +4725,21 @@ export class ReceiveQueue<T> {
     return this.items.length
   }
 
-  push(source: string, item: T): void {
-    this.items.push({ source, item })
-    if (this.items.length >= this.options.max && !this.paused.has(source)) {
-      this.paused.add(source)
-      this.options.onPressure(source, true)
+  async push(source: string, item: T): Promise<void> {
+    if (this.items.length >= this.options.max) {
+      this.options.onPressure?.(source, true)
+      while (this.items.length >= this.options.max) {
+        await new Promise<void>((resolve) => this.capacityWaiters.push(resolve))
+      }
+      this.options.onPressure?.(source, false)
     }
+    this.items.push({ source, item })
     void this.drain()
   }
 
   idle(): Promise<void> {
     if (!this.draining && this.items.length === 0) return Promise.resolve()
-    return new Promise((resolve) => this.waiters.push(resolve))
+    return new Promise((resolve) => this.idleWaiters.push(resolve))
   }
 
   private async drain(): Promise<void> {
@@ -4506,21 +4748,16 @@ export class ReceiveQueue<T> {
     try {
       while (this.items.length > 0) {
         const next = this.items.shift()!
+        this.capacityWaiters.shift()?.()
         try {
           await this.options.process(next.item, next.source)
         } catch (err) {
           this.options.onError?.(err, next.source)
         }
-        if (this.paused.size > 0 && this.items.length <= Math.floor(this.options.max / 2)) {
-          for (const source of [...this.paused]) {
-            this.paused.delete(source)
-            this.options.onPressure(source, false)
-          }
-        }
       }
     } finally {
       this.draining = false
-      for (const resolve of this.waiters.splice(0)) resolve()
+      for (const resolve of this.idleWaiters.splice(0)) resolve()
     }
   }
 }
@@ -4546,7 +4783,7 @@ export type PoolOptions = {
   reconnectDelaysMs?: readonly number[]
   now?: () => number
   log?: (line: string) => void
-  onPressure?: (relay: string, paused: boolean) => void
+  onPressure?: (relay: string, waiting: boolean) => void
 }
 
 export type PublishOutcome = { accepted: string[]; rejected: Array<{ relay: string; reason: string }> }
@@ -4555,10 +4792,11 @@ export type LiveHandlers<T> = { precheck(raw: unknown, relay: string): T | null;
 
 const DEFAULT_RECONNECT_DELAYS_MS: readonly number[] = [1_000, 2_000, 5_000, 10_000, 30_000, 60_000]
 const newSubscriptionId = () => randomBytes(8).toString('hex')
-const errorReason = (err: unknown) => `error: ${err instanceof Error ? err.message : String(err)}`
+const messageOf = (err: unknown) => (err instanceof Error ? err.message : String(err))
 
 export class BoardPool {
   private readonly connections = new Map<string, BoardConnection>()
+  private readonly liveClosers = new Set<() => Promise<void>>()
 
   constructor(private readonly options: PoolOptions) {}
 
@@ -4597,7 +4835,7 @@ export class BoardPool {
           if (result.ok) outcome.accepted.push(relay)
           else outcome.rejected.push({ relay, reason: result.message })
         } catch (err) {
-          outcome.rejected.push({ relay, reason: errorReason(err) })
+          outcome.rejected.push({ relay, reason: `error: ${messageOf(err)}` })
         }
       }),
     )
@@ -4609,7 +4847,7 @@ export class BoardPool {
     try {
       conn = await this.connection(relay)
     } catch (err) {
-      return { events: [], complete: false, closedReason: errorReason(err) }
+      return { events: [], complete: false, closedReason: `error: ${messageOf(err)}` }
     }
     const id = newSubscriptionId()
     const events: unknown[] = []
@@ -4624,7 +4862,9 @@ export class BoardPool {
       }
       const timer = setTimeout(() => finish({ events, complete: false, closedReason: 'error: timed out waiting for EOSE' }), timeoutMs)
       conn.subscribe(id, [filter], {
-        onEvent: (raw) => events.push(raw),
+        onEvent: (raw) => {
+          events.push(raw)
+        },
         onEose: () => finish({ events, complete: true, closedReason: null }),
         onClosed: (reason) => finish({ events, complete: false, closedReason: reason }),
       })
@@ -4634,7 +4874,6 @@ export class BoardPool {
   subscribeLive<T>(relays: readonly string[], handlers: LiveHandlers<T>): { close(): Promise<void> } {
     const delays = this.options.reconnectDelaysMs ?? DEFAULT_RECONNECT_DELAYS_MS
     const now = this.options.now ?? nowSeconds
-    const active = new Map<string, { conn: BoardConnection; id: string }>()
     const wakers = new Set<() => void>()
     let stopped = false
     let signalStop!: () => void
@@ -4643,13 +4882,8 @@ export class BoardPool {
     const queue = new ReceiveQueue<T>({
       max: NOSTR.receiveQueueMax,
       process: (item, relay) => handlers.process(item, relay),
-      onPressure: (relay, paused) => {
-        const entry = active.get(relay)
-        if (paused) entry?.conn.pause()
-        else entry?.conn.resume()
-        this.options.onPressure?.(relay, paused)
-      },
-      onError: (err, relay) => this.options.log?.(`${relay}: processing failed: ${err instanceof Error ? err.message : String(err)}`),
+      onPressure: (relay, waiting) => this.options.onPressure?.(relay, waiting),
+      onError: (err, relay) => this.options.log?.(`${relay}: processing failed: ${messageOf(err)}`),
     })
 
     const sleep = (ms: number) =>
@@ -4668,12 +4902,14 @@ export class BoardPool {
       while (!stopped) {
         try {
           const conn = await this.connection(relay)
+          if (stopped) break
           const id = newSubscriptionId()
           const closed = new Promise<string>((resolve) => {
             conn.subscribe(id, [{ kinds: [NOSTR.wrapKind], '#p': [this.options.identity.publicKey], since: now() - NOSTR.liveSinceSeconds }], {
-              onEvent: (raw) => {
+              onEvent: async (raw) => {
+                if (stopped) return
                 const item = handlers.precheck(raw, relay)
-                if (item !== null) queue.push(relay, item)
+                if (item !== null) await queue.push(relay, item)
               },
               onEose: () => {
                 attempt = 0
@@ -4681,14 +4917,13 @@ export class BoardPool {
               onClosed: (reason) => resolve(reason),
             })
           })
-          active.set(relay, { conn, id })
           const reason = await Promise.race([closed, stop.then(() => 'stopped')])
-          active.delete(relay)
+          conn.unsubscribe(id)
           if (stopped) break
           this.options.log?.(`${relay}: live subscription closed (${reason})`)
         } catch (err) {
           if (stopped) break
-          this.options.log?.(`${relay}: ${err instanceof Error ? err.message : String(err)}`)
+          this.options.log?.(`${relay}: ${messageOf(err)}`)
         }
         await sleep(delays[Math.min(attempt, delays.length - 1)]!)
         attempt++
@@ -4696,24 +4931,22 @@ export class BoardPool {
     }
 
     const loops = [...new Set(relays)].slice(0, NOSTR.maxRelaysPerContact).map((relay) => run(relay))
-
-    return {
-      close: async () => {
+    const close = async () => {
+      if (!stopped) {
         stopped = true
         signalStop()
-        for (const { conn, id } of active.values()) {
-          conn.resume()
-          conn.unsubscribe(id)
-        }
-        active.clear()
         for (const wake of [...wakers]) wake()
-        await Promise.all(loops)
-        await queue.idle()
-      },
+      }
+      await Promise.all(loops)
+      await queue.idle()
+      this.liveClosers.delete(close)
     }
+    this.liveClosers.add(close)
+    return { close }
   }
 
   async close(): Promise<void> {
+    await Promise.all([...this.liveClosers].map((close) => close()))
     for (const conn of this.connections.values()) conn.close()
     this.connections.clear()
   }
@@ -4736,7 +4969,7 @@ Expected: PASS.
 
 ```bash
 git add packages/core/src/boards/receive-queue.ts packages/core/src/boards/pool.ts packages/core/src/index.ts packages/core/test/boards-queue.test.ts packages/core/test/boards-pool.test.ts
-git commit -m "feat(core): board pool with parallel publishing, one-shot queries and a backpressured live subscription"
+git commit -m "feat(core): board pool with parallel publishing, one-shot queries and a bounded live subscription"
 ```
 
 ---
@@ -4752,8 +4985,12 @@ git commit -m "feat(core): board pool with parallel publishing, one-shot queries
 - Consumes: `Store`, `openStore` (Task 4); `historyWindows`, `markWindowComplete`, `DAY_SECONDS`, `CursorRole`, `HistoryWindow` (Task 7); `NOSTR` (Task 2); `BoardPool` (Task 14).
 - Produces:
   - `type HistoryResult = { windows: number; completed: number; pendingRecent: number; incomplete: number; events: number }` — `pendingRecent`: windows read to exhaustion that are still too recent to mark complete.
-  - `recoverHistory(input: { pool: BoardPool; store: Store; relay: string; role: CursorRole; recipientPubkey: string; now: number; handle(raw: unknown): Promise<void>; queryTimeoutMs?: number }): Promise<HistoryResult>` — reads each not-yet-complete window newest first; within a window, each raw event is handed to `handle` once and **awaited** before the window can count as read (the caller's `handle` runs the receive pipeline and persists). If `handle` throws, the error propagates and that window is never marked complete.
-  - Paging rule: request `{ kinds: [1059], '#p': [me], since, until, limit }`. An empty page ends the window. A full page moves `until` to its oldest `created_at` (inclusive; the overlap is de-duplicated); a full page that cannot move `until` escalates the limit 200 → 400 → 800, then marks the window incomplete. A short page is confirmed with one query strictly older than its oldest event, which also exposes relays that cap results below the requested limit.
+  - `recoverHistory(input: { pool: BoardPool; store: Store; relay: string; role: CursorRole; recipientPubkey: string; now: number; handle(raw: unknown): Promise<void>; queryTimeoutMs?: number }): Promise<HistoryResult>` — reads each not-yet-complete window newest first; each raw event is handed to `handle` once per window and **awaited** (the caller's `handle` runs the receive pipeline and persists). **Contract:** if `handle` fails after `precheckWrap` recorded the wrap id, it must call `seen.delete(wrapId)` before rethrowing; the error propagates and that window is never marked complete.
+  - Paging rule, per window, with `trusted = max(NOSTR.minTrustedRelayLimit, largest page this relay returned during this call)`:
+    1. Request `{ kinds: [1059], '#p': [me], since, until, limit }`. An incomplete query (no `EOSE`) makes the window incomplete. An empty page ends the window.
+    2. A page with at least `min(limit, trusted)` events may be truncated. If its oldest event is older than `until`, move `until` to that second (inclusive; the overlap is de-duplicated) and continue. If every event shares the `until` second, escalate the limit 200 → 400 → 800; past 800 the window is incomplete.
+    3. A shorter page is not truncated by the relay's limit. Confirm it with a query strictly older than its oldest event; that second look also walks relays that cap below `trusted` when timestamps differ.
+  - Accepted limitation (Global Constraints): a relay that caps filter limits below 100 can hide same-second ties.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -4765,7 +5002,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { NostrEvent } from 'nostr-tools/pure'
 import { afterEach, describe, expect, it } from 'vitest'
-import { BoardPool, DAY_SECONDS, historyWindows, openStore, recoverHistory, type Store } from '@agentbridge/core'
+import { BoardPool, DAY_SECONDS, historyWindows, openStore, recoverHistory } from '@agentbridge/core'
 import { plainSocketFactory, startFakeBoard, type FakeBoard, type FakeBoardOptions } from './support/fake-board'
 import { testIdentity } from './support/keys'
 
@@ -4797,7 +5034,8 @@ async function setup(options: FakeBoardOptions = {}) {
   const handled: string[] = []
   const recover = (handle = async (raw: unknown) => void handled.push((raw as NostrEvent).id)) =>
     recoverHistory({ pool, store, relay: board.url, role: 'responder', recipientPubkey: me.publicKey, now: NOW, handle })
-  return { board, store, handled, recover }
+  const remaining = () => historyWindows(store, { relay: board.url, role: 'responder', now: NOW }).map((w) => w.since)
+  return { board, handled, recover, remaining }
 }
 
 const reqCount = (board: FakeBoard) => board.frames.filter((f) => f[0] === 'REQ').length
@@ -4813,20 +5051,27 @@ describe('recoverHistory', () => {
     expect(result).toEqual({ windows: 10, completed: 7, pendingRecent: 3, incomplete: 0, events: 453 })
   })
 
-  it('escalates the page size when a full page shares one second, and gives up honestly past 800', async () => {
-    const { board, store, handled, recover } = await setup({ maxLimit: 1_000 })
+  it('escalates same-second pages, and only trusts a short page once the relay has served a bigger one', async () => {
+    const { board, handled, recover, remaining } = await setup({ maxLimit: 1_000 })
+    for (let i = 0; i < 450; i++) board.inject(event(dayStart(4) + 100))
     for (let i = 0; i < 300; i++) board.inject(event(dayStart(5) + 100))
-    for (let i = 0; i < 900; i++) board.inject(event(dayStart(6) + 100))
     const result = await recover()
-    expect(result.incomplete).toBe(1)
-    expect(result.completed).toBe(6)
-    expect(handled.length).toBe(300 + 800)
-    const remaining = historyWindows(store, { relay: board.url, role: 'responder', now: NOW }).map((w) => w.since)
-    expect(remaining).toContain(dayStart(6))
-    expect(remaining).not.toContain(dayStart(5))
+    expect(result).toMatchObject({ completed: 6, pendingRecent: 3, incomplete: 1 })
+    expect(handled).toHaveLength(750)
+    expect(remaining()).toContain(dayStart(4))
+    expect(remaining()).not.toContain(dayStart(5))
   })
 
-  it('does not mistake a relay that caps results below the page size for an exhausted window', async () => {
+  it('leaves an ambiguous same-second window incomplete instead of guessing', async () => {
+    const { board, handled, recover, remaining } = await setup({ maxLimit: 1_000 })
+    for (let i = 0; i < 150; i++) board.inject(event(dayStart(5) + 100))
+    const result = await recover()
+    expect(handled).toHaveLength(150)
+    expect(result.incomplete).toBe(1)
+    expect(remaining()).toContain(dayStart(5))
+  })
+
+  it('walks a relay that caps results below the page size when timestamps differ', async () => {
     const { board, handled, recover } = await setup({ maxLimit: 50 })
     for (let i = 0; i < 120; i++) board.inject(event(dayStart(5) + i * 10))
     const result = await recover()
@@ -4849,14 +5094,14 @@ describe('recoverHistory', () => {
   })
 
   it('never marks a window complete when handling an event fails', async () => {
-    const { board, store, recover } = await setup()
+    const { board, recover, remaining } = await setup()
     board.inject(event(dayStart(5) + 1))
     await expect(
       recover(async () => {
         throw new Error('disk full')
       }),
     ).rejects.toThrow('disk full')
-    expect(historyWindows(store, { relay: board.url, role: 'responder', now: NOW }).map((w) => w.since)).toContain(dayStart(5))
+    expect(remaining()).toContain(dayStart(5))
   })
 })
 ```
@@ -4896,9 +5141,10 @@ const isDated = (raw: unknown): raw is Dated =>
 export async function recoverHistory(input: RecoverHistoryInput): Promise<HistoryResult> {
   const windows = historyWindows(input.store, { relay: input.relay, role: input.role, now: input.now })
   const result: HistoryResult = { windows: windows.length, completed: 0, pendingRecent: 0, incomplete: 0, events: 0 }
+  const relayStats = { largestPage: 0 }
   for (const window of windows) {
     const readStartedAt = input.now
-    if (!(await readWindow(input, window, result))) {
+    if (!(await readWindow(input, window, result, relayStats))) {
       result.incomplete++
       continue
     }
@@ -4909,7 +5155,12 @@ export async function recoverHistory(input: RecoverHistoryInput): Promise<Histor
   return result
 }
 
-async function readWindow(input: RecoverHistoryInput, window: HistoryWindow, result: HistoryResult): Promise<boolean> {
+async function readWindow(
+  input: RecoverHistoryInput,
+  window: HistoryWindow,
+  result: HistoryResult,
+  relayStats: { largestPage: number },
+): Promise<boolean> {
   const limits = NOSTR.historyPageLimits
   const handled = new Set<string>()
   let until = window.until
@@ -4929,10 +5180,15 @@ async function readWindow(input: RecoverHistoryInput, window: HistoryWindow, res
       await input.handle(event)
       result.events++
     }
-    if (page.events.length === 0) return true
+    const count = page.events.length
+    if (count === 0) return true
     if (valid.length === 0) return false
     const oldest = Math.min(...valid.map((e) => e.created_at))
-    if (page.events.length >= limit) {
+    const trusted = Math.max(NOSTR.minTrustedRelayLimit, relayStats.largestPage)
+    const mayBeTruncated = count >= Math.min(limit, trusted)
+    relayStats.largestPage = Math.max(relayStats.largestPage, count)
+
+    if (mayBeTruncated) {
       if (oldest < until) {
         until = oldest
         level = 0
@@ -4944,8 +5200,8 @@ async function readWindow(input: RecoverHistoryInput, window: HistoryWindow, res
       }
       return false
     }
-    // A short page is confirmed with a strictly older query. That second look is what exposes
-    // relays that silently cap results below the limit we asked for.
+    // Not truncated by the relay's limit. Confirm with a strictly older query, which also walks
+    // relays that cap below the trusted limit when the timestamps differ.
     if (oldest - 1 < window.since) return true
     until = oldest - 1
     level = 0
@@ -5121,7 +5377,7 @@ git commit -m "test: opt-in live check of sealed delivery, retrieval and publish
 
 ## What plan 2 starts from
 
-- A `Store` with contacts, outbox and cursors, and `Store.tx` that joins outer transactions — so the responder's `revoke` can combine `revokeInbound`, `deleteUnclaimedFor` and the new inbox decisions in one transaction.
-- `precheckWrap` / `openWrap` producing authenticated `OpenedMessage`s, and `BoardPool.subscribeLive` + `recoverHistory` feeding them.
-- `createRumor` / `wrapRumor` plus `enqueue` / `claimDue` / `stillClaimed` / `markPublished` for everything the responder sends.
-- Still missing, by design: migrations v2 (inbox questions, attempts, channel lock) and the dispatcher (plan 2); asker questions, `AskerService`, CLI and MCP (plan 3); `setup`, `doctor`, packaging, docs, acceptance and deleting `RelayHttpClient` (plan 4).
+- A `Store` with contacts, request records, outbox and cursors, and `Store.tx` that joins outer transactions — so the responder's `revoke` can combine `revokeInbound`, `deleteUnclaimedFor` and the new inbox decisions in one transaction.
+- `precheckWrap` / `openWrap` producing authenticated `OpenedMessage`s, fed by `BoardPool.subscribeLive` and `recoverHistory`. Every `process` / `handle` implementation must call `seen.delete(wrapId)` when persistence fails.
+- `createRumor` / `wrapRumor` plus `enqueue` → `claimDue({ authorize })` → `reservePublish` → `BoardPool.publish` → `markPublished` / `markFailed` / `postpone` for everything a device sends. Plan 2's `authorize` checks that the recipient still holds the permission and generation the message was created for.
+- Still missing, by design: migrations v2 (inbox questions, attempts, channel lock) and the dispatcher (plan 2); asker questions, `AskerService`, CLI and MCP (plan 3); `setup`, `doctor`, packaging, docs, acceptance, restoring the deleted CLI test coverage and deleting `RelayHttpClient` (plan 4).
