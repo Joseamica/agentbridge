@@ -78,7 +78,7 @@ await cp(join(repoRoot, 'LICENSE'), join(outDir, 'LICENSE'))
 const pluginManifest = JSON.parse(await readFile(join(repoRoot, 'plugins/agentbridge/.claude-plugin/plugin.json'), 'utf8'))
 
 const pkg = {
-  name: 'agentbridge',
+  name: '@joseamica/agentbridge',
   version: pluginManifest.version,
   description:
     "Ask another person's coding agent a question, with their explicit revocable permission, from a single CLI or from inside your own Claude Code.",

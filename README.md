@@ -126,7 +126,7 @@ On each machine, run one command and answer its questions — in Spanish, like e
 human sees in this tool:
 
 ```bash
-npx -y agentbridge@latest setup
+npx -y @joseamica/agentbridge@latest setup
 ```
 
 It enrolls the device if it isn't already, asks whether you're going to answer questions, ask
@@ -158,7 +158,7 @@ Nothing to clone, build, or alias. Every command below runs through `npx`, which
 AgentBridge the first time it's used and reuses it after that:
 
 ```bash
-npx -y agentbridge@latest --help
+npx -y @joseamica/agentbridge@latest --help
 ```
 
 (Hacking on AgentBridge itself instead of installing it? See
@@ -177,8 +177,8 @@ it:
 read -rs AGENTBRIDGE_ADMIN_TOKEN && export AGENTBRIDGE_ADMIN_TOKEN
 export AGENTBRIDGE_RELAY_URL=https://your-relay.example.com
 
-npx -y agentbridge@latest admin enroll-link --handle dev --name "Dev"
-npx -y agentbridge@latest admin enroll-link --handle ana --name "Ana"
+npx -y @joseamica/agentbridge@latest admin enroll-link --handle dev --name "Dev"
+npx -y @joseamica/agentbridge@latest admin enroll-link --handle ana --name "Ana"
 ```
 
 Send each person their own link, over any channel you already use.
@@ -198,8 +198,8 @@ how to do any of it by hand if you'd rather skip it.
 **1. Redeem the link — into the responder's own home, not the default one.**
 
 ```bash
-AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y agentbridge@latest enroll "<Dev's link>"
-AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y agentbridge@latest whoami
+AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y @joseamica/agentbridge@latest enroll "<Dev's link>"
+AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y @joseamica/agentbridge@latest whoami
 ```
 
 The dedicated session `start.sh` launches later always runs with
@@ -219,7 +219,7 @@ mkdir -p ~/AgentBridge/shared
 **3. Set up the locked session.**
 
 ```bash
-npx -y agentbridge@latest setup-responder --share ~/AgentBridge/shared --home ~/.agentbridge-responder
+npx -y @joseamica/agentbridge@latest setup-responder --share ~/AgentBridge/shared --home ~/.agentbridge-responder
 ```
 
 This creates a dedicated Claude Code profile, writes the restricted permissions, generates a
@@ -237,7 +237,7 @@ keep it in its own terminal window, or under tmux.
 **5. Check it actually works.**
 
 ```bash
-npx -y agentbridge@latest doctor --home ~/.agentbridge-responder --share ~/AgentBridge/shared
+npx -y @joseamica/agentbridge@latest doctor --home ~/.agentbridge-responder --share ~/AgentBridge/shared
 ```
 
 Every line should read `[ok]`. This is the step that tells you the fence is real, the plugin is
@@ -246,11 +246,11 @@ installed, and nothing dangerous landed in the shared folder. Run it before you 
 **6. Let Ana in.**
 
 ```bash
-AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y agentbridge@latest invite
+AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y @joseamica/agentbridge@latest invite
 ```
 
 Send Ana the link it prints. That is what grants her permission to ask. Dev can undo it at any
-time with `AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y agentbridge@latest revoke ana`. Every
+time with `AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y @joseamica/agentbridge@latest revoke ana`. Every
 command Dev runs about this identity — `invite`, `revoke`, `contacts`, a later `whoami` — needs
 that same `AGENTBRIDGE_HOME`, since that is where step 1 put the credential; exporting it once for
 the whole terminal session avoids repeating it.
@@ -264,14 +264,14 @@ do any of it by hand.
 **1. Redeem her own link.**
 
 ```bash
-npx -y agentbridge@latest enroll "<Ana's link>"
+npx -y @joseamica/agentbridge@latest enroll "<Ana's link>"
 ```
 
 **2. Accept Dev's invite.**
 
 ```bash
-npx -y agentbridge@latest accept "<Dev's invite link>"
-npx -y agentbridge@latest contacts
+npx -y @joseamica/agentbridge@latest accept "<Dev's invite link>"
+npx -y @joseamica/agentbridge@latest contacts
 ```
 
 `contacts` should now list Dev under the people she can ask.
@@ -279,13 +279,13 @@ npx -y agentbridge@latest contacts
 **3. Ask.** From the terminal:
 
 ```bash
-npx -y agentbridge@latest ask dev "which timeout applies to card reads?" --wait 120
+npx -y @joseamica/agentbridge@latest ask dev "which timeout applies to card reads?" --wait 120
 ```
 
 Or — the actual point of this thing — from inside her own Claude Code:
 
 ```bash
-claude mcp add agentbridge --scope user -- npx -y agentbridge@latest mcp
+claude mcp add agentbridge --scope user -- npx -y @joseamica/agentbridge@latest mcp
 ```
 
 Restart any session that was already open, then just tell her agent to ask Dev. It gets

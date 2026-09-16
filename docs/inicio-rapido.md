@@ -44,7 +44,7 @@ En cada computadora, en vez de seguir la lista de pasos de más abajo, puedes co
 comando guiado, en español:
 
 ```bash
-npx -y agentbridge@latest setup
+npx -y @joseamica/agentbridge@latest setup
 ```
 
 Te pregunta lo necesario: si esta computadora ya está dada de alta (y si no, te pide el enlace),
@@ -76,7 +76,7 @@ En **las dos** computadoras: nada que clonar, compilar ni alias que definir. Cad
 guía corre con `npx`, que descarga AgentBridge la primera vez y lo reutiliza después:
 
 ```bash
-npx -y agentbridge@latest --help
+npx -y @joseamica/agentbridge@latest --help
 ```
 
 (¿Vas a modificar el código de AgentBridge en vez de solo usarlo? Mira
@@ -97,8 +97,8 @@ primera computadora que lo use:
 read -rs AGENTBRIDGE_ADMIN_TOKEN && export AGENTBRIDGE_ADMIN_TOKEN
 export AGENTBRIDGE_RELAY_URL=https://tu-relay.ejemplo.com
 
-npx -y agentbridge@latest admin enroll-link --handle dev --name "Dev"
-npx -y agentbridge@latest admin enroll-link --handle ana --name "Ana"
+npx -y @joseamica/agentbridge@latest admin enroll-link --handle dev --name "Dev"
+npx -y @joseamica/agentbridge@latest admin enroll-link --handle ana --name "Ana"
 ```
 
 Mándale a cada quien su enlace, por donde ya se escriban normalmente.
@@ -118,8 +118,8 @@ defecto primero, no en `~/.agentbridge-responder`. Elige un solo camino. Lo que 
 **1. Darse de alta — en la carpeta del respondedor, no en la de siempre.**
 
 ```bash
-AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y agentbridge@latest enroll "<el enlace de Dev>"
-AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y agentbridge@latest whoami
+AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y @joseamica/agentbridge@latest enroll "<el enlace de Dev>"
+AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y @joseamica/agentbridge@latest whoami
 ```
 
 La sesión dedicada que vas a arrancar con `start.sh` siempre corre con
@@ -140,7 +140,7 @@ mkdir -p ~/AgentBridge/compartido
 **3. Preparar la sesión cerrada.**
 
 ```bash
-npx -y agentbridge@latest setup-responder --share ~/AgentBridge/compartido --home ~/.agentbridge-responder
+npx -y @joseamica/agentbridge@latest setup-responder --share ~/AgentBridge/compartido --home ~/.agentbridge-responder
 ```
 
 Esto crea un perfil aparte de Claude Code, le escribe los permisos restringidos, genera un
@@ -158,7 +158,7 @@ para poder contestar: déjala en su propia ventana de terminal, o dentro de tmux
 **5. Comprobar que de verdad quedó bien.**
 
 ```bash
-npx -y agentbridge@latest doctor --home ~/.agentbridge-responder --share ~/AgentBridge/compartido
+npx -y @joseamica/agentbridge@latest doctor --home ~/.agentbridge-responder --share ~/AgentBridge/compartido
 ```
 
 Todas las líneas deben decir `[ok]`. Este es el paso que te confirma que el candado existe, que el
@@ -168,11 +168,11 @@ de confiar en la instalación**, y vuelve a correrlo si algo se siente raro.
 **6. Darle permiso a Ana.**
 
 ```bash
-AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y agentbridge@latest invite
+AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y @joseamica/agentbridge@latest invite
 ```
 
 Mándale a Ana el enlace que imprime. Eso es lo que le da permiso de preguntarte. Se lo puedes
-quitar cuando quieras con `AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y agentbridge@latest
+quitar cuando quieras con `AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y @joseamica/agentbridge@latest
 revoke ana`. Cualquier comando que corras después sobre esta identidad —`invite`, `revoke`,
 `contacts`, un `whoami` más adelante— necesita ese mismo `AGENTBRIDGE_HOME`, porque ahí es donde
 quedó la credencial desde el paso 1; expórtalo una vez para toda la terminal y te ahorras
@@ -187,14 +187,14 @@ paso, y cómo hacer cualquiera de ellos a mano.
 **1. Darse de alta con su propio enlace.**
 
 ```bash
-npx -y agentbridge@latest enroll "<el enlace de Ana>"
+npx -y @joseamica/agentbridge@latest enroll "<el enlace de Ana>"
 ```
 
 **2. Aceptar la invitación de Dev.**
 
 ```bash
-npx -y agentbridge@latest accept "<el enlace de invitación de Dev>"
-npx -y agentbridge@latest contacts
+npx -y @joseamica/agentbridge@latest accept "<el enlace de invitación de Dev>"
+npx -y @joseamica/agentbridge@latest contacts
 ```
 
 En `contacts` ya debe aparecer Dev en la lista de a quién puede preguntarle.
@@ -202,13 +202,13 @@ En `contacts` ya debe aparecer Dev en la lista de a quién puede preguntarle.
 **3. Preguntar.** Desde la terminal:
 
 ```bash
-npx -y agentbridge@latest ask dev "¿qué timeout aplica para la lectura de tarjeta?" --wait 120
+npx -y @joseamica/agentbridge@latest ask dev "¿qué timeout aplica para la lectura de tarjeta?" --wait 120
 ```
 
 O, que es el chiste de todo esto, desde su propio Claude Code:
 
 ```bash
-claude mcp add agentbridge --scope user -- npx -y agentbridge@latest mcp
+claude mcp add agentbridge --scope user -- npx -y @joseamica/agentbridge@latest mcp
 ```
 
 Después de eso hay que **abrir Claude Code**, o reiniciar la sesión que ya estuviera abierta, para
@@ -221,7 +221,7 @@ interrumpe al otro. Si la sesión de Dev está apagada, la pregunta se queda esp
 
 ## Si algo no jala
 
-Lo primero, siempre: `npx -y agentbridge@latest doctor` con las mismas rutas del paso 5. Está
+Lo primero, siempre: `npx -y @joseamica/agentbridge@latest doctor` con las mismas rutas del paso 5. Está
 hecho para explicarte qué falta, y es seguro compartir su salida porque no imprime credenciales.
 
 Algo que confunde la primera vez:
