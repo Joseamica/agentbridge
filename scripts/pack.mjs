@@ -89,7 +89,7 @@ const pkg = {
   keywords: ['agentbridge', 'claude-code', 'cli', 'mcp', 'agent', 'relay'],
   engines: { node: '>=22.4' },
   type: 'module',
-  bin: { agentbridge: './bin/agentbridge.js' },
+  bin: { agentbridge: 'bin/agentbridge.js' },
   files: ['bin', 'plugins', '.claude-plugin', 'README.md', 'LICENSE'],
 }
 await writeFile(join(outDir, 'package.json'), `${JSON.stringify(pkg, null, 2)}\n`)
