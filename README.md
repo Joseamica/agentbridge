@@ -166,9 +166,27 @@ npx -y @joseamica/agentbridge@latest --help
 
 ### Once, on the relay operator's machine
 
-Deploy the relay with the included `render.yaml`, or anywhere that gives you Postgres and a public
-URL. Set `ADMIN_TOKEN` to a long random string and keep it in a password manager: it mints
-enrollment links, so it is the master credential. Never paste it into a chat.
+The relay is the only piece that has to be reachable from the internet. Neither person's machine
+does — both call out to it.
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Joseamica/agentbridge)
+
+That button reads the `render.yaml` in this repo and creates two things: the relay itself and a
+Postgres 16 database, pinned to one instance and closed to the outside world. Four steps:
+
+1. Click it, connect your GitHub account, and approve the blueprint.
+2. Wait for the first deploy. The health check is `/health`.
+3. Copy the service URL — that is your `AGENTBRIDGE_RELAY_URL`.
+4. Open the relay service → **Environment** → copy the generated `ADMIN_TOKEN` into a password
+   manager. Render generates it for you, so you never type it. It mints enrollment links, which
+   makes it the master credential: never paste it into a chat and never give it to an agent.
+
+Prefer to host it elsewhere? Anything with Node 22.4+, Postgres and a public URL works. Set
+`DATABASE_URL`, `ADMIN_TOKEN` (32+ characters) and `PUBLIC_URL`, then `npm run start -w
+@agentbridge/relay`.
+
+One thing to say out loud to whoever you invite: **whoever runs the relay can read every question
+and answer** for the 7 days they are retained. That is why you host your own.
 
 Then issue one link per person — single use, expiring, and bound to the first device that redeems
 it:

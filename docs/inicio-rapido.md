@@ -85,10 +85,28 @@ guía.)
 
 ## Una sola vez: el relay
 
-Despliega el relay con el `render.yaml` que viene incluido, o donde quieras que te dé Postgres y
-una URL pública. Ponle a `ADMIN_TOKEN` una cadena larga y aleatoria, y **guárdala en tu gestor de
-contraseñas**. Con eso se generan las altas, así que es la credencial maestra. Nunca la pegues en
-un chat ni se la des a un agente.
+El relay es lo único que tiene que estar accesible desde internet. Las computadoras de ustedes dos
+no: las dos le hablan a él.
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Joseamica/agentbridge)
+
+Ese botón lee el `render.yaml` del repositorio y crea dos cosas: el relay y una base de datos
+Postgres 16, fijada a una sola instancia y cerrada al exterior. Son cuatro pasos:
+
+1. Púlsalo, conecta tu cuenta de GitHub y aprueba el blueprint.
+2. Espera el primer despliegue. La comprobación de salud es `/health`.
+3. Copia la URL del servicio: esa es tu `AGENTBRIDGE_RELAY_URL`.
+4. Entra al servicio del relay → **Environment** → copia el `ADMIN_TOKEN` que Render generó y
+   guárdalo en tu gestor de contraseñas. Lo genera él, así que nunca lo tecleas. Con él se emiten
+   las altas, o sea que es la credencial maestra: **nunca la pegues en un chat ni se la des a un
+   agente.**
+
+¿Prefieres alojarlo en otro lado? Sirve cualquier sitio con Node 22.4 o más, Postgres y una URL
+pública. Define `DATABASE_URL`, `ADMIN_TOKEN` (32 caracteres o más) y `PUBLIC_URL`, y arranca con
+`npm run start -w @agentbridge/relay`.
+
+Una cosa que hay que decirle en voz alta a quien invites: **quien opera el relay puede leer todas
+las preguntas y respuestas** durante los 7 días que se guardan. Por eso lo alojas tú.
 
 Luego generas un enlace por persona. Cada enlace sirve una sola vez, caduca, y se amarra a la
 primera computadora que lo use:

@@ -16,7 +16,7 @@ if (adminToken.length < 32) {
   console.error('[relay] ADMIN_TOKEN must be at least 32 characters')
   process.exit(1)
 }
-const publicUrl = required('PUBLIC_URL', process.env.PUBLIC_URL ?? process.env.RENDER_EXTERNAL_URL)
+const publicUrl = required('PUBLIC_URL (or RENDER_EXTERNAL_URL)', process.env.PUBLIC_URL ?? process.env.RENDER_EXTERNAL_URL)
 
 const pool = createPool(databaseUrl)
 const applied = await migrate(pool)
