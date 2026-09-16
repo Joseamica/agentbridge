@@ -23,7 +23,7 @@
 - Relay URLs are hostile input: `wss://` only, no credentials, query or fragment, ≤ 200 characters, host must be a domain name (not an IP literal), DNS answers validated inside the socket's own `lookup` (no loopback, private, link-local, CGNAT, ULA, multicast, documentation, benchmarking or reserved ranges, no IPv4-mapped or NAT64 IPv6), no redirects, TLS verified against the host name. The production socket factory re-validates every URL with `checkRelayUrl`, so no caller can bypass the rules with an IP literal.
 - Receiving: frames are read from each socket sequentially and every handler is awaited, so `ws`'s own flow control stops reading when AgentBridge falls behind; the receive queue holds at most 200 items (a push waits for room), with one decryption at a time and nothing dropped. Live subscription `since = now − 2 days − 10 min`. If processing fails after `precheckWrap`, the caller deletes the wrap id from `SeenIds`.
 - History recovery covers 9 days in 1-day windows, pages with `limit` 200 and escalates to 400 then 800 when a page that may be truncated shares one second; otherwise the window is incomplete. A page counts as possibly truncated when it holds at least `min(limit, trusted)` events, where `trusted = max(100, largest page this relay has returned)`. Short pages are confirmed with a strictly older query. Accepted limitation: a relay that caps filter limits below 100 can hide same-second ties from history recovery; NIP-59 randomizes seconds over two days, every message goes to up to 5 relays, and senders retry with fresh wraps for 7 days. A window is marked complete only after everything received in it is persisted **and** its end is older than `read time − 2 days − 10 min`.
-- Outbox: one row per logical message (`recipient` + `rumor_id`); `claimDue` abandons expired rows first and asks an `authorize` callback inside its transaction before claiming each row (unauthorized rows are abandoned); claims last 2 minutes; regeneration at most once every 10 minutes per logical message; pending bytes ≤ 1 MB per recipient and ≤ 20 MB per identity (over the cap the row is stored but postponed 10 minutes); at most 60 publishes per minute per identity, reserved with `reservePublish` immediately before publishing (one publish = one logical message sent to up to 5 relays); asker retry schedule every 5 min during the first hour, then every 30 min, until 7 days after first enqueue; content is purged 7 days after the rumor's creation, whatever the row's state.
+- Outbox: one row per logical message (`recipient` + `rumor_id`); `claimDue` abandons expired rows first and asks an `authorize` callback inside its transaction before claiming each row (unauthorized rows are abandoned); claims last 2 minutes; regeneration at most once every 10 minutes per logical message; pending bytes ≤ 1 MB per recipient and ≤ 20 MB per identity (over the cap the row is stored but postponed 10 minutes); at most 60 publishes per minute per identity, reserved with `reservePublish` inside the `beforeSend` guard that runs immediately before each `EVENT` write, which also re-checks the claim (one publish = one logical message sent to up to 5 relays); asker retry schedule every 5 min during the first hour, then every 30 min, until 7 days after first enqueue; content is purged 7 days after the rumor's creation, whatever the row's state.
 - Local files: identity and state live in `AGENTBRIDGE_HOME` (default `~/.agentbridge`), directory `0700`; `identity.json` `0600`, written to a temporary file and linked into place with `link()` so two concurrent creators never produce two identities or a half-written file; `agentbridge.db` pre-created `0600` so SQLite's WAL and SHM files inherit `0600`.
 - SQLite: WAL, `busy_timeout` 5000 ms, foreign keys on, every read-modify-write inside `BEGIN IMMEDIATE`; `node:sqlite` is imported dynamically **after** installing a filter that suppresses only SQLite's `ExperimentalWarning`.
 - `verifyEvent` from `nostr-tools` trusts an internal marker copied by object spread. Only verify objects freshly produced by `JSON.parse`, and build tamper tests with `JSON.parse(JSON.stringify(event))`.
@@ -1963,7 +1963,7 @@ git commit -m "feat(core): contacts with request records, bounded requests, stri
   - `enqueue(store, input): EnqueueOutcome`
   - `claimDue(store, { owner, now, limit, authorize }): OutboxItem[]` — in one transaction: abandons pending rows past their window (`retry_until_resolved` 7 days, `once` 9 days after first enqueue), then for each due, unclaimed row calls `authorize(item)`; refused rows are abandoned, accepted rows are claimed for 2 minutes. Plans 2 and 3 pass the permission and generation check as `authorize`.
   - `stillClaimed(store, { recipient, rumorId, owner, now }): boolean`
-  - `reservePublish(store, { recipient, rumorId, owner, now }): 'reserved' | 'claim_lost' | 'over_budget'` — call immediately before `BoardPool.publish`; it re-checks the claim and takes one of the 60 publishes allowed per minute (one publish = one logical message to up to 5 relays).
+  - `reservePublish(store, { recipient, rumorId, owner, now }): 'reserved' | 'claim_lost' | 'over_budget'` — called from the `beforeSend` guard of `BoardPool.publish` (Task 14), so it runs at the moment of the write; it re-checks the claim and takes one of the 60 publishes allowed per minute (one publish = one logical message to up to 5 relays: the guard reserves on the first write and only re-checks `stillClaimed` on the others).
   - `postpone(store, { recipient, rumorId, owner, retryAt }): 'ok' | 'claim_lost'` — releases a claim without counting an attempt (use after `over_budget`).
   - `markPublished(store, { recipient, rumorId, owner, now }): 'ok' | 'claim_lost'`
   - `markFailed(store, { recipient, rumorId, owner, now }): 'ok' | 'claim_lost'`
@@ -3968,7 +3968,8 @@ git commit -m "test(core): in-memory NIP-01 relay with auth, caps, rejection and
   - `type Filter = { kinds?: number[]; '#p'?: string[]; since?: number; until?: number; limit?: number }`
   - `type SubscriptionHandlers = { onEvent(raw: unknown): void | Promise<void>; onEose(): void; onClosed(reason: string): void }`
   - `type PublishResult = { ok: boolean; message: string }`
-  - `class BoardConnection extends EventEmitter` with `constructor({ url, identity, createSocket?, timeoutMs?, log? })`, `readonly url`, `get isOpen(): boolean`, `connect(): Promise<void>`, `publish(event: NostrEvent): Promise<PublishResult>`, `subscribe(id: string, filters: Filter[], handlers: SubscriptionHandlers): void`, `unsubscribe(id: string): void`, `close(): void`; emits `'close'`.
+  - `class BoardConnection extends EventEmitter` with `constructor({ url, identity, createSocket?, timeoutMs?, log? })`, `readonly url`, `get isOpen(): boolean`, `connect(): Promise<void>`, `publish(event: NostrEvent, beforeSend?: () => boolean): Promise<PublishResult>`, `subscribe(id: string, filters: Filter[], handlers: SubscriptionHandlers): void`, `unsubscribe(id: string): void`, `close(): void`; emits `'close'`.
+  - `beforeSend` runs synchronously immediately before **each** `EVENT` write — after the connection is open and again after a NIP-42 retry. If it returns `false`, nothing is written and the result is `{ ok: false, message: 'error: publish guard refused' }`. Plans 2 and 3 use it to re-check the outbox claim and take the publish reservation at the moment of sending.
   - Behavior: frames are read through `createWebSocketStream(socket, { readableObjectMode: true })` one at a time, and `onEvent` is **awaited** before the next frame is read — so a slow consumer makes `ws` stop reading from the network instead of piling frames up in memory (while an `onEvent` is pending, `OK` frames for publishes on the same connection also wait). `OK false` or `CLOSED` whose reason starts with `auth-required:` triggers **one** NIP-42 authentication (using the last `AUTH` challenge) and one retry; without a challenge, or if auth fails, the original result is returned. A closed socket resolves every pending publish with `{ ok: false, message: 'error: connection closed' }` and closes every subscription with that reason. Frames that are not JSON arrays are ignored; an exception thrown by a handler is logged and does not stop the reader.
 
 - [ ] **Step 1: Write the failing tests**
@@ -4043,6 +4044,22 @@ describe('BoardConnection', () => {
   it('returns the auth-required verdict when the relay never sent a challenge', async () => {
     const { conn } = await setup({ requireAuthToWrite: true, sendAuthChallenge: false })
     expect(await conn.publish(wrapFor('sin reto'))).toMatchObject({ ok: false, message: expect.stringMatching(/^auth-required:/) })
+  })
+
+  it('never writes the event when the guard refuses right before sending', async () => {
+    const { board, conn } = await setup()
+    expect(await conn.publish(wrapFor('vetado'), () => false)).toEqual({ ok: false, message: 'error: publish guard refused' })
+    expect(board.frames.filter((f) => f[0] === 'EVENT')).toHaveLength(0)
+  })
+
+  it('runs the guard again before the write that follows authentication', async () => {
+    const { conn } = await setup({ requireAuthToWrite: true })
+    let calls = 0
+    expect(await conn.publish(wrapFor('dos veces'), () => ++calls <= 2)).toEqual({ ok: true, message: '' })
+    expect(calls).toBe(2)
+    let refused = 0
+    const { conn: second } = await setup({ requireAuthToWrite: true })
+    expect(await second.publish(wrapFor('segunda vez no'), () => ++refused === 1)).toEqual({ ok: false, message: 'error: publish guard refused' })
   })
 
   it('serves stored events, then EOSE, then live events', async () => {
@@ -4253,11 +4270,11 @@ export class BoardConnection extends EventEmitter {
     return this.opening
   }
 
-  async publish(event: NostrEvent): Promise<PublishResult> {
-    const first = await this.sendEvent(event)
+  async publish(event: NostrEvent, beforeSend: () => boolean = () => true): Promise<PublishResult> {
+    const first = await this.sendEvent(event, beforeSend)
     if (first.ok || !first.message.startsWith('auth-required:')) return first
     if (!(await this.authenticate())) return first
-    return this.sendEvent(event)
+    return this.sendEvent(event, beforeSend)
   }
 
   subscribe(id: string, filters: Filter[], handlers: SubscriptionHandlers): void {
@@ -4290,10 +4307,16 @@ export class BoardConnection extends EventEmitter {
     return true
   }
 
-  private sendEvent(event: NostrEvent): Promise<PublishResult> {
+  private sendEvent(event: NostrEvent, beforeSend: () => boolean): Promise<PublishResult> {
     return new Promise((resolve) => {
       if (!this.isOpen) {
         resolve({ ok: false, message: CLOSED_REASON })
+        return
+      }
+      // Checked at the last synchronous moment before the write, so a claim that expired while we
+      // were connecting or authenticating can never be published.
+      if (!beforeSend()) {
+        resolve({ ok: false, message: 'error: publish guard refused' })
         return
       }
       const timer = setTimeout(() => {
@@ -4446,7 +4469,7 @@ git commit -m "feat(core): sequential NIP-01 board connection over a validated, 
   - `type PublishOutcome = { accepted: string[]; rejected: Array<{ relay: string; reason: string }> }`
   - `type QueryResult = { events: unknown[]; complete: boolean; closedReason: string | null }` — `complete` means `EOSE` arrived.
   - `type LiveHandlers<T> = { precheck(raw: unknown, relay: string): T | null; process(item: T, relay: string): Promise<void> }` — **contract:** if `process` fails after `precheckWrap` recorded the wrap id, `process` must call `seen.delete(wrapId)` before rethrowing (Task 11).
-  - `class BoardPool` with `publish(relays, event): Promise<PublishOutcome>` (at most 5 distinct relays, in parallel, never throws; callers reserve with `reservePublish` first), `query(relay, filter, timeoutMs?): Promise<QueryResult>` (never throws), `subscribeLive<T>(relays, handlers): { close(): Promise<void> }` (filter `{ kinds: [1059], '#p': [me], since: now() − NOSTR.liveSinceSeconds }`; each frame's `precheck` runs on arrival and the connection waits for `queue.push`, so a full queue stops reading from that relay; reconnects with `reconnectDelaysMs` — default `[1000, 2000, 5000, 10000, 30000, 60000]` — resetting the delay after each `EOSE`), and `close(): Promise<void>` (first closes every live subscription created by this pool, then the connections).
+  - `class BoardPool` with `publish(relays, event, beforeSend?): Promise<PublishOutcome>` (at most 5 distinct relays, in parallel, never throws; `beforeSend` is handed to every `BoardConnection.publish`, so plans 2 and 3 re-check the claim and take the `reservePublish` reservation at the moment of each write), `query(relay, filter, timeoutMs?): Promise<QueryResult>` (never throws), `subscribeLive<T>(relays, handlers): { close(): Promise<void> }` (filter `{ kinds: [1059], '#p': [me], since: now() − NOSTR.liveSinceSeconds }`; each frame's `precheck` runs on arrival and the connection waits for `queue.push`, so a full queue stops reading from that relay; reconnects with `reconnectDelaysMs` — default `[1000, 2000, 5000, 10000, 30000, 60000]` — resetting the delay after each `EOSE`), and `close(): Promise<void>` (first closes every live subscription created by this pool, then the connections).
 
 - [ ] **Step 1: Write the failing queue tests**
 
@@ -4585,6 +4608,21 @@ describe('BoardPool.publish', () => {
         { relay: 'ws://127.0.0.1:1', reason: expect.stringMatching(/^error: /) },
       ]),
     )
+  })
+
+  it('asks the guard before writing to each relay and sends nothing it refuses', async () => {
+    const first = await board()
+    const second = await board()
+    let asked = 0
+    const outcome = await pool().publish([first.url, second.url], signed('vetado'), () => {
+      asked++
+      return false
+    })
+    expect(asked).toBe(2)
+    expect(outcome.accepted).toEqual([])
+    expect(outcome.rejected.map((r) => r.reason)).toEqual(['error: publish guard refused', 'error: publish guard refused'])
+    expect(first.events).toHaveLength(0)
+    expect(second.events).toHaveLength(0)
   })
 
   it('publishes to at most five distinct relays', async () => {
@@ -4825,13 +4863,13 @@ export class BoardPool {
     return conn
   }
 
-  async publish(relays: readonly string[], event: NostrEvent): Promise<PublishOutcome> {
+  async publish(relays: readonly string[], event: NostrEvent, beforeSend: () => boolean = () => true): Promise<PublishOutcome> {
     const outcome: PublishOutcome = { accepted: [], rejected: [] }
     const targets = [...new Set(relays)].slice(0, NOSTR.maxRelaysPerContact)
     await Promise.all(
       targets.map(async (relay) => {
         try {
-          const result = await (await this.connection(relay)).publish(event)
+          const result = await (await this.connection(relay)).publish(event, beforeSend)
           if (result.ok) outcome.accepted.push(relay)
           else outcome.rejected.push({ relay, reason: result.message })
         } catch (err) {
@@ -5379,5 +5417,5 @@ git commit -m "test: opt-in live check of sealed delivery, retrieval and publish
 
 - A `Store` with contacts, request records, outbox and cursors, and `Store.tx` that joins outer transactions — so the responder's `revoke` can combine `revokeInbound`, `deleteUnclaimedFor` and the new inbox decisions in one transaction.
 - `precheckWrap` / `openWrap` producing authenticated `OpenedMessage`s, fed by `BoardPool.subscribeLive` and `recoverHistory`. Every `process` / `handle` implementation must call `seen.delete(wrapId)` when persistence fails.
-- `createRumor` / `wrapRumor` plus `enqueue` → `claimDue({ authorize })` → `reservePublish` → `BoardPool.publish` → `markPublished` / `markFailed` / `postpone` for everything a device sends. Plan 2's `authorize` checks that the recipient still holds the permission and generation the message was created for.
+- `createRumor` / `wrapRumor` plus `enqueue` → `claimDue({ authorize })` → `BoardPool.publish(relays, wrap, beforeSend)` whose guard runs `stillClaimed` on every write and `reservePublish` on the first → `markPublished` / `markFailed` / `postpone` for everything a device sends. Plan 2's `authorize` checks that the recipient still holds the permission and generation the message was created for.
 - Still missing, by design: migrations v2 (inbox questions, attempts, channel lock) and the dispatcher (plan 2); asker questions, `AskerService`, CLI and MCP (plan 3); `setup`, `doctor`, packaging, docs, acceptance, restoring the deleted CLI test coverage and deleting `RelayHttpClient` (plan 4).
