@@ -1,6 +1,6 @@
 # AgentBridge 0.2 — sin servidor propio, sobre tableros públicos (Nostr)
 
-Fecha: 2026-09-16 · Estado: revisión 3, tras dos auditorías de Codex. Pendiente de revisión escrita.
+Fecha: 2026-09-16 · Estado: revisión 4, tras tres auditorías de Codex. Pendiente de revisión escrita.
 
 ## Objetivo
 
@@ -210,10 +210,13 @@ Todo mensaje es el contenido JSON de un **rumor** (kind interno propio, fijo) de
 - Una pregunta vence en `rumor.created_at` + 24 h. El remitente no puede elegir otra fecha: el campo
   no existe. Como `rumor.created_at` no puede estar en el futuro y los reintentos reusan el rumor, los
   reintentos no renuevan el plazo.
-- Las decisiones (claves de entidad, `generation` máxima observada, decisión final de cada pregunta)
-  se conservan **9 días** (7 de retención más 2 de fechas aleatorias de NIP-59). El contenido de
+- Una `connect_request` se acepta solo si su `rumor.created_at` tiene como máximo 7 días.
+- Las **decisiones de mensajes** (claves de entidad y decisión final de cada pregunta y solicitud) se
+  conservan **9 días** (7 de retención más 2 de fechas aleatorias de NIP-59). El contenido de
   preguntas y respuestas se borra a los 7 días. Un reintento que llegue después de 9 días cae fuera
   del plazo por su propia fecha.
+- El **estado del contacto** (contador de `generation`, estado del permiso, máxima generación
+  observada y tableros) **nunca caduca**: se conserva mientras exista la identidad.
 
 ### Tubería de recepción, en este orden
 
@@ -298,8 +301,14 @@ por un mensaje autenticado del contacto cuya `generation` sea ≥ la máxima obs
 Quien contesta lleva un contador `generation` por contacto que **solo crece**: cada `approve` y cada
 `revoke` lo incrementa, así que cada generación corresponde a exactamente un estado. Ambos lados
 guardan la **máxima generación observada** para cada contacto, en cualquier estado, incluido
-`pending`, e ignoran todo mensaje con `generation` menor o igual a esa marca. Un `connect_revoked(2)`
-retrasado que llega después de `connect_approved(3)` se ignora.
+`pending`. Hay dos reglas distintas:
+
+- **Cambios de permiso** (`connect_approved`, `connect_revoked`): se aplican solo si su `generation`
+  es **mayor** que la máxima observada. Un `connect_revoked(2)` retrasado que llega después de
+  `connect_approved(3)` se ignora.
+- **Preguntas:** quien pregunta pone en cada `question` la `generation` de su última aprobación.
+  Quien contesta la admite solo si es **igual** a la generación con la que el contacto está
+  `approved` en ese momento.
 
 ### Revocación
 
@@ -317,11 +326,15 @@ El contrato exacto:
 - **Respuesta:** la transacción de `reply` es el punto de autorización final para crear una
   respuesta. Si el permiso no sigue vigente, no se guarda ni se encola nada.
 - **Publicación:** el publicador **reclama** cada salida en una transacción que verifica permiso y
-  `generation`. La única ventana admitida: una salida ya reclamada antes de que `revoke` confirme
-  puede terminar de escribirse en el socket (milisegundos). No hay otra.
-- Las respuestas guardadas no se regeneran para un contacto revocado.
-- Volver a aprobar crea una `generation` nueva: las preguntas anteriores no resucitan y sus
-  reintentos reciben `rejected` / `stale_generation`.
+  `generation`, y justo antes de escribir en el socket vuelve a comprobar que su reclamo no venció.
+  **Única excepción al contrato:** una salida autorizada (reclamada) antes de que `revoke` confirme
+  puede publicarse después de la revocación, por ejemplo si el proceso se suspende entre la
+  comprobación y la escritura. No se promete una duración para esa ventana.
+- **Resultados ya decididos:** una pregunta que ya tiene `answer` conserva ese resultado; sus
+  reintentos de un contacto revocado, o de una generación anterior, se descartan en silencio y la
+  respuesta no se regenera. Una pregunta sin contestar al momento de revocar recibe la decisión final
+  `rejected` / `stale_generation`, que sí se regenera ante un reintento.
+- Volver a aprobar crea una `generation` nueva: las preguntas anteriores no resucitan.
 - Revocar **no** retira sobres ya publicados ni respuestas que la otra persona ya recibió.
 
 ## Entrega de preguntas y respuestas
@@ -332,15 +345,17 @@ Una transacción, al recibir un `question` válido de un contacto:
 
 1. Si la entidad `(senderPubkey, questionId)` existe con el mismo `rumor.id`: regenerar exactamente lo
    ya decidido (el mismo rumor de `receipt`, y el de `answer` o `rejected` si existe), sujeto al
-   límite de regeneración, y terminar. Para un contacto revocado solo se regenera un `rejected`, nunca
-   `receipt` ni `answer`. Si existe con otro `rumor.id`: descartar y registrar.
-2. Si el contacto no está `approved` con esa `generation`: decisión `rejected` / `stale_generation`
-   si hubo relación; descartar en silencio si nunca la hubo.
+   límite de regeneración, y terminar. Si el contacto ya no está `approved` con la `generation` de esa
+   pregunta, solo se regenera un `rejected`; si la pregunta tenía `answer`, el reintento se descarta
+   en silencio (ver "Revocación"). Si existe con otro `rumor.id`: descartar y registrar.
+2. Si es nueva y el contacto no está `approved` con esa `generation`: decisión `rejected` /
+   `stale_generation` si hubo relación; descartar en silencio si nunca la hubo.
 3. Si venció: decisión `rejected` / `expired`.
 4. Si excede 5 abiertas o 20 por día para ese contacto: decisión `rejected` / `limit`.
 5. Si no: persistir la pregunta como `queued` con decisión `receipt`.
 
-Toda decisión se **guarda antes de encolarse** y es final: un reintento posterior la repite, aunque
+Toda decisión se **guarda antes de encolarse** y es final: un reintento posterior la repite (salvo la
+excepción de "Revocación" para preguntas ya contestadas), aunque
 las condiciones hayan cambiado (por ejemplo, ya no se excede el límite).
 
 ### Despacho
