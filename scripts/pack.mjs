@@ -87,7 +87,7 @@ const pkg = {
   homepage: 'https://github.com/Joseamica/agentbridge#readme',
   bugs: { url: 'https://github.com/Joseamica/agentbridge/issues' },
   keywords: ['agentbridge', 'claude-code', 'cli', 'mcp', 'agent', 'relay'],
-  engines: { node: '>=22.4' },
+  engines: { node: '>=22.13' },
   type: 'module',
   bin: { agentbridge: 'bin/agentbridge.js' },
   files: ['bin', 'plugins', '.claude-plugin', 'README.md', 'LICENSE'],

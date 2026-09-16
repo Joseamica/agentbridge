@@ -24,4 +24,19 @@ describe('published package name', () => {
     const readme = await readFile(join(repoRoot, 'README.md'), 'utf8')
     expect(readme).toContain(`${CLI_COMMAND} setup`)
   })
+
+  it('requires the Node version that ships node:sqlite without a flag, in both manifests', async () => {
+    const root = JSON.parse(await readFile(join(repoRoot, 'package.json'), 'utf8'))
+    expect(root.engines.node).toBe('>=22.13')
+    const pack = await readFile(join(repoRoot, 'scripts/pack.mjs'), 'utf8')
+    expect(pack).toContain("engines: { node: '>=22.13' }")
+  })
+
+  it('no longer ships the self-hosted relay or its database scripts', async () => {
+    const root = JSON.parse(await readFile(join(repoRoot, 'package.json'), 'utf8'))
+    expect(root.workspaces).toEqual(['packages/core', 'packages/channel', 'packages/cli'])
+    expect(root.scripts['db:up']).toBeUndefined()
+    expect(root.scripts['db:down']).toBeUndefined()
+    await expect(readFile(join(repoRoot, 'render.yaml'), 'utf8')).rejects.toThrow()
+  })
 })

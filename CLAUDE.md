@@ -4,8 +4,8 @@ Relay + Claude Code channel plugin + CLI that lets one person ask another person
 
 - Runbook (Spanish, step by step): docs/runbooks/m1-acceptance.md
 - Known gaps and deliberate deferrals: docs/known-gaps.md
-- Tests need Docker Postgres: `npm run db:up`, then `npm test`. They only ever talk to the
-  container on port 55432 — never point TEST_DATABASE_URL or DATABASE_URL anywhere else.
+- `npm test` needs neither Docker nor internet. `npm run test:live` is the only suite that talks to
+  public Nostr relays; run it on purpose, never in a loop.
 - User-facing text is Spanish; identifiers, logs and model instructions are English.
 - The Spanish error translator lives in `packages/cli/src/spanish-errors.ts`. Use it rather than
   hand-rolling another one — the same English leak appeared three times before it was consolidated.

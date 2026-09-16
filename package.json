@@ -2,19 +2,17 @@
   "name": "agentbridge",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.4" },
-  "workspaces": ["packages/core", "packages/channel", "packages/cli", "apps/relay"],
+  "engines": { "node": ">=22.13" },
+  "workspaces": ["packages/core", "packages/channel", "packages/cli"],
   "scripts": {
     "test": "vitest run",
+    "test:live": "vitest run --config vitest.live.config.ts",
     "typecheck": "tsc -p tsconfig.json",
     "build": "node scripts/build.mjs",
-    "pack": "node scripts/pack.mjs",
-    "db:up": "docker run -d --name agentbridge-pg -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=agentbridge_test -p 55432:5432 postgres:16",
-    "db:down": "docker rm -f agentbridge-pg"
+    "pack": "node scripts/pack.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.20.2",
-    "@types/pg": "^8.23.1",
     "esbuild": "^0.28.2",
     "tsx": "^4.23.13",
     "typescript": "5.9.3",

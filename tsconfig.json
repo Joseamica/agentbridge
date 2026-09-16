@@ -13,5 +13,5 @@
     "resolveJsonModule": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["packages/*/src", "packages/*/test", "apps/*/src", "apps/*/test", "tests", "vitest.config.ts"]
+  "include": ["packages/*/src", "packages/*/test", "tests", "vitest.config.ts", "vitest.live.config.ts"]
 }
