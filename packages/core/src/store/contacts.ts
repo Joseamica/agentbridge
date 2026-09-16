@@ -313,7 +313,12 @@ export function createOutboundRequest(
   assertPubkey(input.pubkey)
   return store.tx(() => {
     const row = selectRow(store, input.pubkey, 'outbound')
-    if (row?.state === 'pending') return { contact: toContact(row), created: false }
+    // A pending request that has sat unanswered for a full retry window is treated like a
+    // rejected/revoked one: it is replaced with a fresh request id rather than left to block the
+    // asker forever. Its generation counters are preserved by the UPDATE below, which never
+    // touches those columns.
+    const stalePending = row?.state === 'pending' && row.requested_at !== null && input.now - row.requested_at >= NOSTR.retryWindowSeconds
+    if (row?.state === 'pending' && !stalePending) return { contact: toContact(row), created: false }
     if (row?.state === 'approved') throw new UserFacingError('Ya tienes permiso para preguntarle a esa persona.')
     const relays = store.relayPolicy(input.relays)
     if (relays.length === 0) {

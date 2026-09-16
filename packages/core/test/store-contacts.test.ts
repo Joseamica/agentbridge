@@ -208,6 +208,30 @@ describe('outbound requests', () => {
     expect(applyApproval(store, { pubkey: pk(1), requestId: uuid(1), generation: 3, name: 'Dev', relays: [], now: 12 })).toBe('applied')
   })
 
+  it('leaves a young pending request untouched but replaces one at least a retry window old, keeping generation counters', () => {
+    createOutboundRequest(store, { pubkey: pk(1), requestId: uuid(1), ...link, now: 10 })
+    expect(applyRevocation(store, { pubkey: pk(1), generation: 2, now: 11 })).toBe('applied')
+    expect(createOutboundRequest(store, { pubkey: pk(1), requestId: uuid(2), ...link, now: 10 + NOSTR.retryWindowSeconds - 1 })).toMatchObject({
+      created: false,
+      contact: { requestId: uuid(1), maxGenerationSeen: 2 },
+    })
+    expect(createOutboundRequest(store, { pubkey: pk(1), requestId: uuid(2), ...link, now: 10 + NOSTR.retryWindowSeconds })).toMatchObject({
+      created: true,
+      contact: { requestId: uuid(2), state: 'pending', generation: 0, maxGenerationSeen: 2, requestedAt: 10 + NOSTR.retryWindowSeconds },
+    })
+  })
+
+  it('keeps maxGenerationSeen through a revocation and a late approval attempt, then replaces the stale pending request', () => {
+    createOutboundRequest(store, { pubkey: pk(1), requestId: uuid(1), ...link, now: 10 })
+    expect(applyRevocation(store, { pubkey: pk(1), generation: 2, now: 11 })).toBe('applied')
+    expect(getContact(store, pk(1), 'outbound')).toMatchObject({ state: 'pending', maxGenerationSeen: 2 })
+    expect(applyApproval(store, { pubkey: pk(1), requestId: uuid(1), generation: 1, name: 'Dev', relays: [], now: 12 })).toBe('ignored')
+    expect(createOutboundRequest(store, { pubkey: pk(1), requestId: uuid(2), ...link, now: 10 + NOSTR.retryWindowSeconds })).toMatchObject({
+      created: true,
+      contact: { requestId: uuid(2), state: 'pending', maxGenerationSeen: 2 },
+    })
+  })
+
   it('refuses a new request when permission already exists, and allows one after a rejection', () => {
     createOutboundRequest(store, { pubkey: pk(1), requestId: uuid(1), ...link, now: 10 })
     applyApproval(store, { pubkey: pk(1), requestId: uuid(1), generation: 1, name: 'Dev', relays: [], now: 11 })
