@@ -114,6 +114,28 @@ store.close()`
     expect(store.db.prepare('SELECT n FROM counter WHERE id = 1').get()?.n).toBe(200)
     store.close()
   })
+
+  it('lets several processes race openStore from a cold start without losing the lock race', async () => {
+    const home = await newHome()
+    const script = `import { openStore } from ${JSON.stringify(join(repoRoot, 'packages/core/src/store/db.ts'))}
+const store = await openStore(${JSON.stringify(home)}, { migrations: ${JSON.stringify([counterMigration])} })
+for (let i = 0; i < 5; i++) {
+  store.tx(() => {
+    const n = store.db.prepare('SELECT n FROM counter WHERE id = 1').get().n
+    store.db.prepare('UPDATE counter SET n = ? WHERE id = 1').run(n + 1)
+  })
+}
+store.close()`
+    // No pre-creation here: all 6 processes call openStore on the SAME brand-new home at once, so
+    // they race each other to create the file, switch journal_mode to WAL and apply migration 1.
+    await Promise.all(
+      Array.from({ length: 6 }, () => run(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], { cwd: repoRoot })),
+    )
+    const store = await openStore(home, { migrations: [counterMigration] })
+    expect(store.db.prepare('SELECT n FROM counter WHERE id = 1').get()?.n).toBe(30)
+    expect(store.db.prepare('SELECT version FROM schema_version ORDER BY version').all().map((r) => r.version)).toEqual([1])
+    store.close()
+  })
 })
 
 describe('installSqliteWarningFilter', () => {
