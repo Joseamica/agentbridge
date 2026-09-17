@@ -254,6 +254,55 @@ describe('claimDue guards', () => {
     expect(rowState(1)?.state).toBe('abandoned')
     expect(rowState(2)?.state).toBe('pending')
   })
+
+  it('calls onAbandon once with the row identity and the thrown error when authorization throws', () => {
+    enqueue(store, input(1))
+    enqueue(store, input(2))
+    const boom = new Error('boom')
+    const calls: Array<[{ recipient: string; rumorId: string; label: string }, unknown]> = []
+    const claimed = claimDue(store, {
+      owner: 'a',
+      now: T0,
+      limit: 10,
+      authorize: (item) => {
+        if (item.rumorId === hex(1)) throw boom
+        return true
+      },
+      onAbandon: (row, err) => calls.push([row, err]),
+    })
+    expect(claimed.map((i) => i.rumorId)).toEqual([hex(2)])
+    expect(calls).toEqual([[{ recipient: RECIPIENT, rumorId: hex(1), label: 'answer' }, boom]])
+    expect(rowState(1)?.state).toBe('abandoned')
+  })
+
+  it('does not call onAbandon when authorize plainly refuses a row', () => {
+    enqueue(store, input(1))
+    let called = false
+    const claimed = claimDue(store, { owner: 'a', now: T0, limit: 10, authorize: () => false, onAbandon: () => (called = true) })
+    expect(claimed).toEqual([])
+    expect(called).toBe(false)
+    expect(rowState(1)?.state).toBe('abandoned')
+  })
+
+  it('still abandons the row and grants the others when onAbandon itself throws', () => {
+    enqueue(store, input(1))
+    enqueue(store, input(2))
+    const claimed = claimDue(store, {
+      owner: 'a',
+      now: T0,
+      limit: 10,
+      authorize: (item) => {
+        if (item.rumorId === hex(1)) throw new Error('boom')
+        return true
+      },
+      onAbandon: () => {
+        throw new Error('onAbandon boom')
+      },
+    })
+    expect(claimed.map((i) => i.rumorId)).toEqual([hex(2)])
+    expect(rowState(1)?.state).toBe('abandoned')
+    expect(rowState(2)?.state).toBe('pending')
+  })
 })
 
 describe('renewClaim', () => {

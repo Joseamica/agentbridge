@@ -123,7 +123,13 @@ export function enqueue(store: Store, input: EnqueueInput): EnqueueOutcome {
 
 export function claimDue(
   store: Store,
-  input: { owner: string; now: number; limit: number; authorize: (item: OutboxItem) => boolean },
+  input: {
+    owner: string
+    now: number
+    limit: number
+    authorize: (item: OutboxItem) => boolean
+    onAbandon?: (row: { recipient: string; rumorId: string; label: string }, err: unknown) => void
+  },
 ): OutboxItem[] {
   return store.tx(() => {
     store.db
@@ -179,8 +185,14 @@ export function claimDue(
       try {
         item = toItem(row)
         allowed = input.authorize(item)
-      } catch {
+      } catch (err) {
         abandon.run(input.now, row.recipient, row.rumor_id)
+        try {
+          // A throwing onAbandon must never roll back this row's abandonment or the rows after it.
+          input.onAbandon?.({ recipient: row.recipient, rumorId: row.rumor_id, label: row.label }, err)
+        } catch {
+          // ignored: reporting the abandonment must never itself fail the claim
+        }
         continue
       }
       if (!allowed) {

@@ -218,9 +218,9 @@ export class BoardPool {
     return { close: subscription.close }
   }
 
-  // Ruling 26: stop every live loop first, then close every connection — which also aborts connects
-  // still in progress, so a relay that never finishes its handshake cannot hold close() up — and
-  // only then wait for the loops to exit and their queues to drain.
+  // Ruling 26: stop every live loop first, then terminate every connection (no close handshake) —
+  // which also aborts connects still in progress, so a relay that never finishes its handshake
+  // cannot hold close() up — and only then wait for the loops to exit and their queues to drain.
   async close(): Promise<void> {
     this.closed = true
     const live = [...this.live]
