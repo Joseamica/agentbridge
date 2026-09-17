@@ -129,15 +129,16 @@ export function listPendingRequests(store: Store): Contact[] {
   ).map(toContact)
 }
 
-export function findRequestsByPrefix(store: Store, prefix: string): Contact[] {
+export function findRequestsByPrefix(store: Store, prefix: string, states: readonly ContactState[] = ['requested']): Contact[] {
   const normalized = prefix.trim().toLowerCase()
   if (!/^[0-9a-f]{8,64}$/.test(normalized)) {
     throw new UserFacingError('El identificador debe tener al menos 8 caracteres hexadecimales, tal como aparece en la lista de solicitudes.')
   }
+  const placeholders = states.map(() => '?').join(', ')
   return (
     store.db
-      .prepare("SELECT * FROM contacts WHERE direction = 'inbound' AND state = 'requested' AND pubkey LIKE ? ORDER BY requested_at")
-      .all(`${normalized}%`) as ContactRow[]
+      .prepare(`SELECT * FROM contacts WHERE direction = 'inbound' AND state IN (${placeholders}) AND pubkey LIKE ? ORDER BY requested_at`)
+      .all(...states, `${normalized}%`) as ContactRow[]
   ).map(toContact)
 }
 

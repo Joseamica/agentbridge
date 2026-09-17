@@ -7,6 +7,7 @@ import { CLI_COMMAND } from '../published'
 import {
   approveRequest,
   findContactByLocalName,
+  findRequestsByPrefix,
   getContact,
   listPendingRequests,
   purgeRequests,
@@ -16,7 +17,7 @@ import {
 } from '../store/contacts'
 import type { Store } from '../store/db'
 import { rejectUnansweredFor } from '../store/inbox'
-import { deleteUnclaimedFor, enqueue } from '../store/outbox'
+import { deleteUnclaimedFor, enqueue, type EnqueueOutcome } from '../store/outbox'
 import { clearRequestNoticePending, getProfile } from '../store/settings'
 
 export const REQUEST_ID_LENGTH = 8
@@ -44,22 +45,16 @@ export function listRequests(store: Store, now: number): PendingRequestView[] {
 }
 
 function findInbound(store: Store, idPrefix: string, states: readonly Contact['state'][]): Contact {
-  const normalized = idPrefix.trim().toLowerCase()
-  if (!/^[0-9a-f]{8,64}$/.test(normalized)) {
-    throw new UserFacingError('El identificador debe tener al menos 8 caracteres hexadecimales, tal como aparece en la lista de solicitudes.')
-  }
-  const placeholders = states.map(() => '?').join(', ')
-  const rows = store.db
-    .prepare(`SELECT pubkey FROM contacts WHERE direction = 'inbound' AND state IN (${placeholders}) AND pubkey LIKE ? ORDER BY requested_at`)
-    .all(...states, `${normalized}%`) as Array<{ pubkey: string }>
+  const rows = findRequestsByPrefix(store, idPrefix, states)
   if (rows.length === 0) throw new UserFacingError('No hay ninguna solicitud con ese identificador. Revisa la lista de solicitudes.')
   if (rows.length > 1) throw new UserFacingError('Ese identificador coincide con varias solicitudes. Escribe más caracteres del identificador.')
   return getContact(store, rows[0]!.pubkey, 'inbound')!
 }
 
-function send(store: Store, input: { recipient: string; relays: readonly string[]; rumor: Rumor; label: string; now: number }): void {
-  if (input.relays.length === 0) return
-  enqueue(store, {
+// 'no_relays' stands in for the enqueue outcomes that never happen: there is nowhere to send.
+function send(store: Store, input: { recipient: string; relays: readonly string[]; rumor: Rumor; label: string; now: number }): EnqueueOutcome | 'no_relays' {
+  if (input.relays.length === 0) return 'no_relays'
+  return enqueue(store, {
     recipient: input.recipient,
     rumor: input.rumor,
     label: input.label,
@@ -70,8 +65,16 @@ function send(store: Store, input: { recipient: string; relays: readonly string[
   })
 }
 
+// Every decision must be stored before it is enqueued (Global Constraints, "Decisions"). If the
+// UPDATE ever matches no row, that invariant already broke upstream — fail loudly instead of
+// silently leaving a decision that was never actually recorded.
 function storeDecisionRumor(store: Store, senderPubkey: string, requestId: string, rumor: Rumor): void {
-  store.db.prepare('UPDATE requests SET decision_rumor_json = ? WHERE sender_pubkey = ? AND request_id = ?').run(JSON.stringify(rumor), senderPubkey, requestId)
+  const result = store.db
+    .prepare('UPDATE requests SET decision_rumor_json = ? WHERE sender_pubkey = ? AND request_id = ?')
+    .run(JSON.stringify(rumor), senderPubkey, requestId)
+  if (Number(result.changes) === 0) {
+    throw new Error(`storeDecisionRumor: no request row for sender ${senderPubkey} request ${requestId}`)
+  }
 }
 
 export function approveConnection(store: Store, input: { identity: Identity; idPrefix: string; now: number }): { contact: Contact; changed: boolean } {
@@ -132,11 +135,14 @@ export function revokeConnection(
 // when there is one, or one created now (and stored) for a request recorded as approved after the
 // fact. It goes to the relays of the request being answered. A decision already sent is resent at most
 // once per regeneration interval; the clock lives on the request record, so deleting outbox rows
-// (revocation, purge) cannot reset it.
+// (revocation, purge) cannot reset it. The clock only advances when the outbox actually (re)armed the
+// row: an outbox row still 'pending' from an earlier send ('already_pending') means nothing new
+// happened, and an 'abandoned' row means the send never reached the outbox at all, so callers must be
+// able to tell that apart from a real resend instead of being told 'enqueued' either way.
 export function regenerateRequestDecision(
   store: Store,
   input: { identity: Identity; senderPubkey: string; requestId: string; replyRelays: readonly string[]; now: number },
-): 'enqueued' | 'too_soon' | 'nothing' {
+): 'enqueued' | 'too_soon' | 'nothing' | 'abandoned' {
   return store.tx(() => {
     const record = store.db
       .prepare('SELECT decision, decision_generation, decision_rumor_json, decided_at, decision_resent_at FROM requests WHERE sender_pubkey = ? AND request_id = ?')
@@ -167,14 +173,22 @@ export function regenerateRequestDecision(
       storeDecisionRumor(store, input.senderPubkey, input.requestId, rumor)
       rumorJson = JSON.stringify(rumor)
     }
-    send(store, {
+    const outcome = send(store, {
       recipient: input.senderPubkey,
       relays,
       rumor: JSON.parse(rumorJson) as Rumor,
       label: record.decision === 'approved' ? 'connect_approved' : 'connect_rejected',
       now: input.now,
     })
-    store.db.prepare('UPDATE requests SET decision_resent_at = ? WHERE sender_pubkey = ? AND request_id = ?').run(input.now, input.senderPubkey, input.requestId)
+    if (outcome === 'no_relays') return 'nothing'
+    if (outcome === 'regeneration_too_soon') return 'too_soon'
+    if (outcome === 'abandoned') return 'abandoned'
+    // 'already_pending': the earlier send is still waiting to publish, so nothing new happened —
+    // the clock stays put. Every other outcome ('enqueued', 'postponed_cap', 'regenerated')
+    // actually (re)armed the row, so the resend clock advances.
+    if (outcome !== 'already_pending') {
+      store.db.prepare('UPDATE requests SET decision_resent_at = ? WHERE sender_pubkey = ? AND request_id = ?').run(input.now, input.senderPubkey, input.requestId)
+    }
     return 'enqueued'
   })
 }

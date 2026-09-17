@@ -162,6 +162,13 @@ describe('inbound requests', () => {
     expect(() => findRequestsByPrefix(store, 'abc')).toThrow(UserFacingError)
     expect(() => findRequestsByPrefix(store, "'; DROP TABLE contacts; --")).toThrow(UserFacingError)
   })
+
+  it('narrows or widens the match with an explicit states list', () => {
+    request(0x1234abcd)
+    approveRequest(store, { pubkey: pk(0x1234abcd), now: 1 })
+    expect(findRequestsByPrefix(store, pk(0x1234abcd).slice(0, 8))).toHaveLength(0)
+    expect(findRequestsByPrefix(store, pk(0x1234abcd).slice(0, 8), ['requested', 'approved'])).toHaveLength(1)
+  })
 })
 
 describe('outbound requests', () => {

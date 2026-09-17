@@ -100,11 +100,26 @@ describe('approveConnection', () => {
   it('refuses to approve a request with no relays to answer at', () => {
     setProfile(store, { name: 'Ana', now: T0 })
     recordIncomingRequest(store, { pubkey: asker.publicKey, requestId: REQUEST_ID, requestRumorId: hex(1), declaredName: 'Beto', note: 'Soy del equipo', relays: [], now: T0 })
-    expect(() => approveConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 + 1 })).toThrow(/no trae tableros/)
+    expect(() => approveConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 + 1 })).toThrow(
+      'Esa solicitud no trae tableros donde responder, así que no se puede aprobar. Pídele a esa persona que te envíe una solicitud nueva.',
+    )
     expect(getContact(store, asker.publicKey, 'inbound')?.state).toBe('requested')
     expect(outbox()).toEqual([])
     const stored = store.db.prepare('SELECT decision_rumor_json AS j FROM requests WHERE request_id = ?').get(REQUEST_ID)?.j
     expect(stored).toBeNull()
+  })
+
+  it('re-approves after a revocation with a fresh generation', () => {
+    setProfile(store, { name: 'Ana', relays: MY_RELAYS, now: T0 })
+    requestFrom()
+    approveConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 })
+    revokeConnection(store, { identity: responder, name: 'beto', now: T0 + 1 })
+    requestFrom(asker, T0 + 2, uuid(50))
+    store.db.prepare('DELETE FROM outbox').run()
+    const result = approveConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 + 3 })
+    expect(result.contact).toMatchObject({ state: 'approved', generation: 3 })
+    const [row] = outbox()
+    expect(JSON.parse(row!.content)).toMatchObject({ type: 'connect_approved', generation: 3 })
   })
 })
 
@@ -183,5 +198,31 @@ describe('regenerateRequestDecision', () => {
   it('does nothing for an undecided request', () => {
     requestFrom()
     expect(regenerateRequestDecision(store, { identity: responder, senderPubkey: asker.publicKey, requestId: REQUEST_ID, replyRelays: ASKER_RELAYS, now: T0 })).toBe('nothing')
+  })
+
+  it('reports abandoned and leaves the resend clock alone when the outbox row was abandoned', () => {
+    setProfile(store, { name: 'Ana', relays: MY_RELAYS, now: T0 })
+    requestFrom()
+    approveConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 })
+    claimDue(store, { owner: 'someone-else', now: T0, limit: 10, authorize: () => false })
+    const later = T0 + NOSTR.regenerationIntervalSeconds
+    expect(regenerateRequestDecision(store, { identity: responder, senderPubkey: asker.publicKey, requestId: REQUEST_ID, replyRelays: ASKER_RELAYS, now: later })).toBe(
+      'abandoned',
+    )
+    const resentAt = store.db.prepare('SELECT decision_resent_at AS r FROM requests WHERE request_id = ?').get(REQUEST_ID)?.r
+    expect(resentAt).toBeNull()
+  })
+
+  it('reports enqueued but leaves the resend clock alone when the outbox row is still pending', () => {
+    setProfile(store, { name: 'Ana', relays: MY_RELAYS, now: T0 })
+    requestFrom()
+    approveConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 })
+    const later = T0 + NOSTR.regenerationIntervalSeconds
+    expect(regenerateRequestDecision(store, { identity: responder, senderPubkey: asker.publicKey, requestId: REQUEST_ID, replyRelays: ASKER_RELAYS, now: later })).toBe(
+      'enqueued',
+    )
+    const resentAt = store.db.prepare('SELECT decision_resent_at AS r FROM requests WHERE request_id = ?').get(REQUEST_ID)?.r
+    expect(resentAt).toBeNull()
+    expect(outbox()).toHaveLength(1)
   })
 })
