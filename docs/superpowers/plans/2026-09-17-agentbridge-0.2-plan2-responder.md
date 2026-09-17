@@ -58,7 +58,7 @@
 - **Dispatch.**
   - **Lock.** One channel per identity, holding `channel_lock` (PID, process start time, `epoch`) for its whole life. The lock is taken from a previous owner only if that exact process no longer exists. Every epoch is greater than every earlier one: the lock row is never deleted, and releasing it keeps the epoch.
   - **Fencing.** Every dispatch write (reserve, expire, answer) runs in a transaction that first checks the caller's `epoch`.
-  - **One at a time.** Reserve the oldest `queued` question: create an attempt with a UUID, a 4-character code (`newQuestionCode`) that no stored attempt has ever used, so a late reply naming an old code can never match a new attempt, and `deadline = now + LIMITS.attemptTimeoutMs` (10 minutes), mark the question `dispatched`, and only then hand it to Claude.
+  - **One at a time.** Reserve the oldest `queued` question: create an attempt with a UUID, a 4-character code (`newQuestionCode`) that was never handed out before (recorded in `question_codes`, which is never purged), so a late reply naming an old code can never match a new attempt, and `deadline = now + LIMITS.attemptTimeoutMs` (10 minutes), mark the question `dispatched`, and only then hand it to Claude.
   - **`reply`** checks, in one transaction: the channel epoch, the code, that the attempt is the active one, the deadline, and the contact's permission and generation. Then it stores the answer, marks the question `answered` and enqueues `answer`.
   - **Timeout.** A missed deadline cancels the attempt in Claude and requeues the question; after 2 expired attempts the decision is `rejected`/`unanswered`.
   - **Recovery.** Taking the lock cancels every leftover active attempt and requeues every `dispatched` question.
