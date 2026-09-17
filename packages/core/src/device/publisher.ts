@@ -3,6 +3,7 @@ import type { NostrEvent } from 'nostr-tools/pure'
 import type { BoardPool } from '../boards/pool'
 import { sanitizeRelayText } from '../boards/relay-text'
 import { wrapRumor } from '../envelope/seal'
+import { describeError } from '../errors'
 import type { Identity } from '../identity'
 import { nowSeconds } from '../nostr-constants'
 import type { Store } from '../store/db'
@@ -51,10 +52,8 @@ export async function publishDue(input: PublishDueInput): Promise<PublishReport>
       now: now(),
       limit: 1,
       authorize: (candidate) => authorize(input.store, candidate),
-      // Task 9 introduces describeError; until then this stays in the file's own English log voice
-      // and never carries the error message, which can hold decrypted content.
       onAbandon: (row, err) => {
-        log(`outbox row abandoned after an unexpected error (${row.label}, ${err instanceof Error ? err.name : 'non-error value'})`)
+        log(`outbox row abandoned after an unexpected error (${row.label}, ${describeError(err)})`)
       },
     })
     if (!item) {
