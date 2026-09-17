@@ -22,10 +22,15 @@ type Subscription = { filters: Filter[]; handlers: SubscriptionHandlers; retried
 
 const CLOSED_REASON = 'error: connection closed'
 
-// Ruling 8: the spec's receive pipeline checks event size first, before anything more expensive
+// Ruling 8/9: the spec's receive pipeline checks event size first, before anything more expensive
 // (such as JSON.parse). The extra 1024 bytes leave room for the ["EVENT","<subscription id>", …]
-// envelope around a wrap already at the cap.
+// envelope around a wrap already at the cap. An oversize EVENT frame is never parsed, but its
+// subscription still gets a placeholder in the real event's place — see handleOversizeFrame.
 const MAX_FRAME_BYTES = NOSTR.maxWrapBytes + 1024
+
+// Matches the start of ["EVENT","<subscription id>", …] in the first 200 characters of an
+// oversize frame, without ever parsing the (possibly huge) rest of it.
+const OVERSIZE_EVENT_HEAD = /^\s*\[\s*"EVENT"\s*,\s*"([^"\\]{1,64})"\s*,/
 
 export class BoardConnection extends EventEmitter {
   readonly url: string
@@ -56,15 +61,19 @@ export class BoardConnection extends EventEmitter {
 
   connect(): Promise<void> {
     if (this.opening) return this.opening
+    // createSocket runs before the promise is created (and outside its executor): the promise
+    // constructor's return value is assigned to `this.opening` only after the executor has run,
+    // so setting `this.opening = null` from inside the executor's catch was immediately
+    // overwritten by that assignment — pinning the rejection forever and never calling the
+    // factory again. Rejecting directly here leaves `this.opening` untouched (still null), so the
+    // next connect() retries.
+    let socket: WebSocket
+    try {
+      socket = this.createSocket(this.url)
+    } catch (err) {
+      return Promise.reject(err)
+    }
     this.opening = new Promise<void>((resolve, reject) => {
-      let socket: WebSocket
-      try {
-        socket = this.createSocket(this.url)
-      } catch (err) {
-        this.opening = null
-        reject(err)
-        return
-      }
       this.socket = socket
       // The stream must exist before the first frame can arrive; it owns all reading from here on.
       const stream = createWebSocketStream(socket, { readableObjectMode: true })
@@ -102,7 +111,7 @@ export class BoardConnection extends EventEmitter {
     this.subs.set(id, { filters, handlers, retriedAuth: false })
     if (!this.send(['REQ', id, ...filters])) {
       this.subs.delete(id)
-      handlers.onClosed(CLOSED_REASON)
+      void this.runHandler(() => handlers.onClosed(CLOSED_REASON), 'closed')
     }
   }
 
@@ -117,8 +126,22 @@ export class BoardConnection extends EventEmitter {
   private async readFrames(stream: AsyncIterable<unknown>): Promise<void> {
     try {
       for await (const chunk of stream) await this.onFrame(chunk)
-    } catch {
-      // Socket errors surface through the 'close' handler.
+    } catch (err) {
+      // Handler exceptions are caught inside onFrame/runHandler, so anything reaching here is a
+      // genuine stream failure. The socket's own 'close' handler still runs the actual cleanup;
+      // this just makes sure the error itself is not silently swallowed.
+      this.log(`${this.url}: read loop failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  // Runs a subscription callback and never lets it escape: a throwing onEvent/onEose/onClosed
+  // must not stop the reader (which would drop the socket for every other subscription too) and
+  // must not become an unhandled rejection when reached from a detached `.then()` continuation.
+  private async runHandler(action: () => void | Promise<void>, what: string): Promise<void> {
+    try {
+      await action()
+    } catch (err) {
+      this.log(`${this.url}: ${what} handler failed: ${err instanceof Error ? err.message : String(err)}`)
     }
   }
 
@@ -181,11 +204,15 @@ export class BoardConnection extends EventEmitter {
   }
 
   private async onFrame(chunk: unknown): Promise<void> {
-    const text = typeof chunk === 'string' ? chunk : Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
-    // Ruling 8: check the frame's size before doing anything more expensive, such as JSON.parse.
-    // A wrap that passed the publish-side cap can never legitimately produce a larger frame here,
-    // so an oversize frame is dropped rather than parsed; the connection stays open.
-    if (Buffer.byteLength(text, 'utf8') > MAX_FRAME_BYTES) return
+    // Ruling 8/9: measure size before converting to text, and before doing anything more
+    // expensive such as JSON.parse. An oversize Buffer is never turned into a full string.
+    const isBuffer = Buffer.isBuffer(chunk)
+    const bytes = isBuffer ? (chunk as Buffer).length : Buffer.byteLength(typeof chunk === 'string' ? chunk : String(chunk), 'utf8')
+    if (bytes > MAX_FRAME_BYTES) {
+      await this.handleOversizeFrame(chunk, isBuffer, bytes)
+      return
+    }
+    const text = typeof chunk === 'string' ? chunk : isBuffer ? (chunk as Buffer).toString('utf8') : String(chunk)
     let frame: unknown
     try {
       frame = JSON.parse(text)
@@ -197,15 +224,13 @@ export class BoardConnection extends EventEmitter {
       case 'EVENT': {
         const sub = this.subs.get(String(frame[1]))
         if (!sub) return
-        try {
-          await sub.handlers.onEvent(frame[2])
-        } catch (err) {
-          this.log(`${this.url}: event handler failed: ${err instanceof Error ? err.message : String(err)}`)
-        }
+        await this.runHandler(() => sub.handlers.onEvent(frame[2]), 'event')
         return
       }
       case 'EOSE': {
-        this.subs.get(String(frame[1]))?.handlers.onEose()
+        const sub = this.subs.get(String(frame[1]))
+        if (!sub) return
+        await this.runHandler(() => sub.handlers.onEose(), 'eose')
         return
       }
       case 'CLOSED': {
@@ -215,16 +240,21 @@ export class BoardConnection extends EventEmitter {
         if (!sub) return
         if (reason.startsWith('auth-required:') && !sub.retriedAuth) {
           sub.retriedAuth = true
-          void this.authenticate().then((ok) => {
-            if (!this.subs.has(id)) return
-            if (ok && this.send(['REQ', id, ...sub.filters])) return
-            this.subs.delete(id)
-            sub.handlers.onClosed(reason)
-          })
+          this.authenticate()
+            .then(async (ok) => {
+              // Ruling 10b: `id` may have been reused by unsubscribe()+subscribe() while this
+              // retry was in flight. Only the subscription that started the retry may be acted
+              // on — never whatever now sits at the same id.
+              if (this.subs.get(id) !== sub) return
+              if (ok && this.send(['REQ', id, ...sub.filters])) return
+              this.subs.delete(id)
+              await this.runHandler(() => sub.handlers.onClosed(reason), 'closed')
+            })
+            .catch((err) => this.log(`${this.url}: auth retry failed: ${err instanceof Error ? err.message : String(err)}`))
           return
         }
         this.subs.delete(id)
-        sub.handlers.onClosed(reason)
+        await this.runHandler(() => sub.handlers.onClosed(reason), 'closed')
         return
       }
       case 'OK': {
@@ -242,6 +272,24 @@ export class BoardConnection extends EventEmitter {
     }
   }
 
+  // Ruling 9: an oversize EVENT frame is never JSON.parse'd, but dropping it silently would make
+  // a relay's page look shorter than what it actually returned — the history pager (Task 15)
+  // would then believe the page was not truncated and skip same-second events that follow it, a
+  // gap an attacker could otherwise exploit to hide a genuine wrap. Instead, when the frame's head
+  // identifies a live subscription, that subscription receives `null` in the real event's place,
+  // so callers can still count it.
+  private async handleOversizeFrame(chunk: unknown, isBuffer: boolean, bytes: number): Promise<void> {
+    const head = isBuffer ? (chunk as Buffer).subarray(0, 200).toString('utf8') : String(chunk).slice(0, 200)
+    const id = OVERSIZE_EVENT_HEAD.exec(head)?.[1]
+    const sub = id !== undefined ? this.subs.get(id) : undefined
+    if (id !== undefined && sub) {
+      this.log(`${this.url}: oversize event (${bytes} bytes) on subscription ${id}`)
+      await this.runHandler(() => sub.handlers.onEvent(null), 'event')
+      return
+    }
+    this.log(`${this.url}: oversize frame (${bytes} bytes) dropped`)
+  }
+
   private handleClose(socket: WebSocket): void {
     if (this.socket !== socket) return
     this.socket = null
@@ -252,7 +300,7 @@ export class BoardConnection extends EventEmitter {
     this.pendingOk.clear()
     const subs = [...this.subs.values()]
     this.subs.clear()
-    for (const sub of subs) sub.handlers.onClosed(CLOSED_REASON)
+    for (const sub of subs) void this.runHandler(() => sub.handlers.onClosed(CLOSED_REASON), 'closed')
     this.emit('close')
   }
 }
