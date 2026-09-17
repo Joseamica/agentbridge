@@ -142,4 +142,57 @@ describe('publishDue', () => {
     expect(row(store).state).toBe('pending')
     for (const board of boards) expect(board.frames).toHaveLength(0)
   })
+
+  it('counts a claim stolen right before the bookkeeping as lost, not published', async () => {
+    const { store, now } = await setup()
+    // A pool whose relay accepts the write, but the row's claim is stolen (another owner takes it)
+    // in the gap between the accepted write and publishDue's own markPublished call.
+    const thief = {
+      publish: async (relays: readonly string[], _event: NostrEvent, beforeSend: () => boolean) => {
+        const ok = beforeSend()
+        store.db.prepare("UPDATE outbox SET claimed_by = 'thief' WHERE recipient = ?").run(asker.publicKey)
+        return ok ? { accepted: [...relays], rejected: [] } : { accepted: [], rejected: relays.map((relay) => ({ relay, reason: 'error: publish guard refused' })) }
+      },
+    } as unknown as BoardPool
+    const report = await publishDue({ store, identity: me, pool: thief, authorize: allowAll, now: () => now })
+    expect(report).toEqual({ published: 0, failed: 0, postponed: 0, lost: 1 })
+    expect(row(store).state).toBe('pending')
+  })
+
+  it('counts every relay refusing after a lapsed claim as lost, not failed', async () => {
+    const { store, now } = await setup()
+    // The first beforeSend call reserves a publish slot; the claim is then stolen, so every later
+    // recheck (this or another relay) refuses the write, and nobody ever accepts it.
+    const stolenMidSend = {
+      publish: async (relays: readonly string[], _event: NostrEvent, beforeSend: () => boolean) => {
+        expect(beforeSend()).toBe(true)
+        store.db.prepare("UPDATE outbox SET claimed_by = 'thief' WHERE recipient = ?").run(asker.publicKey)
+        expect(beforeSend()).toBe(false)
+        return { accepted: [], rejected: relays.map((relay) => ({ relay, reason: 'error: no OK from relay' })) }
+      },
+    } as unknown as BoardPool
+    const report = await publishDue({ store, identity: me, pool: stolenMidSend, authorize: allowAll, now: () => now })
+    expect(report).toEqual({ published: 0, failed: 0, postponed: 0, lost: 1 })
+  })
+
+  it('logs an abandoned row without leaking the thrown error message', async () => {
+    const { store, pool } = await setup()
+    const lines: string[] = []
+    const boom = new Error('crashed while reading PRIVATE_CANARY')
+    const report = await publishDue({
+      store,
+      identity: me,
+      pool,
+      authorize: () => {
+        throw boom
+      },
+      log: (line) => lines.push(line),
+    })
+    expect(report).toEqual({ published: 0, failed: 0, postponed: 0, lost: 0 })
+    expect(row(store).state).toBe('abandoned')
+    const abandonLine = lines.find((line) => line.includes('abandoned'))
+    expect(abandonLine).toContain('receipt')
+    expect(abandonLine).toContain('Error')
+    expect(lines.some((line) => line.includes('PRIVATE_CANARY'))).toBe(false)
+  })
 })

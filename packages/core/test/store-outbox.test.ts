@@ -7,6 +7,7 @@ import {
   claimDue,
   deleteUnclaimedFor,
   enqueue,
+  hasDueOutbox,
   markFailed,
   markPublished,
   openStore,
@@ -302,6 +303,23 @@ describe('claimDue guards', () => {
     expect(claimed.map((i) => i.rumorId)).toEqual([hex(2)])
     expect(rowState(1)?.state).toBe('abandoned')
     expect(rowState(2)?.state).toBe('pending')
+  })
+})
+
+describe('hasDueOutbox', () => {
+  it('is true for a pending row that is due and unclaimed', () => {
+    enqueue(store, input(1))
+    expect(hasDueOutbox(store, T0)).toBe(true)
+  })
+
+  it('is false once the row is claimed with a live claim', () => {
+    enqueue(store, input(1))
+    claimOne('a', T0)
+    expect(hasDueOutbox(store, T0)).toBe(false)
+  })
+
+  it('is false when there are no rows at all', () => {
+    expect(hasDueOutbox(store, T0)).toBe(false)
   })
 })
 

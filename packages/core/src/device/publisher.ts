@@ -85,8 +85,14 @@ export async function publishDue(input: PublishDueInput): Promise<PublishReport>
 
     // Runs right before each EVENT write: up to 5 relays, each possibly twice after an auth retry.
     // The per-minute reservation is taken on the first write only; later writes only re-check the
-    // claim. Anything thrown here (SQLITE_BUSY included) refuses the write.
-    const guard: { reservation: 'reserved' | 'claim_lost' | 'over_budget' | null } = { reservation: null }
+    // claim. Anything thrown here (SQLITE_BUSY included) refuses the write. A later recheck can find
+    // the claim gone even though the first reservation succeeded (it lapsed, or another owner took
+    // it), which must count as lost rather than failed even though `reservation` itself stays
+    // 'reserved'.
+    const guard: { reservation: 'reserved' | 'claim_lost' | 'over_budget' | null; lostMidSend: boolean } = {
+      reservation: null,
+      lostMidSend: false,
+    }
     const beforeSend = (): boolean => {
       if (input.signal?.aborted) return false
       try {
@@ -95,32 +101,39 @@ export async function publishDue(input: PublishDueInput): Promise<PublishReport>
           guard.reservation = reservePublish(input.store, { ...ref, now: at })
           return guard.reservation === 'reserved'
         }
-        return guard.reservation === 'reserved' && stillClaimed(input.store, { ...ref, now: at })
+        if (guard.reservation !== 'reserved') return false
+        if (stillClaimed(input.store, { ...ref, now: at })) return true
+        guard.lostMidSend = true
+        return false
       } catch {
         return false
       }
     }
 
     const outcome = await input.pool.publish(item.relays, wrap, beforeSend)
+    // A row's own finish call (markPublished/markFailed/postpone) always has the last word on
+    // whether the claim was actually still ours: a claim stolen between the last accepted write and
+    // this bookkeeping must count as lost, not as published or failed, or the row would stay
+    // 'pending' under a new owner while being reported as done.
     if (outcome.accepted.length > 0) {
-      markPublished(input.store, { ...ref, now: now() })
-      report.published++
+      if (markPublished(input.store, { ...ref, now: now() }) === 'claim_lost') report.lost++
+      else report.published++
     } else if (guard.reservation === 'over_budget') {
-      postpone(input.store, { ...ref, retryAt: now() + BUDGET_POSTPONE_SECONDS })
-      report.postponed++
+      if (postpone(input.store, { ...ref, retryAt: now() + BUDGET_POSTPONE_SECONDS }) === 'claim_lost') report.lost++
+      else report.postponed++
       break
-    } else if (guard.reservation === 'claim_lost') {
+    } else if (guard.reservation === 'claim_lost' || guard.lostMidSend) {
       report.lost++
     } else if (input.signal?.aborted) {
-      postpone(input.store, { ...ref, retryAt: now() })
-      report.postponed++
+      if (postpone(input.store, { ...ref, retryAt: now() }) === 'claim_lost') report.lost++
+      else report.postponed++
       break
     } else {
       for (const rejected of outcome.rejected) {
         log(`${sanitizeRelayText(rejected.relay)} did not take an outgoing ${item.label}: ${sanitizeRelayText(rejected.reason)}`)
       }
-      markFailed(input.store, { ...ref, now: now() })
-      report.failed++
+      if (markFailed(input.store, { ...ref, now: now() }) === 'claim_lost') report.lost++
+      else report.failed++
     }
   }
   return report
