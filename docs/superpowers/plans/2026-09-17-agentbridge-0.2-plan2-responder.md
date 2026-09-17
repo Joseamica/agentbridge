@@ -31,7 +31,7 @@
   - `nostr-tools` stays exactly `2.25.2` and `ws` exactly `8.21.3`.
 - **Language.**
   - User-facing text is Spanish. Identifiers, logs and model instructions (the channel's instructions to Claude) are English.
-  - No error message or log line contains a secret key, decrypted third-party content, or a shared-folder path.
+  - No error message or log line contains a secret key, decrypted third-party content, or a shared-folder path. An unexpected error is described only by `describeError` (its type and error code); only a `UserFacingError` message is shown as written.
   - Relay-supplied text is passed through `sanitizeRelayText` (`packages/core/src/boards/relay-text.ts`, internal) before it reaches a log.
 - **Tests.** `npm test` needs neither Docker nor internet. `npm run test:live` is the only suite that touches public relays, and this plan does not add to it.
 - **Protocol (from plan 1, unchanged).**
@@ -41,7 +41,7 @@
   - Any `created_at` at most 10 minutes in the future.
 - **Roles.** A responder process handles only `connect_request` and `question`. Every other message type belongs to the asker role: the responder ignores it without storing anything, and the asker's own process reads it with its own history cursors (role `asker`, plan 3). History cursors are per relay **and** role.
 - **Admission of a `question`** is one transaction, in this order:
-  1. If the entity `(senderPubkey, questionId)` exists with the same `rumor.id`, regenerate exactly what was already decided (the stored receipt rumor, and the stored `answer` or `rejected` rumor if any), subject to the outbox's 10-minute regeneration limit, and stop. If the contact is no longer `approved` with that question's `generation`, only a stored `rejected` is regenerated; a question that already has an `answer` is dropped silently. If the entity exists with another `rumor.id`, drop it.
+  1. If the entity `(senderPubkey, questionId)` exists with the same `rumor.id`, regenerate exactly what was already decided (the stored receipt rumor, and the stored `answer` or `rejected` rumor if any), at most once every 10 minutes per question, counted from the question's own `regenerated_at` (or its arrival), so the limit holds even after revocation or purging deleted its outbox rows, and stop. If the contact is no longer `approved` with that question's `generation`, only a stored `rejected` is regenerated; a question that already has an `answer` is dropped silently. If the entity exists with another `rumor.id`, drop it and log it (identifiers only). If nothing stored is left to resend, report that instead of claiming a regeneration.
   2. If it is new and the contact is not `approved` with that `generation`: store the decision `rejected`/`stale_generation` if there was ever a relationship (contact generation > 0); drop silently if there never was.
   3. If it is expired (`rumor.created_at + 24 h ≤ now`): decision `rejected`/`expired`.
   4. If the contact already has 5 open questions (`queued` or `dispatched`), or 20 admitted in the last 24 h: decision `rejected`/`limit`.
@@ -58,26 +58,28 @@
 - **Dispatch.**
   - **Lock.** One channel per identity, holding `channel_lock` (PID, process start time, `epoch`) for its whole life. The lock is taken from a previous owner only if that exact process no longer exists. Every epoch is greater than every earlier one: the lock row is never deleted, and releasing it keeps the epoch.
   - **Fencing.** Every dispatch write (reserve, expire, answer) runs in a transaction that first checks the caller's `epoch`.
-  - **One at a time.** Reserve the oldest `queued` question: create an attempt with a UUID, a 4-character code (`newQuestionCode`) and `deadline = now + LIMITS.attemptTimeoutMs` (10 minutes), mark the question `dispatched`, and only then hand it to Claude.
+  - **One at a time.** Reserve the oldest `queued` question: create an attempt with a UUID, a 4-character code (`newQuestionCode`) that no stored attempt has ever used, so a late reply naming an old code can never match a new attempt, and `deadline = now + LIMITS.attemptTimeoutMs` (10 minutes), mark the question `dispatched`, and only then hand it to Claude.
   - **`reply`** checks, in one transaction: the channel epoch, the code, that the attempt is the active one, the deadline, and the contact's permission and generation. Then it stores the answer, marks the question `answered` and enqueues `answer`.
   - **Timeout.** A missed deadline cancels the attempt in Claude and requeues the question; after 2 expired attempts the decision is `rejected`/`unanswered`.
   - **Recovery.** Taking the lock cancels every leftover active attempt and requeues every `dispatched` question.
   - **Connectivity.** Losing relays does not cancel the active question.
+  - **Resilience.** A failed dispatch step is logged and the next poll still runs. Handing a question to Claude, or telling Claude it was cancelled, is never awaited by the dispatch loop: a stuck stdio write cannot stop deadlines, fencing or shutdown.
 - **Outbox publishing.**
-  - Claim one row at a time with an owner id unique per claim (`randomUUID()`).
+  - Claim one row at a time with an owner id unique per claim (`randomUUID()`). An empty claim ends the round only when no due row is left (`hasDueOutbox`): a candidate that was abandoned or postponed must not block the rows behind it.
   - `authorizeOutboxItem` runs inside `claimDue`'s transaction and derives the generation from the rumor content and the inbox.
   - Mine the wrap, then `renewClaim`.
-  - Publish to the row's relays with a guard that takes `reservePublish` **once** per claim and afterwards only re-checks `stillClaimed`. A thrown error inside the guard (for example `SQLITE_BUSY`) counts as a refusal.
+  - Publish to the row's relays with a guard that takes `reservePublish` **once** per claim and afterwards only re-checks `stillClaimed`. A thrown error inside the guard (for example `SQLITE_BUSY`), or an aborted sync deadline, counts as a refusal.
   - At least one `OK true` → `markPublished`; `over_budget` → `postpone` 60 s; claim lost → leave the row; otherwise `markFailed`. When shutting down, postpone to now instead of counting a failure.
 - **Receiving.**
   - A wrap id enters `SeenIds` at precheck. If processing throws before anything is persisted, the id is deleted from `SeenIds`.
   - History recovery must not mark a window complete while a wrap from it is still in flight: when history meets a duplicate that is still queued or processing live, it waits for that processing and fails the window if the processing failed.
   - The live subscription only covers the last 2 days and 10 minutes, and relays cap it, so history re-runs periodically.
+  - Only a started (persistent) `Device` publishes in the background. `syncOnce` publishes once, inside its own deadline, and `close()` waits for a sync in progress.
 - **Retention.**
-  - Question text and stored rumors: 7 days after `rumor.created_at`. A question still waiting then becomes `rejected`/`unanswered`, without sending.
-  - Question decisions and request records: 9 days.
+  - Content (question text and stored answer rumors): 7 days after `rumor.created_at`. A question still waiting then becomes `rejected`/`unanswered`, without sending.
+  - Decisions (receipt and rejection rumors, question rows) and request records: 9 days.
   - Contact state: never expires.
-- **Notifications.** Only the channel notifies, and only when a new request is stored. The text is fixed (`AgentBridge: tienes solicitudes nuevas`) with no third-party data. It runs through `execFile` with no shell (macOS `osascript`, Linux `notify-send`), at most once every 10 minutes per identity, claimed in SQLite.
+- **Notifications.** Any process that stores a new request marks a notice as pending in SQLite. Only the channel shows it: at start, every minute, and right after it stores a request itself; listing requests clears the pending notice. The text is fixed (`AgentBridge: tienes solicitudes nuevas`) with no third-party data. It runs through `execFile` with no shell (macOS `osascript`, Linux `notify-send`), at most once every 10 minutes per identity, claimed in SQLite.
 - **Test cost.** Mining a 22-bit request takes seconds. Exactly one test crosses a `connect_request` over boards; every other test seeds contacts through the store functions.
 
 ## Plan-level decisions
@@ -87,11 +89,11 @@ Each one resolves something the spec leaves open. Reviewers may challenge them.
 - **P1 — Roles.** Processes handle messages by role. See Global Constraints; it follows from the spec's "cursores por tablero y por papel".
 - **P2 — `settings` table.** Schema v2 adds a `settings` key/value table for the responder's display name (sent in `connect_approved.name`), its own relays (`profile.relays`), and the notification slot. When no valid relays are stored, `DEFAULT_RELAYS` applies: the five relays that accepted, served and kept wraps in the 2026-09-16 live check. Plan 4's `setup` writes the profile.
 - **P3 — Request decisions keep their rumor.** Schema v2 adds `requests.decision_rumor_json`, so a retried `connect_request` gets the very same `connect_approved`/`connect_rejected` rumor. The 10-minute regeneration limit then applies to it.
-- **P4 — Empty relay hints.** A `connect_request` whose relay hints sanitize to nothing is ignored before anything is stored: nobody could ever be answered (plan 1 carried note). Replies to a retried, already-decided request go to the relays in that authenticated request.
-- **P5 — Channel lock liveness.** `process.kill(pid, 0)` plus `ps -o lstart= -p <pid>`, compared as an exact string. Anything that cannot be verified counts as alive, so a channel refuses to start rather than steal the lock.
+- **P4 — Empty relay hints.** A `connect_request` whose relay hints sanitize to nothing is ignored before anything is stored: nobody could ever be answered (plan 1 carried note). A retry reuses the same rumor, so its relays are the original ones; a new request (new `requestId`) from a key that is already approved or rejected is answered at the relays that new request carries.
+- **P5 — Channel lock liveness.** `process.kill(pid, 0)` plus `ps -o lstart= -p <pid>`, compared as an exact string. `ps` always runs with `TZ=UTC`, `LC_ALL=C` and `LANG=C`, so two processes with different time zones or locales read the same string for the same process. Anything that cannot be verified counts as alive, so a channel refuses to start rather than steal the lock.
 - **P6 — Cross-process changes.** The dispatcher polls SQLite every second to pick up questions admitted, and revocations made, by other processes (for example a CLI `revoke`). It is also woken directly by the channel's own device.
 - **P7 — Mining vs claim lifetime.** The publisher renews its claim after mining (`renewClaim` extends a claim still owned by the caller even after it lapsed, because any other claimer overwrites `claimed_by`). Plan 3 still owns making 22-bit mining faster.
-- **P8 — History schedule.** A running `Device` recovers history at start and every 15 minutes. `syncOnce` (for short-lived CLI commands in plan 3) runs history once with an abort signal, then publishes.
+- **P8 — History schedule.** A running `Device` recovers history at start and every 15 minutes. `syncOnce` (for short-lived CLI commands in plan 3) runs history once with an abort signal, then publishes once within the same deadline; processing during a sync never starts the background publisher.
 - **P9 — `Device` owns no files.** Callers open the identity and the store and pass them in, so the channel can take the lock before any network activity.
 
 ## Carried from plan 1 and resolved here (Task 1)
@@ -107,7 +109,7 @@ Each one resolves something the spec leaves open. Reviewers may challenge them.
 ```text
 packages/core/src/boards/connection.ts          + terminate(), heartbeatMs validation (Task 1)
 packages/core/src/boards/pool.ts                close() terminates connections (Task 1)
-packages/core/src/store/outbox.ts               claimDue per-row guard, renewClaim (Task 1)
+packages/core/src/store/outbox.ts               claimDue per-row guard, renewClaim (Task 1); hasDueOutbox (Task 8)
 packages/core/src/store/schema.ts               + migration v2: settings, inbox_questions, attempts, channel_lock, requests.decision_rumor_json (Task 2)
 packages/core/src/store/settings.ts             settings key/value, profile (name, own relays), DEFAULT_RELAYS, request-notice slot (Task 2)
 packages/core/src/process-identity.ts           currentProcess, processStartTime, isProcessAlive (Task 3)
@@ -119,10 +121,12 @@ packages/core/src/responder/inbound.ts          handleResponderMessage: step 10 
 packages/core/src/device/authorize.ts           authorizeOutboxItem (Task 8)
 packages/core/src/device/publisher.ts           publishDue (Task 8)
 packages/core/src/device/device.ts              Device: live, history, publishing and purge loops; syncOnce; in-flight wraps (Task 9)
+packages/core/src/errors.ts                     + describeError: safe one-line description of any thrown value (Task 9)
 packages/core/src/index.ts                      re-exports the new modules
 packages/channel/src/dispatcher.ts              Dispatcher (Task 10)
 packages/channel/src/channel.ts                 MCP server with the reply tool over the dispatcher (Task 11)
 packages/channel/src/notify.ts                  notifyNewRequests (Task 11)
+packages/channel/src/inbound.ts                 responderMessageHandler: wake the dispatcher, notify, log identity conflicts (Task 11)
 packages/channel/src/main.ts                    wiring: identity, store, lock, device, dispatcher, stdio (Task 11)
 
 packages/core/test/…                            one test file per new module
@@ -427,7 +431,8 @@ git commit -m "fix(core): restore the history page-size guard, terminate sockets
     - `inbox_questions`: PK `(sender_pubkey, question_id)`
     - `attempts`: PK `attempt_id`, FK to `inbox_questions` with `ON DELETE CASCADE`
     - `channel_lock`: single row, `id = 1`
-    - `requests.decision_rumor_json`
+    - `requests.decision_rumor_json` and `requests.decision_resent_at`
+    - `inbox_questions.regenerated_at` (the question's own regeneration clock)
   - `DEFAULT_RELAYS: readonly string[]`
   - `type Profile = { name: string | null; relays: string[] }`
   - `getSetting(store, key): string | null`
@@ -438,7 +443,9 @@ git commit -m "fix(core): restore the history page-size guard, terminate sockets
     - `relays` must keep at least one entry after `relayPolicy`.
     - Otherwise it throws `UserFacingError`.
   - `REQUEST_NOTICE_INTERVAL_SECONDS = 600`
-  - `claimRequestNoticeSlot(store, now): boolean`
+  - `markRequestNoticePending(store, now): void`: any process that stores a new request calls it.
+  - `clearRequestNoticePending(store, now): void`: listing requests calls it.
+  - `claimRequestNoticeSlot(store, now): boolean`: true only when a notice is pending and none was shown in the last 10 minutes. Claiming clears the pending mark.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -455,8 +462,10 @@ import {
   REQUEST_NOTICE_INTERVAL_SECONDS,
   UserFacingError,
   claimRequestNoticeSlot,
+  clearRequestNoticePending,
   getProfile,
   getSetting,
+  markRequestNoticePending,
   openStore,
   setProfile,
   setSetting,
@@ -482,7 +491,9 @@ describe('schema v2', () => {
     const tables = (store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((r) => r.name)
     expect(tables).toEqual(expect.arrayContaining(['settings', 'inbox_questions', 'attempts', 'channel_lock']))
     const columns = (store.db.prepare('PRAGMA table_info(requests)').all() as Array<{ name: string }>).map((c) => c.name)
-    expect(columns).toContain('decision_rumor_json')
+    expect(columns).toEqual(expect.arrayContaining(['decision_rumor_json', 'decision_resent_at']))
+    const inboxColumns = (store.db.prepare('PRAGMA table_info(inbox_questions)').all() as Array<{ name: string }>).map((c) => c.name)
+    expect(inboxColumns).toContain('regenerated_at')
   })
 
   it('deletes a question’s attempts together with the question', async () => {
@@ -549,11 +560,26 @@ describe('profile', () => {
 })
 
 describe('request notice slot', () => {
-  it('grants at most one notice per interval', async () => {
+  it('grants nothing while no request is waiting for a notice', async () => {
     const store = await newStore()
+    expect(claimRequestNoticeSlot(store, T0)).toBe(false)
+  })
+
+  it('grants one notice per pending mark, at most once per interval', async () => {
+    const store = await newStore()
+    markRequestNoticePending(store, T0)
     expect(claimRequestNoticeSlot(store, T0)).toBe(true)
+    expect(claimRequestNoticeSlot(store, T0 + 1)).toBe(false)
+    markRequestNoticePending(store, T0 + 2)
     expect(claimRequestNoticeSlot(store, T0 + REQUEST_NOTICE_INTERVAL_SECONDS - 1)).toBe(false)
     expect(claimRequestNoticeSlot(store, T0 + REQUEST_NOTICE_INTERVAL_SECONDS)).toBe(true)
+  })
+
+  it('forgets a pending notice once the requests were listed', async () => {
+    const store = await newStore()
+    markRequestNoticePending(store, T0)
+    clearRequestNoticePending(store, T0 + 1)
+    expect(claimRequestNoticeSlot(store, T0 + REQUEST_NOTICE_INTERVAL_SECONDS)).toBe(false)
   })
 })
 ```
@@ -573,6 +599,7 @@ In `packages/core/src/store/schema.ts`, add this second element to the `MIGRATIO
     name: 'responder: settings, inbox questions, attempts, channel lock',
     sql: `
 ALTER TABLE requests ADD COLUMN decision_rumor_json TEXT;
+ALTER TABLE requests ADD COLUMN decision_resent_at INTEGER;
 
 CREATE TABLE settings (
   key TEXT PRIMARY KEY,
@@ -595,6 +622,7 @@ CREATE TABLE inbox_questions (
   decision_rumor_json TEXT,
   expired_attempts INTEGER NOT NULL DEFAULT 0 CHECK (expired_attempts >= 0),
   received_at INTEGER NOT NULL,
+  regenerated_at INTEGER,
   decided_at INTEGER,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (sender_pubkey, question_id)
@@ -653,6 +681,7 @@ export const REQUEST_NOTICE_INTERVAL_SECONDS = 600
 const NAME_KEY = 'profile.name'
 const RELAYS_KEY = 'profile.relays'
 const REQUEST_NOTICE_KEY = 'notice.requests_at'
+const REQUEST_NOTICE_PENDING_KEY = 'notice.requests_pending'
 
 export function getSetting(store: Store, key: string): string | null {
   const row = store.db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | undefined
@@ -702,13 +731,25 @@ export function setProfile(store: Store, input: { name?: string; relays?: readon
   return getProfile(store)
 }
 
-// At most one new-request notification every 10 minutes per identity. The slot lives in SQLite so
-// every process on the machine shares it.
+// Whichever process stores a new request marks a notice as pending, so the channel can show it even
+// when a CLI sync stored the request first.
+export function markRequestNoticePending(store: Store, now: number): void {
+  setSetting(store, REQUEST_NOTICE_PENDING_KEY, '1', now)
+}
+
+export function clearRequestNoticePending(store: Store, now: number): void {
+  setSetting(store, REQUEST_NOTICE_PENDING_KEY, '0', now)
+}
+
+// At most one new-request notification every 10 minutes per identity, and only while one is pending.
+// Both live in SQLite, so every process on the machine shares them.
 export function claimRequestNoticeSlot(store: Store, now: number): boolean {
   return store.tx(() => {
+    if (getSetting(store, REQUEST_NOTICE_PENDING_KEY) !== '1') return false
     const last = Number(getSetting(store, REQUEST_NOTICE_KEY) ?? '0')
     if (Number.isFinite(last) && now - last < REQUEST_NOTICE_INTERVAL_SECONDS) return false
     setSetting(store, REQUEST_NOTICE_KEY, String(now), now)
+    clearRequestNoticePending(store, now)
     return true
   })
 }
@@ -746,7 +787,7 @@ git commit -m "feat(core): schema v2 for the responder and a profile with defaul
 - Produces:
   - `type ProcessIdentity = { pid: number; start: string }`
   - `type ProcessCommandRunner = (file: string, args: readonly string[]) => string`
-  - `processStartTime(pid, run?): string | null`: the output of `ps -o lstart= -p <pid>`, with whitespace collapsed. `null` when `ps` fails or prints nothing.
+  - `processStartTime(pid, run?): string | null`: the output of `ps -o lstart= -p <pid>`, with whitespace collapsed. `null` when `ps` fails or prints nothing. The default runner runs `ps` with `TZ=UTC`, `LC_ALL=C` and `LANG=C`, so the string does not depend on the reader's time zone or locale.
   - `currentProcess(run?): ProcessIdentity`: `start` is `'unverifiable'` when `ps` fails.
   - `isProcessAlive(holder, run?): boolean`:
     - `false` for a non-positive PID or when `kill(pid, 0)` reports `ESRCH`.
@@ -768,8 +809,13 @@ Create `packages/core/test/process-identity.test.ts`:
 
 ```ts
 import { execFile } from 'node:child_process'
+import { join, resolve } from 'node:path'
+import { promisify } from 'node:util'
 import { describe, expect, it } from 'vitest'
 import { currentProcess, isProcessAlive, processStartTime, type ProcessCommandRunner } from '@agentbridge/core'
+
+const run = promisify(execFile)
+const repoRoot = resolve(import.meta.dirname, '../../..')
 
 const failingRunner: ProcessCommandRunner = () => {
   throw new Error('ps not available')
@@ -782,6 +828,16 @@ describe('process identity', () => {
     expect(self.start).not.toBe('unverifiable')
     expect(self.start).toBe(processStartTime(process.pid))
     expect(isProcessAlive(self)).toBe(true)
+  })
+
+  it('reads the same start time whatever time zone or locale the reading process uses', async () => {
+    const script = `import { processStartTime } from ${JSON.stringify(join(repoRoot, 'packages/core/src/process-identity.ts'))}
+console.log(processStartTime(${process.pid}))`
+    const { stdout } = await run(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
+      cwd: repoRoot,
+      env: { ...process.env, TZ: 'Asia/Tokyo', LC_ALL: 'ja_JP.UTF-8', LANG: 'ja_JP.UTF-8' },
+    })
+    expect(stdout.trim()).toBe(processStartTime(process.pid))
   })
 
   it('treats a PID now used by a different process start as gone', () => {
@@ -947,8 +1003,16 @@ export type ProcessCommandRunner = (file: string, args: readonly string[]) => st
 
 const UNVERIFIABLE = 'unverifiable'
 
+// `ps` prints start times in the reader's time zone and locale. Two processes started with different
+// TZ or LANG would read different strings for the same process and wrongly call a live owner dead, so
+// every reader asks for the same fixed representation.
 const runCommand: ProcessCommandRunner = (file, args) =>
-  execFileSync(file, [...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2_000 })
+  execFileSync(file, [...args], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+    timeout: 2_000,
+    env: { ...process.env, TZ: 'UTC', LC_ALL: 'C', LANG: 'C' },
+  })
 
 // The start time `ps` reports for a process, as an opaque string. With the PID it names exactly one
 // process: a PID the system later reuses belongs to a process with a different start time.
@@ -1098,8 +1162,10 @@ git commit -m "feat(core): exclusive channel lock with process identity, growing
   - `type RejectReason = 'expired' | 'limit' | 'unanswered' | 'stale_generation'`
   - `type InboxQuestion = { senderPubkey; questionId; rumorId; rumorCreatedAt; generation; text: string | null; state: InboxState; admitted: boolean; decision: 'answer' | 'rejected' | null; rejectReason: RejectReason | null; expiredAttempts: number; receivedAt: number; decidedAt: number | null }`
   - `type AdmissionInput = { identity: Identity; senderPubkey: string; questionId: string; rumorId: string; rumorCreatedAt: number; generation: number; text: string; now: number }`
-  - `type AdmissionOutcome = { kind: 'queued' } | { kind: 'rejected'; reason: RejectReason } | { kind: 'regenerated' } | { kind: 'dropped'; reason: 'unrelated' | 'conflict' | 'answered_after_revocation' | 'no_relays' }`
+  - `type AdmissionOutcome = { kind: 'queued' } | { kind: 'rejected'; reason: RejectReason } | { kind: 'regenerated' } | { kind: 'regeneration_too_soon' } | { kind: 'dropped'; reason: 'unrelated' | 'conflict' | 'answered_after_revocation' | 'no_relays' | 'purged' }`
   - `admitQuestion(store, input): AdmissionOutcome`: the spec's admission, in one transaction (see Global Constraints).
+    - A known question is resent at most once every `NOSTR.regenerationIntervalSeconds`, counted from its own `regenerated_at` (or its arrival). The clock lives on the question, so it still holds after revocation or the outbox purge deleted its rows.
+    - `dropped`/`purged` when nothing stored is left to resend.
   - `getInboxQuestion(store, senderPubkey, questionId): InboxQuestion | null`
   - `rejectQuestion(store, { identity, senderPubkey, questionId, reason, now, send }): boolean`:
     - Stores the final `rejected` decision and its rumor on an undecided question.
@@ -1107,7 +1173,7 @@ git commit -m "feat(core): exclusive channel lock with process identity, growing
     - Enqueues the rumor only when `send` is true.
     - Returns `false` when the question does not exist or already has a decision.
   - `rejectUnansweredFor(store, { identity, senderPubkey, now }): number`: every `queued` or `dispatched` question from that sender gets `stale_generation`, without sending.
-  - `purgeInbox(store, now): { rejectedWaiting: number; contentCleared: number; forgotten: number }`
+  - `purgeInbox(store, now): { rejectedWaiting: number; contentCleared: number; forgotten: number }`: at 7 days it clears question text and answer rumors (content); receipt and rejection rumors are decisions and stay until the row is forgotten at 9 days.
   - Outbox labels used: `receipt`, `answer`, `rejected:<reason>`. All responses use policy `once` and 16 bits.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1186,12 +1252,32 @@ describe('admitQuestion', () => {
     approveAsker()
     admitQuestion(store, question(1))
     const [receipt] = outbox()
-    expect(admitQuestion(store, question(1, { now: T0 + 60 }))).toEqual({ kind: 'regenerated' })
+    expect(admitQuestion(store, question(1, { now: T0 + 60 }))).toEqual({ kind: 'regeneration_too_soon' })
     expect(outbox()).toHaveLength(1)
     const [claimed] = claimDue(store, { owner: 'o', now: T0, limit: 10, authorize: () => true })
     markPublished(store, { recipient: asker.publicKey, rumorId: claimed!.rumorId, owner: 'o', now: T0 })
     expect(admitQuestion(store, question(1, { now: T0 + NOSTR.regenerationIntervalSeconds }))).toEqual({ kind: 'regenerated' })
     expect(outbox()).toEqual([{ ...receipt!, state: 'pending' }])
+  })
+
+  it('keeps the regeneration limit even when its outbox rows were deleted', () => {
+    approveAsker()
+    admitQuestion(store, question(1))
+    store.db.prepare('DELETE FROM outbox').run()
+    expect(admitQuestion(store, question(1, { now: T0 + 60 }))).toEqual({ kind: 'regeneration_too_soon' })
+    expect(outbox()).toEqual([])
+    const later = T0 + NOSTR.regenerationIntervalSeconds
+    expect(admitQuestion(store, question(1, { now: later }))).toEqual({ kind: 'regenerated' })
+    expect(outbox().map((r) => r.label)).toEqual(['receipt'])
+    store.db.prepare('DELETE FROM outbox').run()
+    expect(admitQuestion(store, question(1, { now: later + 60 }))).toEqual({ kind: 'regeneration_too_soon' })
+  })
+
+  it('says so when nothing stored is left to resend', () => {
+    approveAsker()
+    admitQuestion(store, question(1))
+    store.db.prepare('UPDATE inbox_questions SET receipt_rumor_json = NULL').run()
+    expect(admitQuestion(store, question(1, { now: T0 + NOSTR.regenerationIntervalSeconds }))).toEqual({ kind: 'dropped', reason: 'purged' })
   })
 
   it('drops a different rumor that reuses a known question id', () => {
@@ -1227,7 +1313,7 @@ describe('admitQuestion', () => {
     for (let n = 1; n <= LIMITS.maxOpenTicketsPerPair; n++) expect(admitQuestion(store, question(n))).toEqual({ kind: 'queued' })
     expect(admitQuestion(store, question(6))).toEqual({ kind: 'rejected', reason: 'limit' })
     store.db.prepare("UPDATE inbox_questions SET state = 'answered', decision = 'answer' WHERE question_id = ?").run(uuid(1))
-    expect(admitQuestion(store, question(6, { now: T0 + 30 }))).toEqual({ kind: 'regenerated' })
+    expect(admitQuestion(store, question(6, { now: T0 + NOSTR.regenerationIntervalSeconds }))).toEqual({ kind: 'regenerated' })
     expect(getInboxQuestion(store, asker.publicKey, uuid(6))?.rejectReason).toBe('limit')
   })
 
@@ -1248,7 +1334,7 @@ describe('admitQuestion', () => {
     store.db.prepare("UPDATE inbox_questions SET state = 'answered', decision = 'answer', decision_rumor_json = '{}' WHERE question_id = ?").run(uuid(1))
     revokeInbound(store, { pubkey: asker.publicKey, now: T0 + 10 })
     expect(admitQuestion(store, question(1, { now: T0 + 20 }))).toEqual({ kind: 'dropped', reason: 'answered_after_revocation' })
-    expect(admitQuestion(store, question(2, { generation: 5, now: T0 + 20 }))).toEqual({ kind: 'regenerated' })
+    expect(admitQuestion(store, question(2, { generation: 5, now: T0 + NOSTR.regenerationIntervalSeconds }))).toEqual({ kind: 'regenerated' })
   })
 })
 
@@ -1272,14 +1358,18 @@ describe('rejectUnansweredFor', () => {
 })
 
 describe('purgeInbox', () => {
-  it('ends waiting questions and clears content at 7 days, and forgets decisions at 9', () => {
+  it('clears content at 7 days but keeps decisions, which are still resent until they are forgotten at 9', () => {
     approveAsker()
     admitQuestion(store, question(1))
+    admitQuestion(store, question(2, { generation: 5 }))
     const sevenDays = T0 + NOSTR.contentRetentionSeconds
     expect(purgeInbox(store, sevenDays - 1)).toEqual({ rejectedWaiting: 0, contentCleared: 0, forgotten: 0 })
     expect(purgeInbox(store, sevenDays)).toEqual({ rejectedWaiting: 1, contentCleared: 1, forgotten: 0 })
     expect(getInboxQuestion(store, asker.publicKey, uuid(1))).toMatchObject({ state: 'rejected', rejectReason: 'unanswered', text: null })
-    expect(purgeInbox(store, T0 + NOSTR.decisionRetentionSeconds)).toEqual({ rejectedWaiting: 0, contentCleared: 0, forgotten: 1 })
+    store.db.prepare('DELETE FROM outbox').run()
+    expect(admitQuestion(store, question(2, { generation: 5, now: sevenDays + 1 }))).toEqual({ kind: 'regenerated' })
+    expect(messages()).toEqual([{ v: 1, type: 'rejected', questionId: uuid(2), reason: 'stale_generation' }])
+    expect(purgeInbox(store, T0 + NOSTR.decisionRetentionSeconds)).toEqual({ rejectedWaiting: 0, contentCleared: 0, forgotten: 2 })
     expect(getInboxQuestion(store, asker.publicKey, uuid(1))).toBeNull()
   })
 })
@@ -1338,7 +1428,8 @@ export type AdmissionOutcome =
   | { kind: 'queued' }
   | { kind: 'rejected'; reason: RejectReason }
   | { kind: 'regenerated' }
-  | { kind: 'dropped'; reason: 'unrelated' | 'conflict' | 'answered_after_revocation' | 'no_relays' }
+  | { kind: 'regeneration_too_soon' }
+  | { kind: 'dropped'; reason: 'unrelated' | 'conflict' | 'answered_after_revocation' | 'no_relays' | 'purged' }
 
 type InboxRow = {
   sender_pubkey: string
@@ -1355,6 +1446,7 @@ type InboxRow = {
   decision_rumor_json: string | null
   expired_attempts: number
   received_at: number
+  regenerated_at: number | null
   decided_at: number | null
   updated_at: number
 }
@@ -1388,9 +1480,10 @@ export function getInboxQuestion(store: Store, senderPubkey: string, questionId:
 }
 
 // Stored response rumors are resent unchanged, so the asker recognizes a repeat by its rumor id.
-// Nothing is sent without relays (a contact that never gave usable ones) or after the content purge.
-function resend(store: Store, input: { recipient: string; relays: readonly string[]; rumorJson: string | null; label: string; now: number }): void {
-  if (input.rumorJson === null || input.relays.length === 0) return
+// Nothing is sent without relays (a contact that never gave usable ones) or once the rumor was purged.
+// Returns whether anything was handed to the outbox.
+function resend(store: Store, input: { recipient: string; relays: readonly string[]; rumorJson: string | null; label: string; now: number }): boolean {
+  if (input.rumorJson === null || input.relays.length === 0) return false
   enqueue(store, {
     recipient: input.recipient,
     rumor: JSON.parse(input.rumorJson) as Rumor,
@@ -1400,6 +1493,7 @@ function resend(store: Store, input: { recipient: string; relays: readonly strin
     policy: 'once',
     now: input.now,
   })
+  return true
 }
 
 export function rejectQuestion(
@@ -1452,19 +1546,24 @@ export function admitQuestion(store: Store, input: AdmissionInput): AdmissionOut
       if (existing.rumor_id !== input.rumorId) return { kind: 'dropped', reason: 'conflict' }
       const relays = contact?.relays ?? []
       const stillAllowed = contact?.state === 'approved' && contact.generation === existing.generation
-      if (!stillAllowed) {
-        if (existing.decision === 'answer') return { kind: 'dropped', reason: 'answered_after_revocation' }
-        // Revocation decides every unanswered question in its own transaction; this only covers a
-        // contact whose permission changed some other way.
-        if (existing.decision === null) {
-          rejectQuestion(store, { identity: input.identity, senderPubkey: input.senderPubkey, questionId: input.questionId, reason: 'stale_generation', now: input.now, send: false })
-        }
-        const decided = selectRow(store, input.senderPubkey, input.questionId)!
-        resend(store, { recipient: input.senderPubkey, relays, rumorJson: decided.decision_rumor_json, label: decisionLabel(decided), now: input.now })
-        return { kind: 'regenerated' }
+      if (!stillAllowed && existing.decision === 'answer') return { kind: 'dropped', reason: 'answered_after_revocation' }
+      // The regeneration clock lives on the question: revocation and the 7-day outbox purge delete
+      // outbox rows, and with them the outbox's own regeneration limit.
+      if (input.now - (existing.regenerated_at ?? existing.received_at) < NOSTR.regenerationIntervalSeconds) {
+        return { kind: 'regeneration_too_soon' }
       }
-      resend(store, { recipient: input.senderPubkey, relays, rumorJson: existing.receipt_rumor_json, label: 'receipt', now: input.now })
-      resend(store, { recipient: input.senderPubkey, relays, rumorJson: existing.decision_rumor_json, label: decisionLabel(existing), now: input.now })
+      // Revocation decides every unanswered question in its own transaction; this only covers a
+      // contact whose permission changed some other way.
+      if (!stillAllowed && existing.decision === null) {
+        rejectQuestion(store, { identity: input.identity, senderPubkey: input.senderPubkey, questionId: input.questionId, reason: 'stale_generation', now: input.now, send: false })
+      }
+      const current = selectRow(store, input.senderPubkey, input.questionId)!
+      const receiptSent = stillAllowed && resend(store, { recipient: input.senderPubkey, relays, rumorJson: current.receipt_rumor_json, label: 'receipt', now: input.now })
+      const decisionSent = resend(store, { recipient: input.senderPubkey, relays, rumorJson: current.decision_rumor_json, label: decisionLabel(current), now: input.now })
+      if (!receiptSent && !decisionSent) return { kind: 'dropped', reason: 'purged' }
+      store.db
+        .prepare('UPDATE inbox_questions SET regenerated_at = ?, updated_at = ? WHERE sender_pubkey = ? AND question_id = ?')
+        .run(input.now, input.now, input.senderPubkey, input.questionId)
       return { kind: 'regenerated' }
     }
 
@@ -1509,9 +1608,10 @@ export function rejectUnansweredFor(store: Store, input: { identity: Identity; s
   })
 }
 
-// Question text and stored rumors follow the 7-day content retention by the question's own date. A
-// question still waiting then can never be answered, so it is closed as unanswered without sending
-// (its rumor is gone with the content). Decisions are forgotten after 9 days.
+// Content (question text and answer rumors) follows the 7-day retention by the question's own date. A
+// question still waiting then can never be answered, so it is closed as unanswered without sending.
+// Receipts and rejections are decisions, not content: they stay, and can still be resent, until the
+// row is forgotten after 9 days.
 export function purgeInbox(store: Store, now: number): { rejectedWaiting: number; contentCleared: number; forgotten: number } {
   return store.tx(() => {
     const contentHorizon = now - NOSTR.contentRetentionSeconds
@@ -1530,8 +1630,9 @@ export function purgeInbox(store: Store, now: number): { rejectedWaiting: number
       .run(now, now, contentHorizon)
     const contentCleared = store.db
       .prepare(
-        `UPDATE inbox_questions SET text = NULL, receipt_rumor_json = NULL, decision_rumor_json = NULL, updated_at = ?
-         WHERE rumor_created_at <= ? AND (text IS NOT NULL OR receipt_rumor_json IS NOT NULL OR decision_rumor_json IS NOT NULL)`,
+        `UPDATE inbox_questions
+           SET text = NULL, decision_rumor_json = CASE WHEN decision = 'answer' THEN NULL ELSE decision_rumor_json END, updated_at = ?
+         WHERE rumor_created_at <= ? AND (text IS NOT NULL OR (decision = 'answer' AND decision_rumor_json IS NOT NULL))`,
       )
       .run(now, contentHorizon)
     const forgotten = store.db.prepare('DELETE FROM inbox_questions WHERE rumor_created_at <= ?').run(now - NOSTR.decisionRetentionSeconds)
@@ -1582,6 +1683,7 @@ git commit -m "feat(core): question admission with stored final decisions, revoc
   - `type ReserveOutcome = { kind: 'reserved'; attempt: ActiveAttempt } | { kind: 'busy' } | { kind: 'empty' } | { kind: 'fenced' }`
   - `reserveNextQuestion(store, { epoch, nowMs, attemptTimeoutMs, identity, newCode?, newAttemptId? }): ReserveOutcome`
     - It skips, and rejects with `stale_generation` without sending, any queued question whose contact is no longer approved with its generation.
+    - The code it hands out was never used by any stored attempt (it draws again, up to 50 times), so a late reply naming an old code can never be taken as the answer to a newer question.
   - `getAttemptState(store, attemptId): { state: AttemptState; cancelReason: AttemptCancelReason | null } | null`
   - `type ExpireOutcome = { kind: 'requeued' } | { kind: 'rejected_unanswered' } | { kind: 'not_due' } | { kind: 'not_active' } | { kind: 'fenced' }`
   - `expireAttempt(store, { epoch, attemptId, nowMs, identity }): ExpireOutcome`
@@ -1668,6 +1770,20 @@ describe('reserveNextQuestion', () => {
     })
     expect(getInboxQuestion(store, asker.publicKey, uuid(1))?.state).toBe('dispatched')
     expect(reserve()).toEqual({ kind: 'busy' })
+  })
+
+  it('never reuses a code an earlier attempt still holds', () => {
+    admit(1)
+    admit(2, T0 + 1)
+    const draws = ['AAAA', 'AAAA', 'BBBB']
+    const reserveWith = () =>
+      reserveNextQuestion(store, { epoch, nowMs: T0_MS, attemptTimeoutMs: TIMEOUT, identity: responder, newCode: () => draws.shift() ?? 'ZZZZ' })
+    const first = reserveWith()
+    if (first.kind !== 'reserved') throw new Error('expected a reservation')
+    expect(answer({ code: first.attempt.code })).toMatchObject({ kind: 'answered' })
+    const second = reserveWith()
+    expect(second).toMatchObject({ kind: 'reserved', attempt: { code: 'BBBB', questionId: uuid(2) } })
+    expect(answer({ code: 'AAAA' })).toEqual({ kind: 'wrong_code', activeCode: 'BBBB' })
   })
 
   it('reports an empty queue', () => {
@@ -1867,7 +1983,15 @@ export function reserveNextQuestion(
         continue
       }
       const attemptId = (input.newAttemptId ?? randomUUID)()
-      const code = (input.newCode ?? newQuestionCode)()
+      // Attempts live as long as their question (9 days). A code none of them ever used can never be
+      // matched by a late reply that was meant for an older question.
+      const draw = input.newCode ?? newQuestionCode
+      const codeTaken = store.db.prepare('SELECT 1 FROM attempts WHERE code = ? LIMIT 1')
+      let code = draw()
+      for (let tries = 1; codeTaken.get(code) !== undefined; tries++) {
+        if (tries >= 50) throw new Error('dispatch: could not draw an unused question code')
+        code = draw()
+      }
       const deadlineMs = input.nowMs + input.attemptTimeoutMs
       store.db
         .prepare(
@@ -2001,17 +2125,17 @@ git commit -m "feat(core): fenced dispatch transactions for reserving, expiring 
 **Interfaces:**
 - Consumes:
   - plan 1: `recordIncomingRequest`, `approveRequest`, `rejectRequest`, `revokeInbound`, `purgeRequests`, `listPendingRequests`, `findContactByLocalName`, `getContact`, `type Contact`, `enqueue`, `deleteUnclaimedFor`, `createRumor`, `NOSTR`
-  - `getProfile` (Task 2)
+  - `getProfile`, `clearRequestNoticePending`, `markRequestNoticePending`, `claimRequestNoticeSlot` (Task 2)
   - `rejectUnansweredFor` (Task 4)
   - `CLI_COMMAND`
 - Produces:
   - `REQUEST_ID_LENGTH = 8`
   - `type PendingRequestView = { id: string; pubkey: string; declaredName: string; note: string; requestedAt: number }`
-  - `listRequests(store, now): PendingRequestView[]`: purges first; ids are the first 8 characters of the requester's key.
+  - `listRequests(store, now): PendingRequestView[]`: purges first and clears the pending request notice (the person is looking at the list); ids are the first 8 characters of the requester's key.
   - `approveConnection(store, { identity, idPrefix, now }): { contact: Contact; changed: boolean }`
   - `rejectConnection(store, { identity, idPrefix, now }): { contact: Contact; changed: boolean }`
   - `revokeConnection(store, { identity, name, now }): { contact: Contact; changed: boolean; rejectedQuestions: number }`
-  - `regenerateRequestDecision(store, { identity, senderPubkey, requestId, replyRelays, now }): 'enqueued' | 'nothing'`
+  - `regenerateRequestDecision(store, { identity, senderPubkey, requestId, replyRelays, now }): 'enqueued' | 'too_soon' | 'nothing'`: a decision already sent is resent at most once every `NOSTR.regenerationIntervalSeconds`, counted from `requests.decision_resent_at` (or `decided_at`), so the limit survives revocation deleting its outbox rows. A decision never sent yet goes out at once.
   - Outbox labels: `connect_approved`, `connect_rejected`, `connect_revoked` (policy `once`, 16 bits).
   - Spanish `UserFacingError`s:
     - an identifier that is not hex
@@ -2035,9 +2159,11 @@ import {
   admitQuestion,
   approveConnection,
   claimDue,
+  claimRequestNoticeSlot,
   getContact,
   getInboxQuestion,
   listRequests,
+  markRequestNoticePending,
   openStore,
   recordIncomingRequest,
   regenerateRequestDecision,
@@ -2078,6 +2204,13 @@ describe('listRequests', () => {
       { id: asker.publicKey.slice(0, 8), pubkey: asker.publicKey, declaredName: 'Beto', note: 'Soy del equipo', requestedAt: T0 },
     ])
     expect(listRequests(store, T0 + NOSTR.requestMaxAgeSeconds)).toEqual([])
+  })
+
+  it('clears the pending request notice, because the person is looking at the list', () => {
+    requestFrom()
+    markRequestNoticePending(store, T0)
+    listRequests(store, T0 + 1)
+    expect(claimRequestNoticeSlot(store, T0 + 2)).toBe(false)
   })
 })
 
@@ -2161,9 +2294,16 @@ describe('regenerateRequestDecision', () => {
     store.db.prepare('DELETE FROM outbox').run()
     const newRelays = ['wss://nuevo.example.com']
     expect(regenerateRequestDecision(store, { identity: responder, senderPubkey: asker.publicKey, requestId: REQUEST_ID, replyRelays: newRelays, now: T0 + 60 })).toBe(
-      'enqueued',
+      'too_soon',
     )
+    expect(outbox()).toEqual([])
+    const later = T0 + NOSTR.regenerationIntervalSeconds
+    expect(regenerateRequestDecision(store, { identity: responder, senderPubkey: asker.publicKey, requestId: REQUEST_ID, replyRelays: newRelays, now: later })).toBe('enqueued')
     expect(outbox()).toEqual([{ ...original, relays: JSON.stringify(newRelays) }])
+    store.db.prepare('DELETE FROM outbox').run()
+    expect(regenerateRequestDecision(store, { identity: responder, senderPubkey: asker.publicKey, requestId: REQUEST_ID, replyRelays: newRelays, now: later + 60 })).toBe(
+      'too_soon',
+    )
   })
 
   it('creates and stores an approval for a request recorded as approved after the fact', () => {
@@ -2217,16 +2357,23 @@ import {
 import type { Store } from '../store/db'
 import { rejectUnansweredFor } from '../store/inbox'
 import { deleteUnclaimedFor, enqueue } from '../store/outbox'
-import { getProfile } from '../store/settings'
+import { clearRequestNoticePending, getProfile } from '../store/settings'
 
 export const REQUEST_ID_LENGTH = 8
 
 export type PendingRequestView = { id: string; pubkey: string; declaredName: string; note: string; requestedAt: number }
 
-type RequestRecord = { decision: 'approved' | 'rejected' | null; decision_generation: number | null; decision_rumor_json: string | null }
+type RequestRecord = {
+  decision: 'approved' | 'rejected' | null
+  decision_generation: number | null
+  decision_rumor_json: string | null
+  decided_at: number | null
+  decision_resent_at: number | null
+}
 
 export function listRequests(store: Store, now: number): PendingRequestView[] {
   purgeRequests(store, now)
+  clearRequestNoticePending(store, now)
   return listPendingRequests(store).map((contact) => ({
     id: contact.pubkey.slice(0, REQUEST_ID_LENGTH),
     pubkey: contact.pubkey,
@@ -2320,16 +2467,20 @@ export function revokeConnection(
 
 // A retried connect_request that was already decided gets the same decision again: the stored rumor
 // when there is one, or one created now (and stored) for a request recorded as approved after the
-// fact. It goes to the relays in that authenticated retry when it brought any.
+// fact. It goes to the relays of the request being answered. A decision already sent is resent at most
+// once per regeneration interval; the clock lives on the request record, so deleting outbox rows
+// (revocation, purge) cannot reset it.
 export function regenerateRequestDecision(
   store: Store,
   input: { identity: Identity; senderPubkey: string; requestId: string; replyRelays: readonly string[]; now: number },
-): 'enqueued' | 'nothing' {
+): 'enqueued' | 'too_soon' | 'nothing' {
   return store.tx(() => {
     const record = store.db
-      .prepare('SELECT decision, decision_generation, decision_rumor_json FROM requests WHERE sender_pubkey = ? AND request_id = ?')
+      .prepare('SELECT decision, decision_generation, decision_rumor_json, decided_at, decision_resent_at FROM requests WHERE sender_pubkey = ? AND request_id = ?')
       .get(input.senderPubkey, input.requestId) as RequestRecord | undefined
     if (!record?.decision) return 'nothing'
+    const lastSent = record.decision_resent_at ?? record.decided_at
+    if (record.decision_rumor_json !== null && lastSent !== null && input.now - lastSent < NOSTR.regenerationIntervalSeconds) return 'too_soon'
     const relays = input.replyRelays.length > 0 ? [...input.replyRelays] : (getContact(store, input.senderPubkey, 'inbound')?.relays ?? [])
     if (relays.length === 0) return 'nothing'
     let rumorJson = record.decision_rumor_json
@@ -2360,6 +2511,7 @@ export function regenerateRequestDecision(
       label: record.decision === 'approved' ? 'connect_approved' : 'connect_rejected',
       now: input.now,
     })
+    store.db.prepare('UPDATE requests SET decision_resent_at = ? WHERE sender_pubkey = ? AND request_id = ?').run(input.now, input.senderPubkey, input.requestId)
     return 'enqueued'
   })
 }
@@ -2398,13 +2550,15 @@ git commit -m "feat(core): approve, reject and revoke connections with stored de
   - `recordIncomingRequest`, `type IncomingRequestOutcome` (plan 1)
   - `admitQuestion`, `type AdmissionOutcome` (Task 4)
   - `regenerateRequestDecision` (Task 6)
+  - `markRequestNoticePending` (Task 2)
   - `store.relayPolicy`
 - Produces:
   - `type ResponderInboundOutcome = { kind: 'ignored'; reason: 'other_role' | 'request_too_old' | 'no_relays' } | { kind: 'request'; outcome: IncomingRequestOutcome['kind'] } | { kind: 'question'; outcome: AdmissionOutcome }`
   - `handleResponderMessage(store, { identity, opened, now }): ResponderInboundOutcome`:
     - It is synchronous, and every write happens in one transaction.
     - A `connect_request` older than 7 days, or whose relay hints sanitize to nothing, is ignored before anything is stored.
-    - A retried request that was already approved or rejected gets its decision regenerated, sent to the retry's relays.
+    - A new request is stored and marks a request notice as pending (`markRequestNoticePending`), in the same transaction.
+    - A retried request that was already approved or rejected gets its stored decision regenerated (within the regeneration limit). A new request from an already approved key is answered at the relays that new request carries.
     - `question` goes to admission.
     - Every other type is `other_role`, and nothing is stored.
 
@@ -2420,6 +2574,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   NOSTR,
   approveConnection,
+  claimRequestNoticeSlot,
   getContact,
   handleResponderMessage,
   openStore,
@@ -2458,9 +2613,10 @@ const outboxCount = () => Number(store.db.prepare('SELECT count(*) AS n FROM out
 const tableCount = (table: string) => Number(store.db.prepare(`SELECT count(*) AS n FROM ${table}`).get()?.n)
 
 describe('handleResponderMessage', () => {
-  it('stores a new connection request and recognizes its duplicate', () => {
+  it('stores a new connection request, marks a notice as pending, and recognizes its duplicate', () => {
     const message = opened(request())
     expect(handle(message)).toEqual({ kind: 'request', outcome: 'stored' })
+    expect(claimRequestNoticeSlot(store, T0)).toBe(true)
     expect(handle(message)).toEqual({ kind: 'request', outcome: 'duplicate' })
     expect(getContact(store, asker.publicKey, 'inbound')).toMatchObject({ state: 'requested', declaredName: 'Beto', relays: ['wss://asker.example.com'] })
   })
@@ -2472,15 +2628,28 @@ describe('handleResponderMessage', () => {
     expect(tableCount('requests')).toBe(0)
   })
 
-  it('answers a retried approved request with the same approval rumor, at the retry’s relays', () => {
+  it('answers a retried approved request with the same approval rumor, once the regeneration limit allows', () => {
     const first = opened(request())
     handle(first)
     approveConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 })
     const approval = store.db.prepare('SELECT rumor_id FROM outbox').get()?.rumor_id
     store.db.prepare('DELETE FROM outbox').run()
-    const retry = opened(request(['wss://otro.example.com']), { rumorId: first.rumor.id })
-    expect(handle(retry, T0 + 60)).toEqual({ kind: 'request', outcome: 'approved_already' })
-    expect(store.db.prepare('SELECT rumor_id, relays FROM outbox').all()).toEqual([{ rumor_id: approval, relays: JSON.stringify(['wss://otro.example.com']) }])
+    // A retry is the very same rumor in a new wrap: same content, same relays.
+    expect(handle(first, T0 + 60)).toEqual({ kind: 'request', outcome: 'approved_already' })
+    expect(outboxCount()).toBe(0)
+    expect(handle(first, T0 + NOSTR.regenerationIntervalSeconds)).toEqual({ kind: 'request', outcome: 'approved_already' })
+    expect(store.db.prepare('SELECT rumor_id, relays FROM outbox').all()).toEqual([{ rumor_id: approval, relays: JSON.stringify(['wss://asker.example.com']) }])
+  })
+
+  it('answers a new request from an already approved key at the relays that request carries', () => {
+    handle(opened(request()))
+    approveConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 })
+    store.db.prepare('DELETE FROM outbox').run()
+    const again = opened(request(['wss://otro.example.com'], uuid(2)))
+    expect(handle(again, T0 + 60)).toEqual({ kind: 'request', outcome: 'approved_already' })
+    const [row] = store.db.prepare("SELECT relays, json_extract(rumor_json, '$.content') AS content FROM outbox").all() as Array<{ relays: string; content: string }>
+    expect(row!.relays).toBe(JSON.stringify(['wss://otro.example.com']))
+    expect(JSON.parse(row!.content)).toMatchObject({ type: 'connect_approved', requestId: uuid(2), generation: 1 })
   })
 
   it('answers a retried rejected request with the same rejection', () => {
@@ -2488,7 +2657,7 @@ describe('handleResponderMessage', () => {
     handle(first)
     rejectConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 })
     store.db.prepare('DELETE FROM outbox').run()
-    expect(handle(opened(request(), { rumorId: first.rumor.id }), T0 + 60)).toEqual({ kind: 'request', outcome: 'rejected_already' })
+    expect(handle(first, T0 + NOSTR.regenerationIntervalSeconds)).toEqual({ kind: 'request', outcome: 'rejected_already' })
     expect(outboxCount()).toBe(1)
   })
 
@@ -2543,6 +2712,7 @@ import { NOSTR } from '../nostr-constants'
 import { recordIncomingRequest, type IncomingRequestOutcome } from '../store/contacts'
 import type { Store } from '../store/db'
 import { admitQuestion, type AdmissionOutcome } from '../store/inbox'
+import { markRequestNoticePending } from '../store/settings'
 import { regenerateRequestDecision } from './connections'
 
 export type ResponderInboundOutcome =
@@ -2572,6 +2742,7 @@ export function handleResponderMessage(store: Store, input: { identity: Identity
         relays,
         now: input.now,
       })
+      if (outcome.kind === 'stored') markRequestNoticePending(store, input.now)
       if (outcome.kind === 'approved_already' || outcome.kind === 'rejected_already') {
         regenerateRequestDecision(store, { identity: input.identity, senderPubkey: opened.senderPubkey, requestId: message.requestId, replyRelays: relays, now: input.now })
       }
@@ -2623,6 +2794,7 @@ git commit -m "feat(core): route opened messages for the responder role"
 **Files:**
 - Create: `packages/core/src/device/authorize.ts`
 - Create: `packages/core/src/device/publisher.ts`
+- Modify: `packages/core/src/store/outbox.ts` (add `hasDueOutbox`)
 - Modify: `packages/core/src/index.ts`
 - Test: `packages/core/test/device-authorize.test.ts`, `packages/core/test/device-publisher.test.ts`
 
@@ -2641,7 +2813,11 @@ git commit -m "feat(core): route opened messages for the responder role"
     - Content that is not a protocol message is refused.
   - `type PublishReport = { published: number; failed: number; postponed: number; lost: number }`
   - `type PublishDueInput = { store: Store; identity: Identity; pool: BoardPool; authorize?: (store: Store, item: OutboxItem) => boolean; now?: () => number; signal?: AbortSignal; limit?: number; log?: (line: string) => void }`
-  - `publishDue(input): Promise<PublishReport>`: one row per claim, with a fresh owner id for each claim.
+  - `hasDueOutbox(store, now): boolean` (in `store/outbox.ts`): whether any pending row is due and not currently claimed.
+  - `publishDue(input): Promise<PublishReport>`:
+    - One row per claim, with a fresh owner id for each claim.
+    - An empty claim ends the round only when `hasDueOutbox` says nothing due is left: an abandoned or postponed candidate must not block the rows behind it.
+    - The write guard refuses once `signal` is aborted, so nothing is written after a sync deadline.
 
 - [ ] **Step 1: Write the failing authorization tests**
 
@@ -2860,6 +3036,33 @@ describe('publishDue', () => {
     expect(row(store).state).toBe('abandoned')
   })
 
+  it('keeps going past a row it had to abandon', async () => {
+    const { boards, store, pool, now } = await setup()
+    const revoked = createRumor({ v: 1, type: 'connect_revoked', generation: 2 }, me, now)
+    enqueue(store, { recipient: asker.publicKey, rumor: revoked, label: 'connect_revoked', powBits: 16, relays: boards.map((b) => b.url), policy: 'once', now })
+    expect(await publishDue({ store, identity: me, pool })).toEqual({ published: 1, failed: 0, postponed: 0, lost: 0 })
+    expect(store.db.prepare('SELECT label, state FROM outbox ORDER BY rowid').all()).toEqual([
+      { label: 'receipt', state: 'abandoned' },
+      { label: 'connect_revoked', state: 'published' },
+    ])
+  })
+
+  it('writes nothing once the deadline passed while it was connecting', async () => {
+    const { store, now } = await setup()
+    const controller = new AbortController()
+    // A pool that reaches the write only after the deadline has passed.
+    const lateWriter = {
+      publish: async (relays: readonly string[], _event: NostrEvent, beforeSend: () => boolean) => {
+        controller.abort()
+        return beforeSend() ? { accepted: [...relays], rejected: [] } : { accepted: [], rejected: relays.map((relay) => ({ relay, reason: 'error: publish guard refused' })) }
+      },
+    } as unknown as BoardPool
+    const report = await publishDue({ store, identity: me, pool: lateWriter, authorize: allowAll, signal: controller.signal, now: () => now })
+    expect(report).toEqual({ published: 0, failed: 0, postponed: 1, lost: 0 })
+    expect(store.db.prepare('SELECT count(*) AS n FROM publish_log').get()?.n).toBe(0)
+    expect(row(store)).toMatchObject({ state: 'pending', next_attempt_at: now, claimed_by: null })
+  })
+
   it('does nothing once aborted', async () => {
     const { boards, store, pool } = await setup()
     const controller = new AbortController()
@@ -2876,7 +3079,22 @@ describe('publishDue', () => {
 Run: `npx vitest run packages/core/test/device-authorize.test.ts packages/core/test/device-publisher.test.ts`
 Expected: FAIL. `authorizeOutboxItem` and `publishDue` are not exported.
 
-- [ ] **Step 4: Implement authorization**
+- [ ] **Step 4: Add `hasDueOutbox` to the outbox store**
+
+In `packages/core/src/store/outbox.ts`, add after `stillClaimed`:
+
+```ts
+// Whether a claim could still find work: a pending row that is due and not claimed by anyone right now.
+export function hasDueOutbox(store: Store, now: number): boolean {
+  return (
+    store.db
+      .prepare("SELECT 1 FROM outbox WHERE state = 'pending' AND next_attempt_at <= ? AND (claimed_until IS NULL OR claimed_until <= ?) LIMIT 1")
+      .get(now, now) !== undefined
+  )
+}
+```
+
+- [ ] **Step 5: Implement authorization**
 
 Create `packages/core/src/device/authorize.ts`:
 
@@ -2925,7 +3143,7 @@ export function authorizeOutboxItem(store: Store, item: OutboxItem): boolean {
 }
 ```
 
-- [ ] **Step 5: Implement the publisher**
+- [ ] **Step 6: Implement the publisher**
 
 Create `packages/core/src/device/publisher.ts`:
 
@@ -2940,6 +3158,7 @@ import { nowSeconds } from '../nostr-constants'
 import type { Store } from '../store/db'
 import {
   claimDue,
+  hasDueOutbox,
   markFailed,
   markPublished,
   postpone,
@@ -2978,7 +3197,11 @@ export async function publishDue(input: PublishDueInput): Promise<PublishReport>
   for (let round = 0; round < limit && !input.signal?.aborted; round++) {
     const owner = randomUUID()
     const [item] = claimDue(input.store, { owner, now: now(), limit: 1, authorize: (candidate) => authorize(input.store, candidate) })
-    if (!item) break
+    if (!item) {
+      // An empty claim may only mean that the first candidate was abandoned or postponed.
+      if (hasDueOutbox(input.store, now())) continue
+      break
+    }
     const ref = { recipient: item.recipient, rumorId: item.rumorId, owner }
 
     let wrap: NostrEvent
@@ -3005,6 +3228,7 @@ export async function publishDue(input: PublishDueInput): Promise<PublishReport>
     // claim. Anything thrown here (SQLITE_BUSY included) refuses the write.
     const guard: { reservation: 'reserved' | 'claim_lost' | 'over_budget' | null } = { reservation: null }
     const beforeSend = (): boolean => {
+      if (input.signal?.aborted) return false
       try {
         const at = now()
         if (guard.reservation === null) {
@@ -3050,15 +3274,15 @@ export * from './device/authorize'
 export * from './device/publisher'
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [ ] **Step 7: Run the tests to verify they pass**
 
 Run: `npx vitest run packages/core/test/device-authorize.test.ts packages/core/test/device-publisher.test.ts && npm run typecheck`
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add packages/core/src/device/authorize.ts packages/core/src/device/publisher.ts packages/core/src/index.ts packages/core/test/device-authorize.test.ts packages/core/test/device-publisher.test.ts
+git add packages/core/src/device/authorize.ts packages/core/src/device/publisher.ts packages/core/src/store/outbox.ts packages/core/src/index.ts packages/core/test/device-authorize.test.ts packages/core/test/device-publisher.test.ts
 git commit -m "feat(core): authorize outgoing messages by current permission and publish them with one budget slot each"
 ```
 
@@ -3067,8 +3291,9 @@ git commit -m "feat(core): authorize outgoing messages by current permission and
 
 **Files:**
 - Create: `packages/core/src/device/device.ts`
+- Modify: `packages/core/src/errors.ts` (add `describeError`)
 - Modify: `packages/core/src/index.ts`
-- Test: `packages/core/test/device.test.ts`
+- Test: `packages/core/test/device.test.ts`, `packages/core/test/errors.test.ts`
 
 **Interfaces:**
 - Consumes:
@@ -3077,6 +3302,11 @@ git commit -m "feat(core): authorize outgoing messages by current permission and
   - Task 4: `purgeInbox`
   - Task 8: `publishDue`, `type PublishReport`
 - Produces:
+  - `describeError(err: unknown): string` (in `errors.ts`):
+    - a `UserFacingError` gives its message;
+    - any other `Error` gives only its name, plus its code when that is a short upper-case identifier (`SqliteError (SQLITE_BUSY)`-style);
+    - anything else gives `non-error value thrown`.
+    - Every log line about an unexpected failure in the device, dispatcher, channel and entry point uses it, because messages from SQLite, zod or a handler can carry decrypted content, keys or paths.
   - `type InboundHandler<T> = (store: Store, input: { identity: Identity; opened: OpenedMessage; now: number }) => T`
   - `type DeviceOptions<T> = { store: Store; identity: Identity; role: CursorRole; handleMessage: InboundHandler<T>; onMessage?: (opened: OpenedMessage, outcome: T) => void; createSocket?: SocketFactory; now?: () => number; log?: (line: string) => void; pool?: Partial<Pick<PoolOptions, 'timeoutMs' | 'heartbeatMs' | 'reconnectDelaysMs'>>; historyIntervalMs?: number; publishIntervalMs?: number; purgeIntervalMs?: number }`
   - `type HistoryRun = { relay: string; completed: number; incomplete: number; events: number; failed: boolean }`
@@ -3084,9 +3314,9 @@ git commit -m "feat(core): authorize outgoing messages by current permission and
   - `class Device<T>`:
     - `readonly pool: BoardPool`
     - `start(): void`: live subscription on the profile's relays; history now and every `historyIntervalMs` (default 15 min); publishing every `publishIntervalMs` (default 5 s); purge now and every `purgeIntervalMs` (default 1 h).
-    - `wakePublisher(): void`
-    - `syncOnce({ maxMs? }): Promise<SyncReport>`: one purge, one history pass and one publishing pass. No new work starts after `maxMs` (default 10 000); work already in flight ends within the pool timeouts.
-    - `close(): Promise<void>`: clears timers, aborts mining, closes the pool (which drains the live queue) and waits for publishing.
+    - `wakePublisher(): void`: does nothing until `start()` ran. Only a persistent device publishes in the background.
+    - `syncOnce({ maxMs? }): Promise<SyncReport>`: one purge, one history pass and one publishing pass, all under one deadline (`maxMs`, default 10 000). Messages processed during the sync never start the background publisher. Mining and every write check the deadline; a connection or AUTH already in flight ends within the pool timeouts.
+    - `close(): Promise<void>`: clears timers, aborts mining and any sync in progress, closes the pool (which drains the live queue), and waits for publishing and for that sync.
   - Receiving contract:
     - Precheck registers the wrap as in flight.
     - Processing opens it, runs `handleMessage`, then `onMessage`. A throwing `onMessage` is only logged.
@@ -3205,11 +3435,11 @@ describe('Device', () => {
     expect(outcomes).toEqual([{ kind: 'question', outcome: { kind: 'queued' } }])
   })
 
-  it('forgets a wrap whose processing failed, so a later pass processes it again', async () => {
+  it('forgets a wrap whose processing failed, so a later pass processes it again, and never logs the error text', async () => {
     let failures = 1
     const { mine, store, device, logs } = await setup({
       handle: (s, input) => {
-        if (failures-- > 0) throw new Error('disk full')
+        if (failures-- > 0) throw new Error('disk full near PRIVATE_DECRYPTED_CANARY')
         return handleResponderMessage(s, input)
       },
     })
@@ -3218,6 +3448,7 @@ describe('Device', () => {
     expect(first.history.every((run) => run.failed)).toBe(true)
     expect(inboxCount(store)).toBe(0)
     expect(logs.some((line) => line.includes('history failed'))).toBe(true)
+    expect(logs.join('\n')).not.toContain('PRIVATE_DECRYPTED_CANARY')
     await device.syncOnce({ maxMs: 5_000 })
     expect(inboxCount(store)).toBe(1)
   })
@@ -3245,6 +3476,17 @@ describe('Device', () => {
     expect(historyDone).toBe(true)
   })
 
+  it('publishes only inside a sync, never through a background publisher left running after it', async () => {
+    const { mine, theirs, device } = await setup()
+    mine.inject(await questionWrap(uuid(14)))
+    const report = await device.syncOnce({ maxMs: 10_000 })
+    expect(report.published.published).toBe(1)
+    expect((device as unknown as { publishing: Promise<void> | null }).publishing).toBeNull()
+    const events = theirs.events.length
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(theirs.events.length).toBe(events)
+  })
+
   it('stops starting work once a sync runs out of time', async () => {
     const { device } = await setup({ mine: { ignoreReads: true } })
     const started = Date.now()
@@ -3263,12 +3505,49 @@ describe('Device', () => {
 })
 ```
 
+Create `packages/core/test/errors.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest'
+import { UserFacingError, describeError } from '@agentbridge/core'
+
+describe('describeError', () => {
+  it('keeps a message written for people', () => {
+    expect(describeError(new UserFacingError('No hay ninguna solicitud con ese identificador.'))).toBe('No hay ninguna solicitud con ese identificador.')
+  })
+
+  it('reports only the type and code of anything else, never its message', () => {
+    const sqlite = Object.assign(new Error('UNIQUE constraint failed near PRIVATE_DECRYPTED_CANARY'), { code: 'ERR_SQLITE_ERROR' })
+    expect(describeError(sqlite)).toBe('Error (ERR_SQLITE_ERROR)')
+    expect(describeError(new TypeError('secret key 0123abcd'))).toBe('TypeError')
+    expect(describeError(Object.assign(new Error('x'), { code: 'not a code; PRIVATE' }))).toBe('Error')
+    expect(describeError('PRIVATE_DECRYPTED_CANARY')).toBe('non-error value thrown')
+  })
+})
+```
+
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `npx vitest run packages/core/test/device.test.ts`
-Expected: FAIL. `Device` is not exported.
+Run: `npx vitest run packages/core/test/device.test.ts packages/core/test/errors.test.ts`
+Expected: FAIL. `Device` and `describeError` are not exported.
 
 - [ ] **Step 3: Implement**
+
+Append to `packages/core/src/errors.ts`:
+
+```ts
+// For logs and tool results about unexpected failures. Messages from SQLite, zod or a message handler
+// can carry decrypted third-party content, keys or file paths, so only the error's type and a short
+// error code are reported. A UserFacingError was written to be shown and keeps its message.
+export function describeError(err: unknown): string {
+  if (err instanceof UserFacingError) return err.message
+  if (err instanceof Error) {
+    const code = (err as { code?: unknown }).code
+    return typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,39}$/.test(code) ? `${err.name} (${code})` : err.name
+  }
+  return 'non-error value thrown'
+}
+```
 
 Create `packages/core/src/device/device.ts`:
 
@@ -3279,6 +3558,7 @@ import { sanitizeRelayText } from '../boards/relay-text'
 import type { SocketFactory } from '../boards/socket'
 import { SeenIds } from '../envelope/dedupe'
 import { openWrap, precheckWrap, type OpenedMessage, type PrecheckedWrap } from '../envelope/open'
+import { describeError } from '../errors'
 import type { Identity } from '../identity'
 import { nowSeconds } from '../nostr-constants'
 import { purgeRequests } from '../store/contacts'
@@ -3311,7 +3591,6 @@ export type SyncReport = { history: HistoryRun[]; published: PublishReport; time
 
 type InFlight = { promise: Promise<void>; resolve(): void; reject(err: unknown): void }
 
-const messageOf = (err: unknown) => sanitizeRelayText(err instanceof Error ? err.message : String(err))
 
 function inFlight(): InFlight {
   let resolve!: () => void
@@ -3340,6 +3619,8 @@ export class Device<T> {
   private publishing: Promise<void> | null = null
   private publishAgain = false
   private historyRunning: Promise<HistoryRun[]> | null = null
+  private syncing: Promise<SyncReport> | null = null
+  private started = false
   private closed = false
 
   constructor(private readonly options: DeviceOptions<T>) {
@@ -3350,6 +3631,7 @@ export class Device<T> {
 
   start(): void {
     if (this.closed || this.live) return
+    this.started = true
     const relays = getProfile(this.options.store).relays
     this.live = this.pool.subscribeLive<PrecheckedWrap>(relays, {
       precheck: (raw) => this.precheck(raw),
@@ -3363,8 +3645,10 @@ export class Device<T> {
     this.every(this.options.purgeIntervalMs ?? 60 * 60_000, () => this.purge())
   }
 
+  // Background publishing belongs to a started (persistent) device only. A short-lived client publishes
+  // inside syncOnce, under its deadline, so nothing keeps writing after the sync returned.
   wakePublisher(): void {
-    if (this.closed) return
+    if (this.closed || !this.started) return
     if (this.publishing) {
       this.publishAgain = true
       return
@@ -3375,7 +3659,7 @@ export class Device<T> {
         try {
           await publishDue({ store: this.options.store, identity: this.options.identity, pool: this.pool, now: this.now, signal: this.shutdown.signal, log: this.log })
         } catch (err) {
-          this.log(`publishing failed: ${messageOf(err)}`)
+          this.log(`publishing failed (${describeError(err)})`)
         }
       } while (this.publishAgain && !this.closed)
     })().finally(() => {
@@ -3383,8 +3667,15 @@ export class Device<T> {
     })
   }
 
-  async syncOnce(options: { maxMs?: number } = {}): Promise<SyncReport> {
-    const maxMs = options.maxMs ?? 10_000
+  syncOnce(options: { maxMs?: number } = {}): Promise<SyncReport> {
+    const run = this.runSync(options.maxMs ?? 10_000)
+    this.syncing = run
+    return run.finally(() => {
+      if (this.syncing === run) this.syncing = null
+    })
+  }
+
+  private async runSync(maxMs: number): Promise<SyncReport> {
     const deadline = new AbortController()
     const onShutdown = () => deadline.abort()
     this.shutdown.signal.addEventListener('abort', onShutdown, { once: true })
@@ -3420,6 +3711,7 @@ export class Device<T> {
     await this.live?.close()
     await this.publishing
     await this.historyRunning?.catch(() => [])
+    await this.syncing?.catch(() => undefined)
   }
 
   private every(ms: number, run: () => void): void {
@@ -3447,7 +3739,7 @@ export class Device<T> {
         try {
           this.options.onMessage?.(opened, outcome)
         } catch (err) {
-          this.log(`message callback failed: ${messageOf(err)}`)
+          this.log(`message callback failed (${describeError(err)})`)
         }
         this.wakePublisher()
       }
@@ -3497,7 +3789,7 @@ export class Device<T> {
           })
           return { relay, completed: result.completed, incomplete: result.incomplete, events: result.events, failed: false }
         } catch (err) {
-          this.log(`${sanitizeRelayText(relay)}: history failed: ${messageOf(err)}`)
+          this.log(`${sanitizeRelayText(relay)}: history failed (${describeError(err)})`)
           return { relay, completed: 0, incomplete: 0, events: 0, failed: true }
         }
       }),
@@ -3516,7 +3808,7 @@ export class Device<T> {
       try {
         run()
       } catch (err) {
-        this.log(`purge of ${name} failed: ${messageOf(err)}`)
+        this.log(`purge of ${name} failed (${describeError(err)})`)
       }
     }
   }
@@ -3537,7 +3829,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add packages/core/src/device/device.ts packages/core/src/index.ts packages/core/test/device.test.ts
+git add packages/core/src/device/device.ts packages/core/src/errors.ts packages/core/src/index.ts packages/core/test/device.test.ts packages/core/test/errors.test.ts
 git commit -m "feat(core): device runtime that receives, recovers history, publishes and purges for one role"
 ```
 
@@ -3551,7 +3843,7 @@ git commit -m "feat(core): device runtime that receives, recovers history, publi
 **Interfaces:**
 - Consumes:
   - `reserveNextQuestion`, `getAttemptState`, `expireAttempt`, `answerQuestion`, `type AnswerOutcome`, `type AttemptCancelReason` (Task 5)
-  - `LIMITS.attemptTimeoutMs`, `type Confidence`, `type Identity`, `type Store`
+  - `LIMITS.attemptTimeoutMs`, `describeError` (Task 9), `type Confidence`, `type Identity`, `type Store`
 - Produces:
   - `type QuestionNotice = { code: string; fromName: string; text: string }`
   - `type CancelReason = 'timeout' | AttemptCancelReason` (that is, `'timeout' | 'revoked' | 'recovered' | 'purged'`)
@@ -3566,7 +3858,8 @@ git commit -m "feat(core): device runtime that receives, recovers history, publi
     1. For the tracked attempt: cancel it in Claude when its state became `cancelled`; expire it when its deadline passed, then cancel it in Claude with reason `timeout`, and call `onEnqueued` if the expiry produced `rejected`/`unanswered`; forget it when it is no longer active.
     2. When nothing is tracked, reserve and deliver the next question.
     3. A `fenced` result from any store call stops the dispatcher and calls `onFenced`.
-    4. The next tick runs after `pollMs` (default 1000), or at the deadline if that comes sooner.
+    4. The next tick runs after `pollMs` (default 1000), or at the deadline if that comes sooner. A tick that throws is logged with `describeError` and the next poll is still scheduled.
+    5. `deliver` and `cancel` are started, never awaited: a stdio write stuck on back-pressure must not stop deadlines, fencing or `stop()`. Their failures are logged.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3711,6 +4004,59 @@ describe('Dispatcher', () => {
     expect(reply(d, delivered[0]!.code).kind).toBe('cancelled')
   })
 
+  it('keeps polling after a store error', async () => {
+    admit(1)
+    let failures = 1
+    const flaky: Store = {
+      ...store,
+      tx: <T>(fn: () => T): T => {
+        if (failures-- > 0) throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR' })
+        return store.tx(fn)
+      },
+    }
+    const d = new Dispatcher({
+      store: flaky,
+      identity: responder,
+      epoch,
+      deliver: async (q) => {
+        delivered.push(q)
+      },
+      cancel: async () => {},
+      pollMs: 10,
+      nowMs: () => clock.ms,
+    })
+    dispatchers.push(d)
+    d.start()
+    await until(() => delivered.length === 1)
+  })
+
+  it('keeps deadlines and shutdown working while a write to Claude never completes', async () => {
+    admit(1)
+    const stuck: QuestionNotice[] = []
+    const d = new Dispatcher({
+      store,
+      identity: responder,
+      epoch,
+      deliver: (q) => {
+        stuck.push(q)
+        return new Promise<void>(() => {})
+      },
+      cancel: async (code, reason) => {
+        cancelled.push({ code, reason })
+      },
+      attemptTimeoutMs: 1_000,
+      pollMs: 10,
+      nowMs: () => clock.ms,
+    })
+    dispatchers.push(d)
+    d.start()
+    await until(() => stuck.length === 1)
+    clock.ms += 1_000
+    await until(() => cancelled.length === 1)
+    expect(cancelled[0]).toEqual({ code: stuck[0]!.code, reason: 'timeout' })
+    await d.stop()
+  })
+
   it('stops when another channel took the lock', async () => {
     const d = dispatcher()
     d.start()
@@ -3737,6 +4083,7 @@ Create `packages/channel/src/dispatcher.ts`:
 import {
   LIMITS,
   answerQuestion,
+  describeError,
   expireAttempt,
   getAttemptState,
   reserveNextQuestion,
@@ -3830,8 +4177,22 @@ export class Dispatcher {
     if (this.timer) clearTimeout(this.timer)
     this.timer = setTimeout(() => {
       this.timer = null
-      this.chain = this.chain.then(() => this.tick()).catch((err: unknown) => this.log(`dispatch failed: ${err instanceof Error ? err.message : String(err)}`))
+      this.chain = this.chain
+        .then(() => this.tick())
+        .catch((err: unknown) => this.log(`dispatch failed (${describeError(err)})`))
+        .finally(() => {
+          // A tick that threw never reached its own scheduling: the next poll must still happen.
+          if (!this.stopped && this.timer === null) this.schedule(this.pollMs)
+        })
     }, Math.max(0, delayMs))
+  }
+
+  // Handing something to Claude goes through stdio, which waits for the pipe to drain. It is started,
+  // never awaited, so a stuck write cannot hold up deadlines, fencing or stop().
+  private notify(what: string, send: () => Promise<void>): void {
+    void Promise.resolve()
+      .then(send)
+      .catch((err: unknown) => this.log(`could not ${what} (${describeError(err)})`))
   }
 
   private fence(): void {
@@ -3852,13 +4213,13 @@ export class Dispatcher {
       const attempt = getAttemptState(store, tracked.attemptId)
       if (attempt?.state === 'cancelled') {
         this.tracked = null
-        await this.options.cancel(tracked.code, attempt.cancelReason ?? 'revoked')
+        this.notify('tell Claude a question was cancelled', () => this.options.cancel(tracked.code, attempt.cancelReason ?? 'revoked'))
       } else if (attempt?.state === 'active' && tracked.deadlineMs <= this.nowMs()) {
         const expired = expireAttempt(store, { epoch, attemptId: tracked.attemptId, nowMs: this.nowMs(), identity })
         if (expired.kind === 'fenced') return this.fence()
         if (expired.kind === 'requeued' || expired.kind === 'rejected_unanswered') {
           this.tracked = null
-          await this.options.cancel(tracked.code, 'timeout')
+          this.notify('tell Claude a question timed out', () => this.options.cancel(tracked.code, 'timeout'))
           if (expired.kind === 'rejected_unanswered') this.options.onEnqueued?.()
         }
       } else if (attempt?.state !== 'active') {
@@ -3872,12 +4233,8 @@ export class Dispatcher {
       if (reserved.kind === 'reserved') {
         const { attempt } = reserved
         this.tracked = { attemptId: attempt.attemptId, code: attempt.code, deadlineMs: attempt.deadlineMs }
-        try {
-          await this.options.deliver({ code: attempt.code, fromName: attempt.fromName, text: attempt.text })
-        } catch (err) {
-          // The attempt stays active: its deadline brings the question back if Claude never got it.
-          this.log(`could not hand a question to Claude: ${err instanceof Error ? err.message : String(err)}`)
-        }
+        // If Claude never gets it, the attempt's deadline brings the question back.
+        this.notify('hand a question to Claude', () => this.options.deliver({ code: attempt.code, fromName: attempt.fromName, text: attempt.text }))
       }
     }
 
@@ -3905,10 +4262,11 @@ git commit -m "feat(channel): dispatcher that hands Claude one question at a tim
 **Files:**
 - Modify (rewrite): `packages/channel/src/channel.ts`
 - Create: `packages/channel/src/notify.ts`
+- Create: `packages/channel/src/inbound.ts`
 - Modify (rewrite): `packages/channel/src/main.ts`
 - Delete: `packages/channel/src/relay-client.ts`, `packages/channel/src/inflight.ts`, `packages/channel/test/inflight.test.ts`
 - Modify (rewrite): `packages/channel/test/channel.test.ts`, `packages/channel/test/bundle.test.ts`
-- Test: `packages/channel/test/notify.test.ts`
+- Test: `packages/channel/test/notify.test.ts`, `packages/channel/test/inbound.test.ts`
 
 **Interfaces:**
 - Consumes:
@@ -3920,6 +4278,7 @@ git commit -m "feat(channel): dispatcher that hands Claude one question at a tim
   - `Device` (Task 9)
   - `Dispatcher` (Task 10)
   - `ConfidenceSchema`, `LIMITS`, `loadIdentity`, `loadOrCreateIdentity`, `agentbridgeHome`, `CLI_COMMAND`
+  - `describeError` (Task 9), `markRequestNoticePending` (Task 2), `type ResponderInboundOutcome` (Task 7)
 - Produces:
   - `CHANNEL_INSTRUCTIONS: string`
     - Questions arrive as `<channel source="agentbridge" code="XXXX" from_name="...">question</channel>`.
@@ -3927,21 +4286,26 @@ git commit -m "feat(channel): dispatcher that hands Claude one question at a tim
   - `type ChannelBackend = { reply(args: ReplyArgs): AnswerOutcome }`
   - `replyResult(outcome: AnswerOutcome, typedCode: string): { text: string; isError: boolean }`: Spanish text for every outcome.
   - `cancelNotice(code: string, reason: CancelReason): string`
-  - `createChannelServer(backend, { version? }): { server: Server; deliverQuestion(question: QuestionNotice): Promise<void>; cancelQuestion(code: string, reason: CancelReason): Promise<void> }`
+  - `createChannelServer(backend, { version?, log? }): { server: Server; deliverQuestion(question: QuestionNotice): Promise<void>; cancelQuestion(code: string, reason: CancelReason): Promise<void> }`: an exception thrown by `backend.reply` becomes a generic Spanish tool error, and only `describeError` of it is logged.
   - `REQUEST_NOTICE_TEXT = 'AgentBridge: tienes solicitudes nuevas'`
   - `type NoticeRunner = (file: string, args: readonly string[]) => Promise<void>`
   - `notifyNewRequests({ store, now, platform?, run?, log? }): Promise<boolean>`
     - macOS: `osascript -e 'display notification "<text>" with title "AgentBridge"'`
     - Linux: `notify-send AgentBridge <text>`
     - Other platforms: nothing, and no notice slot is claimed.
+    - Needs a pending notice (`markRequestNoticePending`, set by whichever process stored the request).
     - Returns `true` only when a notice was actually shown.
+  - `responderMessageHandler({ wakeDispatcher, notifyRequests, log })` (in `inbound.ts`) returns the `Device` `onMessage` callback. It:
+    - wakes the dispatcher for a queued question;
+    - tries the request notice for a stored request;
+    - logs identity conflicts (a request or question id reused with other content) with identifiers only: the entity id and the first 8 characters of the sender's key.
   - `packages/channel/src/main.ts`, the bundle entry `plugins/agentbridge/dist/server.js`, runs these steps in order:
     1. Load the identity. If there is none, exit 1 with a Spanish hint to run `setup`.
     2. Open the store.
     3. Take the channel lock. If a live channel already holds it, exit 1 with a Spanish message.
     4. Wire the channel server, the `Device` (role `responder`) and the `Dispatcher`.
     5. Connect stdio.
-    6. Start the device and the dispatcher.
+    6. Start the device and the dispatcher, and try the request notice (a CLI may have stored requests while the channel was closed). It is tried again every minute.
   - Shutdown (SIGTERM, SIGINT or stdin end) stops the dispatcher, closes the device, releases the lock and closes the store. A fenced channel exits 1 without releasing.
 
 - [ ] **Step 1: Rewrite the channel server tests**
@@ -3960,6 +4324,8 @@ type Note = { method: string; params?: { content?: string; meta?: Record<string,
 
 let calls: ReplyArgs[]
 let nextOutcome: AnswerOutcome
+let failWith: Error | null
+let logs: string[]
 let client: Client
 let notes: Note[]
 let channel: ReturnType<typeof createChannelServer>
@@ -3967,12 +4333,18 @@ let channel: ReturnType<typeof createChannelServer>
 beforeEach(async () => {
   calls = []
   nextOutcome = { kind: 'answered', fromName: 'beto', code: 'ABCD' }
-  channel = createChannelServer({
-    reply: (args) => {
-      calls.push(args)
-      return nextOutcome
+  failWith = null
+  logs = []
+  channel = createChannelServer(
+    {
+      reply: (args) => {
+        calls.push(args)
+        if (failWith) throw failWith
+        return nextOutcome
+      },
     },
-  })
+    { log: (line) => logs.push(line) },
+  )
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
   client = new Client({ name: 'fake-claude', version: '0.0.0' })
   notes = []
@@ -4028,6 +4400,15 @@ describe('channel MCP server', () => {
     expect(calls).toEqual([])
   })
 
+  it('turns an unexpected backend error into a generic tool error that does not repeat the error text', async () => {
+    failWith = new Error('disk I/O error near PRIVATE_DECRYPTED_CANARY')
+    const result = await reply({ code: 'ABCD', answer: 'x', source: 'y', confidence: 'seguro' })
+    expect(result.isError).toBe(true)
+    expect(textOf(result)).toMatch(/error interno/)
+    expect(textOf(result)).not.toContain('PRIVATE_DECRYPTED_CANARY')
+    expect(logs).toEqual(['reply failed (Error)'])
+  })
+
   it('turns every refusal into a Spanish tool error', async () => {
     nextOutcome = { kind: 'wrong_code', activeCode: 'WXYZ' }
     const wrong = await reply({ code: 'ABCD', answer: 'x', source: 'y', confidence: 'seguro' })
@@ -4068,7 +4449,7 @@ import { mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { REQUEST_NOTICE_INTERVAL_SECONDS, openStore, type Store } from '@agentbridge/core'
+import { REQUEST_NOTICE_INTERVAL_SECONDS, markRequestNoticePending, openStore, type Store } from '@agentbridge/core'
 import { REQUEST_NOTICE_TEXT, notifyNewRequests } from '../src/notify'
 
 const T0 = 2_000_000_000
@@ -4085,24 +4466,34 @@ beforeEach(async () => {
 afterEach(() => store.close())
 
 describe('notifyNewRequests', () => {
+  it('does nothing while no request is waiting for a notice', async () => {
+    expect(await notifyNewRequests({ store, now: T0, platform: 'darwin', run: recordRun })).toBe(false)
+    expect(runs).toEqual([])
+  })
+
   it('shows a fixed-text macOS notification without a shell', async () => {
+    markRequestNoticePending(store, T0)
     expect(await notifyNewRequests({ store, now: T0, platform: 'darwin', run: recordRun })).toBe(true)
     expect(runs).toEqual([{ file: 'osascript', args: ['-e', `display notification "${REQUEST_NOTICE_TEXT}" with title "AgentBridge"`] }])
   })
 
   it('uses notify-send on Linux', async () => {
+    markRequestNoticePending(store, T0)
     expect(await notifyNewRequests({ store, now: T0, platform: 'linux', run: recordRun })).toBe(true)
     expect(runs).toEqual([{ file: 'notify-send', args: ['AgentBridge', REQUEST_NOTICE_TEXT] }])
   })
 
   it('shows at most one notice every 10 minutes', async () => {
+    markRequestNoticePending(store, T0)
     await notifyNewRequests({ store, now: T0, platform: 'darwin', run: recordRun })
+    markRequestNoticePending(store, T0 + 1)
     expect(await notifyNewRequests({ store, now: T0 + REQUEST_NOTICE_INTERVAL_SECONDS - 1, platform: 'darwin', run: recordRun })).toBe(false)
     expect(await notifyNewRequests({ store, now: T0 + REQUEST_NOTICE_INTERVAL_SECONDS, platform: 'darwin', run: recordRun })).toBe(true)
     expect(runs).toHaveLength(2)
   })
 
   it('does nothing, and keeps the slot free, on other platforms', async () => {
+    markRequestNoticePending(store, T0)
     expect(await notifyNewRequests({ store, now: T0, platform: 'win32', run: recordRun })).toBe(false)
     expect(await notifyNewRequests({ store, now: T0, platform: 'darwin', run: recordRun })).toBe(true)
   })
@@ -4112,6 +4503,7 @@ describe('notifyNewRequests', () => {
     const failing = async () => {
       throw Object.assign(new Error('spawn notify-send ENOENT'), { code: 'ENOENT' })
     }
+    markRequestNoticePending(store, T0)
     expect(await notifyNewRequests({ store, now: T0, platform: 'linux', run: failing, log: (line) => logs.push(line) })).toBe(false)
     expect(logs).toEqual(['request notice failed (ENOENT)'])
   })
@@ -4122,20 +4514,75 @@ describe('notifyNewRequests', () => {
 })
 ```
 
+Create `packages/channel/test/inbound.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest'
+import { NOSTR, type Message, type OpenedMessage, type ResponderInboundOutcome } from '@agentbridge/core'
+import { responderMessageHandler } from '../src/inbound'
+
+const sender = 'ab'.repeat(32)
+const opened = (message: Message): OpenedMessage => ({
+  ok: true,
+  wrapId: 'c'.repeat(64),
+  senderPubkey: sender,
+  rumor: { id: 'd'.repeat(64), pubkey: sender, created_at: 1, kind: NOSTR.rumorKind, tags: [], content: JSON.stringify(message) },
+  message,
+  powBits: message.type === 'connect_request' ? 22 : 16,
+})
+const question: Message = { v: 1, type: 'question', questionId: '00000000-0000-4000-8000-000000000001', generation: 1, text: 'texto privado' }
+const request: Message = { v: 1, type: 'connect_request', requestId: '00000000-0000-4000-8000-000000000002', name: 'Nombre Privado', note: 'nota privada', relays: ['wss://r.example.com'] }
+
+function recorder() {
+  const calls: string[] = []
+  const handle = responderMessageHandler({ wakeDispatcher: () => calls.push('wake'), notifyRequests: () => calls.push('notify'), log: (line) => calls.push(line) })
+  return { calls, handle: (message: Message, outcome: ResponderInboundOutcome) => handle(opened(message), outcome) }
+}
+
+describe('responderMessageHandler', () => {
+  it('wakes the dispatcher for a queued question and tries the notice for a stored request', () => {
+    const { calls, handle } = recorder()
+    handle(question, { kind: 'question', outcome: { kind: 'queued' } })
+    handle(request, { kind: 'request', outcome: 'stored' })
+    expect(calls).toEqual(['wake', 'notify'])
+  })
+
+  it('logs identity conflicts with identifiers only', () => {
+    const { calls, handle } = recorder()
+    handle(question, { kind: 'question', outcome: { kind: 'dropped', reason: 'conflict' } })
+    handle(request, { kind: 'request', outcome: 'conflict' })
+    expect(calls).toEqual([
+      'dropped a question that reuses question id 00000000-0000-4000-8000-000000000001 with different content (sender abababab)',
+      'dropped a connection request that reuses request id 00000000-0000-4000-8000-000000000002 with different content (sender abababab)',
+    ])
+    expect(calls.join(' ')).not.toMatch(/privad/i)
+  })
+
+  it('does nothing for every other outcome', () => {
+    const { calls, handle } = recorder()
+    handle(question, { kind: 'question', outcome: { kind: 'regenerated' } })
+    handle(question, { kind: 'question', outcome: { kind: 'dropped', reason: 'unrelated' } })
+    handle(request, { kind: 'request', outcome: 'duplicate' })
+    handle(question, { kind: 'ignored', reason: 'other_role' })
+    expect(calls).toEqual([])
+  })
+})
+```
+
 - [ ] **Step 3: Run the tests to verify they fail**
 
-Run: `npx vitest run packages/channel/test/channel.test.ts packages/channel/test/notify.test.ts`
+Run: `npx vitest run packages/channel/test/channel.test.ts packages/channel/test/notify.test.ts packages/channel/test/inbound.test.ts`
 Expected: FAIL:
 - `replyResult` is not exported;
 - `createChannelServer` still expects the 0.1 relay;
-- `../src/notify` cannot be resolved.
+- `../src/notify` and `../src/inbound` cannot be resolved.
 
 - [ ] **Step 4: Rewrite the channel server**
 
 Replace the whole content of `packages/channel/src/channel.ts` with:
 
 ```ts
-import { ConfidenceSchema, LIMITS, type AnswerOutcome } from '@agentbridge/core'
+import { ConfidenceSchema, LIMITS, describeError, type AnswerOutcome } from '@agentbridge/core'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
@@ -4213,7 +4660,8 @@ export function replyResult(outcome: AnswerOutcome, typedCode: string): { text: 
 
 const toolError = (text: string) => ({ content: [{ type: 'text' as const, text }], isError: true })
 
-export function createChannelServer(backend: ChannelBackend, opts: { version?: string } = {}) {
+export function createChannelServer(backend: ChannelBackend, opts: { version?: string; log?: (line: string) => void } = {}) {
+  const log = opts.log ?? ((line: string) => process.stderr.write(`[agentbridge] ${line}\n`))
   const server = new Server(
     { name: 'agentbridge', version: opts.version ?? '0.2.0' },
     { capabilities: { tools: {}, experimental: { 'claude/channel': {} } }, instructions: CHANNEL_INSTRUCTIONS },
@@ -4222,9 +4670,7 @@ export function createChannelServer(backend: ChannelBackend, opts: { version?: s
   const push = (content: string, meta: Record<string, string>): Promise<void> =>
     server
       .notification({ method: 'notifications/claude/channel', params: { content, meta } })
-      .catch((err: unknown) => {
-        process.stderr.write(`[agentbridge] notification failed: ${err instanceof Error ? err.message : String(err)}\n`)
-      })
+      .catch((err: unknown) => log(`notification failed (${describeError(err)})`))
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [REPLY_TOOL] }))
 
@@ -4235,7 +4681,16 @@ export function createChannelServer(backend: ChannelBackend, opts: { version?: s
       const fields = Array.from(new Set(parsed.error.issues.map((i) => (i.path.length ? i.path.join('.') : 'cuerpo'))))
       return toolError(`Argumentos inválidos en: ${fields.join(', ')}`)
     }
-    const result = replyResult(backend.reply(parsed.data), parsed.data.code)
+    let outcome: AnswerOutcome
+    try {
+      outcome = backend.reply(parsed.data)
+    } catch (err) {
+      // The MCP SDK would put an exception's message in its error response to Claude; that message may
+      // carry stored content, so only a generic text goes back and only the error type is logged.
+      log(`reply failed (${describeError(err)})`)
+      return toolError('No se pudo guardar la respuesta por un error interno. Vuelve a llamar reply con el mismo código en un momento.')
+    }
+    const result = replyResult(outcome, parsed.data.code)
     return result.isError ? toolError(result.text) : { content: [{ type: 'text' as const, text: result.text }] }
   })
 
@@ -4292,6 +4747,40 @@ export async function notifyNewRequests(input: {
 }
 ```
 
+Create `packages/channel/src/inbound.ts`:
+
+```ts
+import type { OpenedMessage, ResponderInboundOutcome } from '@agentbridge/core'
+
+export type ResponderMessageActions = {
+  wakeDispatcher(): void
+  notifyRequests(): void
+  log(line: string): void
+}
+
+// What the channel does once its device handled a message: wake the dispatcher for a new question, try
+// the request notice for a new request, and record identity conflicts, which the spec says to drop and
+// log. Log lines carry identifiers only: an entity id (a validated UUID) and a key prefix.
+export function responderMessageHandler(actions: ResponderMessageActions): (opened: OpenedMessage, outcome: ResponderInboundOutcome) => void {
+  return (opened, outcome) => {
+    const sender = opened.senderPubkey.slice(0, 8)
+    if (outcome.kind === 'question') {
+      if (outcome.outcome.kind === 'queued') actions.wakeDispatcher()
+      if (outcome.outcome.kind === 'dropped' && outcome.outcome.reason === 'conflict' && opened.message.type === 'question') {
+        actions.log(`dropped a question that reuses question id ${opened.message.questionId} with different content (sender ${sender})`)
+      }
+      return
+    }
+    if (outcome.kind === 'request') {
+      if (outcome.outcome === 'stored') actions.notifyRequests()
+      if (outcome.outcome === 'conflict' && opened.message.type === 'connect_request') {
+        actions.log(`dropped a connection request that reuses request id ${opened.message.requestId} with different content (sender ${sender})`)
+      }
+    }
+  }
+}
+```
+
 - [ ] **Step 6: Rewrite the process entry point**
 
 Replace the whole content of `packages/channel/src/main.ts` with:
@@ -4300,10 +4789,10 @@ Replace the whole content of `packages/channel/src/main.ts` with:
 import {
   CLI_COMMAND,
   Device,
-  UserFacingError,
   acquireChannelLock,
   agentbridgeHome,
   currentProcess,
+  describeError,
   handleResponderMessage,
   isProcessAlive,
   loadIdentity,
@@ -4314,6 +4803,7 @@ import {
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { createChannelServer } from './channel'
 import { Dispatcher } from './dispatcher'
+import { responderMessageHandler } from './inbound'
 import { notifyNewRequests } from './notify'
 
 const log = (message: string) => process.stderr.write(`[agentbridge] ${message}\n`)
@@ -4337,19 +4827,18 @@ async function main(): Promise<void> {
   const epoch = lock.epoch
 
   const wiring: { dispatcher: Dispatcher | null } = { dispatcher: null }
-  const channel = createChannelServer({
-    reply: (args) => (wiring.dispatcher ? wiring.dispatcher.reply(args) : { kind: 'no_active' }),
-  })
+  const channel = createChannelServer(
+    { reply: (args) => (wiring.dispatcher ? wiring.dispatcher.reply(args) : { kind: 'no_active' }) },
+    { log },
+  )
+  const notifyRequests = () => void notifyNewRequests({ store, now: nowSeconds(), log })
   const device = new Device({
     store,
     identity,
     role: 'responder',
     handleMessage: handleResponderMessage,
     log,
-    onMessage: (_opened, outcome) => {
-      if (outcome.kind === 'request' && outcome.outcome === 'stored') void notifyNewRequests({ store, now: nowSeconds(), log })
-      if (outcome.kind === 'question') wiring.dispatcher?.wake()
-    },
+    onMessage: responderMessageHandler({ wakeDispatcher: () => wiring.dispatcher?.wake(), notifyRequests, log }),
   })
   const dispatcher = new Dispatcher({
     store,
@@ -4363,10 +4852,16 @@ async function main(): Promise<void> {
   })
   wiring.dispatcher = dispatcher
 
+  // A request stored by another process (a CLI sync) leaves a pending notice in SQLite: try it at start
+  // and every minute.
+  const noticeTimer = setInterval(notifyRequests, 60_000)
+  noticeTimer.unref()
+
   let stopping = false
   async function shutdown(code: number): Promise<void> {
     if (stopping) return
     stopping = true
+    clearInterval(noticeTimer)
     await dispatcher.stop()
     await device.close()
     // A fenced channel no longer owns the lock; releasing by its old epoch would be a no-op anyway.
@@ -4381,11 +4876,12 @@ async function main(): Promise<void> {
   await channel.server.connect(new StdioServerTransport())
   device.start()
   dispatcher.start()
+  notifyRequests()
   log('channel started')
 }
 
 main().catch((err: unknown) => {
-  log(err instanceof UserFacingError ? err.message : `could not start: ${err instanceof Error ? err.message : String(err)}`)
+  log(`could not start (${describeError(err)})`)
   process.exit(1)
 })
 ```
@@ -4464,7 +4960,7 @@ Expected: PASS.
 - [ ] **Step 9: Commit**
 
 ```bash
-git add packages/channel/src/channel.ts packages/channel/src/notify.ts packages/channel/src/main.ts packages/channel/test/channel.test.ts packages/channel/test/notify.test.ts packages/channel/test/bundle.test.ts
+git add packages/channel/src/channel.ts packages/channel/src/notify.ts packages/channel/src/inbound.ts packages/channel/src/main.ts packages/channel/test/channel.test.ts packages/channel/test/notify.test.ts packages/channel/test/inbound.test.ts packages/channel/test/bundle.test.ts
 git commit -m "feat(channel): run the responder over public relays with a fenced dispatcher, honest reply text and request notices"
 ```
 
@@ -4910,7 +5406,8 @@ describe('responder scenarios', () => {
   it(
     'revocation cancels the active question in Claude, refuses its answer, tells the asker, and rejects a waiting question on retry',
     async () => {
-      const { ana, beto, to, now } = await approvedPair()
+      const clock: Clock = { now: nowSeconds() }
+      const { ana, beto, to, now } = await approvedPair({ clock })
       const first = randomUUID()
       const second = randomUUID()
       await beto.send(to, question(first, 'primera'))
@@ -4927,6 +5424,8 @@ describe('responder scenarios', () => {
       await until(() => beto.messages('connect_revoked').length === 1, 20_000, 'connect_revoked')
       expect(beto.messages('connect_revoked')[0]).toMatchObject({ generation: 2 })
 
+      // The asker's retry comes after the 10-minute regeneration limit.
+      clock.now += 601
       await beto.send(to, question(second, 'segunda'), { rumor: secondRumor })
       await until(() => beto.messages('rejected').some((m) => m.questionId === second), 20_000, 'the stale_generation rejection')
       expect(beto.messages('rejected').find((m) => m.questionId === second)).toMatchObject({ reason: 'stale_generation' })
@@ -4939,7 +5438,8 @@ describe('responder scenarios', () => {
   it(
     'a new approval does not bring back questions from before the revocation',
     async () => {
-      const { theirs, ana, beto, to, now } = await approvedPair()
+      const clock: Clock = { now: nowSeconds() }
+      const { theirs, ana, beto, to, now } = await approvedPair({ clock })
       const old = randomUUID()
       const oldRumor = await beto.send(to, question(old, 'vieja'))
       await until(() => ana.questions().length === 1, 20_000, 'the old question in Claude')
@@ -4958,6 +5458,7 @@ describe('responder scenarios', () => {
       const { contact } = approveConnection(ana.store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: now() })
       expect(contact.generation).toBe(3)
 
+      clock.now += 601
       await beto.send(to, question(old, 'vieja'), { rumor: oldRumor })
       await until(() => beto.messages('rejected').some((m) => m.questionId === old), 20_000, 'the old question rejected')
       const fresh = randomUUID()
