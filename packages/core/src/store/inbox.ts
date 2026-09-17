@@ -5,7 +5,7 @@ import { NOSTR } from '../nostr-constants'
 import { LIMITS } from '../protocol'
 import { getContact } from './contacts'
 import type { Store } from './db'
-import { enqueue } from './outbox'
+import { enqueue, type EnqueueOutcome } from './outbox'
 
 export type InboxState = 'queued' | 'dispatched' | 'answered' | 'rejected'
 export type RejectReason = 'expired' | 'limit' | 'unanswered' | 'stale_generation'
@@ -42,7 +42,7 @@ export type AdmissionOutcome =
   | { kind: 'rejected'; reason: RejectReason }
   | { kind: 'regenerated' }
   | { kind: 'regeneration_too_soon' }
-  | { kind: 'dropped'; reason: 'unrelated' | 'conflict' | 'answered_after_revocation' | 'no_relays' | 'purged' }
+  | { kind: 'dropped'; reason: 'unrelated' | 'conflict' | 'answered_after_revocation' | 'no_relays' | 'purged' | 'abandoned' }
 
 type InboxRow = {
   sender_pubkey: string
@@ -93,11 +93,12 @@ export function getInboxQuestion(store: Store, senderPubkey: string, questionId:
 }
 
 // Stored response rumors are resent unchanged, so the asker recognizes a repeat by its rumor id.
-// Nothing is sent without relays (a contact that never gave usable ones) or once the rumor was purged.
-// Returns whether anything was handed to the outbox.
-function resend(store: Store, input: { recipient: string; relays: readonly string[]; rumorJson: string | null; label: string; now: number }): boolean {
-  if (input.rumorJson === null || input.relays.length === 0) return false
-  enqueue(store, {
+// Nothing is sent without relays (a contact that never gave usable ones) or once the rumor was purged
+// — that case, and any other reason enqueue itself declined the rumor, is reported as 'nothing' so a
+// caller can tell "nothing to send" apart from "the outbox refused it."
+function resend(store: Store, input: { recipient: string; relays: readonly string[]; rumorJson: string | null; label: string; now: number }): EnqueueOutcome | 'nothing' {
+  if (input.rumorJson === null || input.relays.length === 0) return 'nothing'
+  return enqueue(store, {
     recipient: input.recipient,
     rumor: JSON.parse(input.rumorJson) as Rumor,
     label: input.label,
@@ -106,8 +107,13 @@ function resend(store: Store, input: { recipient: string; relays: readonly strin
     policy: 'once',
     now: input.now,
   })
-  return true
 }
+
+// Of everything enqueue can answer, only these outcomes mean the outbox now actually holds the rumor
+// to send. 'abandoned' (the row was written off, e.g. an unauthorized retry) and
+// 'regeneration_too_soon' (the outbox's own clock, distinct from the question's) do not.
+const SENT_OUTCOMES: ReadonlySet<EnqueueOutcome> = new Set(['enqueued', 'postponed_cap', 'regenerated', 'already_pending'])
+const wasSent = (outcome: EnqueueOutcome | 'nothing'): boolean => outcome !== 'nothing' && SENT_OUTCOMES.has(outcome)
 
 export function rejectQuestion(
   store: Store,
@@ -171,9 +177,15 @@ export function admitQuestion(store: Store, input: AdmissionInput): AdmissionOut
         rejectQuestion(store, { identity: input.identity, senderPubkey: input.senderPubkey, questionId: input.questionId, reason: 'stale_generation', now: input.now, send: false })
       }
       const current = selectRow(store, input.senderPubkey, input.questionId)!
-      const receiptSent = stillAllowed && resend(store, { recipient: input.senderPubkey, relays, rumorJson: current.receipt_rumor_json, label: 'receipt', now: input.now })
-      const decisionSent = resend(store, { recipient: input.senderPubkey, relays, rumorJson: current.decision_rumor_json, label: decisionLabel(current), now: input.now })
-      if (!receiptSent && !decisionSent) return { kind: 'dropped', reason: 'purged' }
+      const receiptOutcome: EnqueueOutcome | 'nothing' = stillAllowed
+        ? resend(store, { recipient: input.senderPubkey, relays, rumorJson: current.receipt_rumor_json, label: 'receipt', now: input.now })
+        : 'nothing'
+      const decisionOutcome = resend(store, { recipient: input.senderPubkey, relays, rumorJson: current.decision_rumor_json, label: decisionLabel(current), now: input.now })
+      if (!wasSent(receiptOutcome) && !wasSent(decisionOutcome)) {
+        if (receiptOutcome === 'nothing' && decisionOutcome === 'nothing') return { kind: 'dropped', reason: 'purged' }
+        if (receiptOutcome === 'regeneration_too_soon' || decisionOutcome === 'regeneration_too_soon') return { kind: 'regeneration_too_soon' }
+        return { kind: 'dropped', reason: 'abandoned' }
+      }
       store.db
         .prepare('UPDATE inbox_questions SET regenerated_at = ?, updated_at = ? WHERE sender_pubkey = ? AND question_id = ?')
         .run(input.now, input.now, input.senderPubkey, input.questionId)
@@ -222,25 +234,24 @@ export function rejectUnansweredFor(store: Store, input: { identity: Identity; s
 }
 
 // Content (question text and answer rumors) follows the 7-day retention by the question's own date. A
-// question still waiting then can never be answered, so it is closed as unanswered without sending.
+// question still waiting then can never be answered, so it is closed as unanswered — through
+// rejectQuestion, so that decision keeps its own stored rumor and can still be resent later, the same
+// as any other rejection, right up to the 9-day forgetting below. rejectQuestion also cancels the
+// active attempt (as 'purged', since send is false), so there is nothing left to do for it here.
 // Receipts and rejections are decisions, not content: they stay, and can still be resent, until the
 // row is forgotten after 9 days.
-export function purgeInbox(store: Store, now: number): { rejectedWaiting: number; contentCleared: number; forgotten: number } {
+export function purgeInbox(store: Store, input: { identity: Identity; now: number }): { rejectedWaiting: number; contentCleared: number; forgotten: number } {
   return store.tx(() => {
+    const { identity, now } = input
     const contentHorizon = now - NOSTR.contentRetentionSeconds
-    store.db
-      .prepare(
-        `UPDATE attempts SET state = 'cancelled', cancel_reason = 'purged', ended_at = ?
-         WHERE state = 'active' AND (sender_pubkey, question_id) IN (
-           SELECT sender_pubkey, question_id FROM inbox_questions WHERE state = 'dispatched' AND rumor_created_at <= ?)`,
-      )
-      .run(now, contentHorizon)
-    const rejectedWaiting = store.db
-      .prepare(
-        `UPDATE inbox_questions SET state = 'rejected', decision = 'rejected', reject_reason = 'unanswered', decided_at = ?, updated_at = ?
-         WHERE state IN ('queued', 'dispatched') AND rumor_created_at <= ?`,
-      )
-      .run(now, now, contentHorizon)
+    const waiting = store.db
+      .prepare("SELECT sender_pubkey, question_id FROM inbox_questions WHERE state IN ('queued', 'dispatched') AND rumor_created_at <= ?")
+      .all(contentHorizon) as Array<{ sender_pubkey: string; question_id: string }>
+    let rejectedWaiting = 0
+    for (const { sender_pubkey, question_id } of waiting) {
+      const closed = rejectQuestion(store, { identity, senderPubkey: sender_pubkey, questionId: question_id, reason: 'unanswered', now, send: false })
+      if (closed) rejectedWaiting++
+    }
     const contentCleared = store.db
       .prepare(
         `UPDATE inbox_questions
@@ -249,6 +260,6 @@ export function purgeInbox(store: Store, now: number): { rejectedWaiting: number
       )
       .run(now, contentHorizon)
     const forgotten = store.db.prepare('DELETE FROM inbox_questions WHERE rumor_created_at <= ?').run(now - NOSTR.decisionRetentionSeconds)
-    return { rejectedWaiting: Number(rejectedWaiting.changes), contentCleared: Number(contentCleared.changes), forgotten: Number(forgotten.changes) }
+    return { rejectedWaiting, contentCleared: Number(contentCleared.changes), forgotten: Number(forgotten.changes) }
   })
 }

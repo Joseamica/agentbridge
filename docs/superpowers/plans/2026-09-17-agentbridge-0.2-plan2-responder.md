@@ -1170,7 +1170,7 @@ git commit -m "feat(core): exclusive channel lock with process identity, growing
   - `type RejectReason = 'expired' | 'limit' | 'unanswered' | 'stale_generation'`
   - `type InboxQuestion = { senderPubkey; questionId; rumorId; rumorCreatedAt; generation; text: string | null; state: InboxState; admitted: boolean; decision: 'answer' | 'rejected' | null; rejectReason: RejectReason | null; expiredAttempts: number; receivedAt: number; decidedAt: number | null }`
   - `type AdmissionInput = { identity: Identity; senderPubkey: string; questionId: string; rumorId: string; rumorCreatedAt: number; generation: number; text: string; now: number }`
-  - `type AdmissionOutcome = { kind: 'queued' } | { kind: 'rejected'; reason: RejectReason } | { kind: 'regenerated' } | { kind: 'regeneration_too_soon' } | { kind: 'dropped'; reason: 'unrelated' | 'conflict' | 'answered_after_revocation' | 'no_relays' | 'purged' }`
+  - `type AdmissionOutcome = { kind: 'queued' } | { kind: 'rejected'; reason: RejectReason } | { kind: 'regenerated' } | { kind: 'regeneration_too_soon' } | { kind: 'dropped'; reason: 'unrelated' | 'conflict' | 'answered_after_revocation' | 'no_relays' | 'purged' | 'abandoned' }`
   - `admitQuestion(store, input): AdmissionOutcome`: the spec's admission, in one transaction (see Global Constraints).
     - A known question is resent at most once every `NOSTR.regenerationIntervalSeconds`, counted from its own `regenerated_at` (or its arrival). The clock lives on the question, so it still holds after revocation or the outbox purge deleted its rows.
     - `dropped`/`purged` when nothing stored is left to resend.
@@ -1181,7 +1181,7 @@ git commit -m "feat(core): exclusive channel lock with process identity, growing
     - Enqueues the rumor only when `send` is true.
     - Returns `false` when the question does not exist or already has a decision.
   - `rejectUnansweredFor(store, { identity, senderPubkey, now }): number`: every `queued` or `dispatched` question from that sender gets `stale_generation`, without sending.
-  - `purgeInbox(store, now): { rejectedWaiting: number; contentCleared: number; forgotten: number }`: at 7 days it clears question text and answer rumors (content); receipt and rejection rumors are decisions and stay until the row is forgotten at 9 days.
+  - `purgeInbox(store, { identity, now }): { rejectedWaiting: number; contentCleared: number; forgotten: number }`: at 7 days it clears question text and answer rumors (content); receipt and rejection rumors are decisions and stay until the row is forgotten at 9 days. Waiting questions are closed through `rejectQuestion` with their rumor, without sending.
   - Outbox labels used: `receipt`, `answer`, `rejected:<reason>`. All responses use policy `once` and 16 bits.
 
 - [ ] **Step 1: Write the failing tests**
@@ -3845,7 +3845,7 @@ export class Device<T> {
     const now = this.now()
     const steps: Array<[string, () => unknown]> = [
       ['requests', () => purgeRequests(this.options.store, now)],
-      ['inbox', () => purgeInbox(this.options.store, now)],
+      ['inbox', () => purgeInbox(this.options.store, { identity: this.options.identity, now })],
       ['outbox', () => purgeOutbox(this.options.store, now)],
       ['cursors', () => purgeCursors(this.options.store, now)],
     ]

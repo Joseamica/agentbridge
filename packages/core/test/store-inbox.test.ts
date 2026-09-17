@@ -13,6 +13,7 @@ import {
   openStore,
   purgeInbox,
   recordIncomingRequest,
+  rejectQuestion,
   rejectUnansweredFor,
   revokeInbound,
   type AdmissionInput,
@@ -153,6 +154,31 @@ describe('admitQuestion', () => {
     expect(admitQuestion(store, question(1, { now: T0 + 20 }))).toEqual({ kind: 'dropped', reason: 'answered_after_revocation' })
     expect(admitQuestion(store, question(2, { generation: 5, now: T0 + NOSTR.regenerationIntervalSeconds }))).toEqual({ kind: 'regenerated' })
   })
+
+  it('reports the outbox refused a retry instead of falsely claiming regeneration', () => {
+    approveAsker()
+    admitQuestion(store, question(1))
+    claimDue(store, { owner: 'o', now: T0, limit: 10, authorize: () => false })
+    expect(outbox().map((r) => r.state)).toEqual(['abandoned'])
+    expect(admitQuestion(store, question(1, { now: T0 + NOSTR.regenerationIntervalSeconds }))).toEqual({ kind: 'dropped', reason: 'abandoned' })
+    expect(getInboxQuestion(store, asker.publicKey, uuid(1))?.state).toBe('queued')
+    const row = store.db.prepare('SELECT regenerated_at FROM inbox_questions WHERE question_id = ?').get(uuid(1)) as { regenerated_at: number | null }
+    expect(row.regenerated_at).toBeNull()
+    // A later retry, once the outbox row is gone entirely rather than merely abandoned, still regenerates.
+    store.db.prepare('DELETE FROM outbox').run()
+    expect(admitQuestion(store, question(1, { now: T0 + 2 * NOSTR.regenerationIntervalSeconds }))).toEqual({ kind: 'regenerated' })
+  })
+})
+
+describe('rejectQuestion', () => {
+  it('with send true, enqueues exactly one outbox row labelled rejected:<reason> holding the stored rumor', () => {
+    approveAsker()
+    admitQuestion(store, question(1))
+    expect(outbox().map((r) => r.label)).toEqual(['receipt'])
+    expect(rejectQuestion(store, { identity: responder, senderPubkey: asker.publicKey, questionId: uuid(1), reason: 'limit', now: T0 + 5, send: true })).toBe(true)
+    expect(outbox().map((r) => r.label)).toEqual(['receipt', 'rejected:limit'])
+    expect(messages()).toEqual([{ v: 1, type: 'receipt', questionId: uuid(1) }, { v: 1, type: 'rejected', questionId: uuid(1), reason: 'limit' }])
+  })
 })
 
 describe('rejectUnansweredFor', () => {
@@ -180,13 +206,50 @@ describe('purgeInbox', () => {
     admitQuestion(store, question(1))
     admitQuestion(store, question(2, { generation: 5 }))
     const sevenDays = T0 + NOSTR.contentRetentionSeconds
-    expect(purgeInbox(store, sevenDays - 1)).toEqual({ rejectedWaiting: 0, contentCleared: 0, forgotten: 0 })
-    expect(purgeInbox(store, sevenDays)).toEqual({ rejectedWaiting: 1, contentCleared: 1, forgotten: 0 })
+    expect(purgeInbox(store, { identity: responder, now: sevenDays - 1 })).toEqual({ rejectedWaiting: 0, contentCleared: 0, forgotten: 0 })
+    expect(purgeInbox(store, { identity: responder, now: sevenDays })).toEqual({ rejectedWaiting: 1, contentCleared: 1, forgotten: 0 })
     expect(getInboxQuestion(store, asker.publicKey, uuid(1))).toMatchObject({ state: 'rejected', rejectReason: 'unanswered', text: null })
     store.db.prepare('DELETE FROM outbox').run()
     expect(admitQuestion(store, question(2, { generation: 5, now: sevenDays + 1 }))).toEqual({ kind: 'regenerated' })
     expect(messages()).toEqual([{ v: 1, type: 'rejected', questionId: uuid(2), reason: 'stale_generation' }])
-    expect(purgeInbox(store, T0 + NOSTR.decisionRetentionSeconds)).toEqual({ rejectedWaiting: 0, contentCleared: 0, forgotten: 2 })
+    expect(purgeInbox(store, { identity: responder, now: T0 + NOSTR.decisionRetentionSeconds })).toEqual({ rejectedWaiting: 0, contentCleared: 0, forgotten: 2 })
     expect(getInboxQuestion(store, asker.publicKey, uuid(1))).toBeNull()
+  })
+
+  it('closes a queued and a dispatched question as rejected/unanswered with a stored rumor, without sending, and cancels the dispatched one\'s attempt as purged; a later retry resends both stored rumors', () => {
+    approveAsker()
+    admitQuestion(store, question(1))
+    admitQuestion(store, question(2))
+    store.db.prepare("UPDATE inbox_questions SET state = 'dispatched' WHERE question_id = ?").run(uuid(2))
+    store.db
+      .prepare("INSERT INTO attempts (attempt_id, sender_pubkey, question_id, code, epoch, deadline_ms, state, created_at) VALUES ('att2', ?, ?, 'ABCD', 1, 0, 'active', ?)")
+      .run(asker.publicKey, uuid(2), T0)
+    const sevenDays = T0 + NOSTR.contentRetentionSeconds
+    expect(purgeInbox(store, { identity: responder, now: sevenDays })).toEqual({ rejectedWaiting: 2, contentCleared: 2, forgotten: 0 })
+    for (const n of [1, 2]) {
+      expect(getInboxQuestion(store, asker.publicKey, uuid(n))).toMatchObject({ state: 'rejected', decision: 'rejected', rejectReason: 'unanswered', text: null })
+      const row = store.db.prepare('SELECT decision_rumor_json FROM inbox_questions WHERE question_id = ?').get(uuid(n)) as { decision_rumor_json: string | null }
+      expect(row.decision_rumor_json).not.toBeNull()
+    }
+    expect(outbox().find((r) => r.label === 'rejected:unanswered')).toBeUndefined()
+    expect(store.db.prepare("SELECT state, cancel_reason FROM attempts WHERE attempt_id = 'att2'").get()).toEqual({ state: 'cancelled', cancel_reason: 'purged' })
+
+    store.db.prepare('DELETE FROM outbox').run()
+    expect(admitQuestion(store, question(2, { now: sevenDays + NOSTR.regenerationIntervalSeconds }))).toEqual({ kind: 'regenerated' })
+    expect(outbox().map((r) => r.label).sort()).toEqual(['receipt', 'rejected:unanswered'])
+  })
+
+  it('clears an answer rumor at 7 days but keeps a rejection rumor until the row is forgotten at 9', () => {
+    approveAsker()
+    admitQuestion(store, question(1))
+    admitQuestion(store, question(2, { generation: 5 }))
+    store.db.prepare("UPDATE inbox_questions SET state = 'answered', decision = 'answer', decision_rumor_json = '{\"content\":\"x\"}' WHERE question_id = ?").run(uuid(1))
+    const decisionOf = (n: number) => store.db.prepare('SELECT decision_rumor_json FROM inbox_questions WHERE question_id = ?').get(uuid(n)) as { decision_rumor_json: string | null }
+    const sevenDays = T0 + NOSTR.contentRetentionSeconds
+    expect(purgeInbox(store, { identity: responder, now: sevenDays })).toMatchObject({ forgotten: 0 })
+    expect(decisionOf(1).decision_rumor_json).toBeNull()
+    expect(decisionOf(2).decision_rumor_json).not.toBeNull()
+    expect(purgeInbox(store, { identity: responder, now: T0 + NOSTR.decisionRetentionSeconds })).toMatchObject({ forgotten: 2 })
+    expect(getInboxQuestion(store, asker.publicKey, uuid(2))).toBeNull()
   })
 })
