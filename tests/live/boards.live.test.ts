@@ -1,0 +1,92 @@
+import { randomUUID } from 'node:crypto'
+import { generateSecretKey, getPublicKey } from 'nostr-tools/pure'
+import { afterAll, describe, expect, it } from 'vitest'
+import {
+  BoardPool,
+  SeenIds,
+  createRumor,
+  leadingZeroBits,
+  nowSeconds,
+  openWrap,
+  pinnedSocketFactory,
+  precheckWrap,
+  wrapRumor,
+  type Identity,
+  type Message,
+  type PrecheckedWrap,
+} from '@agentbridge/core'
+
+// The relays that accepted and served NIP-59 wraps in the 2026-09-16 spike.
+const RELAYS = ['wss://relay.primal.net', 'wss://relay.snort.social', 'wss://relay.nostr.net', 'wss://nostr.oxtr.dev', 'wss://nos.lol']
+
+const newIdentity = (): Identity => {
+  const secretKey = generateSecretKey()
+  return { secretKey, publicKey: getPublicKey(secretKey) }
+}
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+describe('public Nostr relays (live, opt-in)', () => {
+  const sender = newIdentity()
+  const recipient = newIdentity()
+  const log = (line: string) => console.log(`[live] ${line}`)
+  const senderPool = new BoardPool({ identity: sender, createSocket: pinnedSocketFactory, log })
+  const recipientPool = new BoardPool({ identity: recipient, createSocket: pinnedSocketFactory, log })
+  afterAll(async () => {
+    await senderPool.close()
+    await recipientPool.close()
+  })
+
+  const wrapFor = async (message: Message) => wrapRumor(createRumor(message, sender, nowSeconds()), sender, recipient.publicKey, { now: nowSeconds() })
+
+  it('delivers a sealed question to a live subscriber and keeps it retrievable afterwards', async () => {
+    const seen = new SeenIds()
+    const received: string[] = []
+    const live = recipientPool.subscribeLive<PrecheckedWrap>(RELAYS, {
+      precheck: (raw) => {
+        const pre = precheckWrap(raw, { identity: recipient, now: nowSeconds(), seen })
+        return pre.ok ? pre : null
+      },
+      process: async (item) => {
+        const opened = openWrap(item, { identity: recipient, now: nowSeconds(), seen })
+        if (opened.ok && opened.message.type === 'question' && opened.senderPubkey === sender.publicKey) received.push(opened.message.questionId)
+      },
+    })
+    await sleep(3_000)
+
+    const questionId = randomUUID()
+    const wrap = await wrapFor({ v: 1, type: 'question', questionId, generation: 1, text: 'Prueba en vivo de AgentBridge 0.2' })
+    const outcome = await senderPool.publish(RELAYS, wrap)
+    log(`publish: ${JSON.stringify(outcome)}`)
+    expect(outcome.accepted.length).toBeGreaterThanOrEqual(1)
+
+    for (let i = 0; i < 300 && !received.includes(questionId); i++) await sleep(100)
+    await live.close()
+    expect(received).toContain(questionId)
+
+    const stored = await Promise.all(
+      outcome.accepted.map((relay) =>
+        recipientPool.query(relay, { kinds: [1059], '#p': [recipient.publicKey], since: wrap.created_at - 1, until: wrap.created_at + 1, limit: 10 }),
+      ),
+    )
+    const retrievable = stored.filter((r) => r.events.some((e) => (e as { id?: string }).id === wrap.id)).length
+    log(`retrievable from ${retrievable}/${outcome.accepted.length} accepting relays`)
+    expect(retrievable).toBeGreaterThanOrEqual(1)
+  })
+
+  it('reports how the relays treat five quick publishes from one identity', async () => {
+    const outcomes = []
+    for (let i = 0; i < 5; i++) outcomes.push(await senderPool.publish(RELAYS, await wrapFor({ v: 1, type: 'receipt', questionId: randomUUID() })))
+    log(`burst: ${JSON.stringify(outcomes.map((o) => ({ accepted: o.accepted.length, rejected: o.rejected.map((r) => r.reason) })))}`)
+    expect(outcomes.every((o) => o.accepted.length >= 1)).toBe(true)
+  })
+
+  it('accepts a 22-bit connection request on at least one relay', async () => {
+    const started = Date.now()
+    const wrap = await wrapFor({ v: 1, type: 'connect_request', requestId: randomUUID(), name: 'Prueba', note: 'live', relays: RELAYS })
+    log(`connect_request mined in ${Date.now() - started} ms`)
+    expect(leadingZeroBits(wrap.id)).toBeGreaterThanOrEqual(22)
+    const outcome = await senderPool.publish(RELAYS, wrap)
+    log(`connect_request: ${JSON.stringify(outcome)}`)
+    expect(outcome.accepted.length).toBeGreaterThanOrEqual(1)
+  })
+})
