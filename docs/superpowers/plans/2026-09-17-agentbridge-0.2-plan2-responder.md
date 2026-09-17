@@ -2154,7 +2154,7 @@ git commit -m "feat(core): fenced dispatch transactions for reserving, expiring 
   - `REQUEST_ID_LENGTH = 8`
   - `type PendingRequestView = { id: string; pubkey: string; declaredName: string; note: string; requestedAt: number }`
   - `listRequests(store, now): PendingRequestView[]`: purges first and clears the pending request notice (the person is looking at the list); ids are the first 8 characters of the requester's key.
-  - `approveConnection(store, { identity, idPrefix, now }): { contact: Contact; changed: boolean }`
+  - `approveConnection(store, { identity, idPrefix, now }): { contact: Contact; changed: boolean }`: refuses (before writing anything) a request whose stored relays are empty.
   - `rejectConnection(store, { identity, idPrefix, now }): { contact: Contact; changed: boolean }`
   - `revokeConnection(store, { identity, name, now }): { contact: Contact; changed: boolean; rejectedQuestions: number }`
   - `regenerateRequestDecision(store, { identity, senderPubkey, requestId, replyRelays, now }): 'enqueued' | 'too_soon' | 'nothing'`: a decision already sent is resent at most once every `NOSTR.regenerationIntervalSeconds`, counted from `requests.decision_resent_at` (or `decided_at`), so the limit survives revocation deleting its outbox rows. A decision never sent yet goes out at once.
@@ -2164,6 +2164,7 @@ git commit -m "feat(core): fenced dispatch transactions for reserving, expiring 
     - no match
     - an ambiguous prefix
     - approving without a profile name
+    - approving a request with no relays
     - an unknown contact name
 
 - [ ] **Step 1: Write the failing tests**

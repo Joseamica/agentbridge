@@ -96,6 +96,16 @@ describe('approveConnection', () => {
     store.db.prepare("UPDATE contacts SET pubkey = ? || substr(pubkey, 9) WHERE pubkey = ?").run(asker.publicKey.slice(0, 8), twin.publicKey)
     expect(() => approveConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 })).toThrow(/varias/)
   })
+
+  it('refuses to approve a request with no relays to answer at', () => {
+    setProfile(store, { name: 'Ana', now: T0 })
+    recordIncomingRequest(store, { pubkey: asker.publicKey, requestId: REQUEST_ID, requestRumorId: hex(1), declaredName: 'Beto', note: 'Soy del equipo', relays: [], now: T0 })
+    expect(() => approveConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 + 1 })).toThrow(/no trae tableros/)
+    expect(getContact(store, asker.publicKey, 'inbound')?.state).toBe('requested')
+    expect(outbox()).toEqual([])
+    const stored = store.db.prepare('SELECT decision_rumor_json AS j FROM requests WHERE request_id = ?').get(REQUEST_ID)?.j
+    expect(stored).toBeNull()
+  })
 })
 
 describe('rejectConnection', () => {

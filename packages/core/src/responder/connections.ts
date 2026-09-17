@@ -79,6 +79,9 @@ export function approveConnection(store: Store, input: { identity: Identity; idP
     purgeRequests(store, input.now)
     const target = findInbound(store, input.idPrefix, ['requested', 'approved'])
     if (target.state === 'approved') return { contact: target, changed: false }
+    if (target.relays.length === 0) {
+      throw new UserFacingError('Esa solicitud no trae tableros donde responder, así que no se puede aprobar. Pídele a esa persona que te envíe una solicitud nueva.')
+    }
     const profile = getProfile(store)
     if (!profile.name) throw new UserFacingError(`Antes de aprobar solicitudes, completa tu configuración con: ${CLI_COMMAND} setup`)
     const { contact } = approveRequest(store, { pubkey: target.pubkey, now: input.now })
