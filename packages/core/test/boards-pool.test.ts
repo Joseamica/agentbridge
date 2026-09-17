@@ -98,6 +98,14 @@ describe('BoardPool.query', () => {
     expect(await p.query(silent.url, {}, 200)).toMatchObject({ complete: false, closedReason: 'error: timed out waiting for EOSE' })
     expect(await p.query('ws://127.0.0.1:1', {})).toMatchObject({ complete: false, closedReason: expect.stringMatching(/^error: /) })
   })
+
+  // Ruling 27: a hostile relay must not be able to fill memory with one query.
+  it('stops holding events once a relay sends far more than the query asked for', async () => {
+    const b = await board({ beforeEose: () => Array.from({ length: 300 }, (_, i) => fake(i + 1)) })
+    const result = await pool().query(b.url, { kinds: [1059], limit: 10 })
+    expect(result).toMatchObject({ complete: false, closedReason: 'error: relay sent more events than requested' })
+    expect(result.events.length).toBeLessThanOrEqual(10 + 64)
+  })
 })
 
 describe('BoardPool.subscribeLive', () => {

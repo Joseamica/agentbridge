@@ -28,6 +28,7 @@ const DEFAULT_RECONNECT_DELAYS_MS: readonly number[] = [1_000, 2_000, 5_000, 10_
 // immediately would force a full re-subscription (re-downloading up to two days of events) on
 // every cycle, at the fastest configured delay, forever.
 const STABLE_SUBSCRIPTION_MS = 60_000
+const QUERY_EXTRA_EVENTS = 64
 const newSubscriptionId = () => randomBytes(8).toString('hex')
 const messageOf = (err: unknown) => (err instanceof Error ? err.message : String(err))
 
@@ -103,6 +104,10 @@ export class BoardPool {
     }
     const id = newSubscriptionId()
     const events: unknown[] = []
+    // Ruling 27: bound what one query holds in memory. A relay may add a few events before EOSE (a
+    // live one racing the query), but one that keeps sending past the limit is misbehaving. Oversize
+    // placeholders (null) count too.
+    const cap = (filter.limit ?? Math.max(...NOSTR.historyPageLimits)) + QUERY_EXTRA_EVENTS
     return new Promise<QueryResult>((resolve) => {
       let finished = false
       const finish = (result: QueryResult) => {
@@ -115,6 +120,11 @@ export class BoardPool {
       const timer = setTimeout(() => finish({ events, complete: false, closedReason: 'error: timed out waiting for EOSE' }), timeoutMs)
       conn.subscribe(id, [filter], {
         onEvent: (raw) => {
+          if (finished) return
+          if (events.length >= cap) {
+            finish({ events, complete: false, closedReason: 'error: relay sent more events than requested' })
+            return
+          }
           events.push(raw)
         },
         onEose: () => finish({ events, complete: true, closedReason: null }),
