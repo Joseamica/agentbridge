@@ -77,7 +77,7 @@ describe('wrapRumor', () => {
   })
 
   it('mines 22 bits for a connection request', { timeout: 120_000 }, async () => {
-    const request: Message = { v: 1, type: 'connect_request', requestId: questionId, name: 'Ana', note: '', relays: [] }
+    const request: Message = { v: 1, type: 'connect_request', requestId: questionId, name: 'Ana', note: '', relays: ['wss://nos.lol'] }
     const wrap = await wrapRumor(createRumor(request, sender, NOW), sender, recipient.publicKey, { now: NOW })
     expect(leadingZeroBits(wrap.id)).toBeGreaterThanOrEqual(22)
     expect(wrap.tags.at(-1)).toEqual(['nonce', expect.stringMatching(/^\d+$/), '22'])

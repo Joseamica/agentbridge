@@ -143,7 +143,7 @@ describe('receive pipeline', () => {
   })
 
   it('requires 22 bits for connection requests even though 16 bits pass the precheck', async () => {
-    const request: Message = { v: 1, type: 'connect_request', requestId: questionId, name: 'Ana', note: '', relays: [] }
+    const request: Message = { v: 1, type: 'connect_request', requestId: questionId, name: 'Ana', note: '', relays: ['wss://nos.lol'] }
     const craft = () => craftWrap({ sender, recipientPubkey: recipient.publicKey, content: request, now: NOW, bits: 16 })
     let cheap = await craft()
     while (leadingZeroBits(cheap.id) >= NOSTR.powRequestBits) cheap = await craft()

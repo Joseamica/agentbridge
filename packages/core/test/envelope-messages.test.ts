@@ -14,7 +14,7 @@ const id = '3b241101-e2bb-4255-8caf-4136c566a962'
 
 const valid: Message[] = [
   { v: 1, type: 'connect_request', requestId: id, name: 'Ana', note: 'Hola', relays: ['wss://nos.lol'] },
-  { v: 1, type: 'connect_approved', requestId: id, generation: 1, name: 'Dev', relays: [] },
+  { v: 1, type: 'connect_approved', requestId: id, generation: 1, name: 'Dev', relays: ['wss://relay.primal.net'] },
   { v: 1, type: 'connect_rejected', requestId: id },
   { v: 1, type: 'connect_revoked', generation: 2 },
   { v: 1, type: 'question', questionId: id, generation: 1, text: '¿Qué timeout aplica?' },
@@ -41,6 +41,8 @@ describe('MessageSchema', () => {
     [{ v: 1, type: 'answer', questionId: id, text: '€'.repeat(6000), source: 's', confidence: 'creo' }, 'within chars but over 16 KB'],
     [{ v: 1, type: 'answer', questionId: id, text: 'ok', source: 's', confidence: 'quizas' }, 'bad confidence'],
     [{ v: 1, type: 'connect_request', requestId: id, name: 'Ana', note: '', relays: Array(6).fill('wss://a.example.com') }, 'too many relays'],
+    [{ v: 1, type: 'connect_request', requestId: id, name: 'Ana', note: '', relays: [] }, 'request without relays'],
+    [{ v: 1, type: 'connect_approved', requestId: id, generation: 1, name: 'Dev', relays: [] }, 'approval without relays'],
     [{ v: 1, type: 'rejected', questionId: id, reason: 'because' }, 'bad reason'],
   ])('rejects %j (%s)', (message, _description) => {
     expect(MessageSchema.safeParse(message).success).toBe(false)

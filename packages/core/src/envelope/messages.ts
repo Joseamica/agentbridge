@@ -4,7 +4,8 @@ import { ConfidenceSchema, LIMITS } from '../protocol'
 
 const Uuid = z.uuid()
 const Generation = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
-const RelayHints = z.array(z.string().max(NOSTR.maxRelayUrlLength)).max(NOSTR.maxRelaysPerContact)
+// At least one relay: a connection request or approval without one can never be answered.
+const RelayHints = z.array(z.string().max(NOSTR.maxRelayUrlLength)).min(1).max(NOSTR.maxRelaysPerContact)
 
 const text = (maxChars: number) =>
   z
