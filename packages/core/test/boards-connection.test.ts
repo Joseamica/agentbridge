@@ -311,6 +311,61 @@ describe('BoardConnection', () => {
   })
 })
 
+// Ruling 25: a half-open socket (laptop sleep, Wi-Fi change, NAT drop) never errors on its own.
+// The connection pings every `heartbeatMs` and terminates the socket after three silent intervals.
+describe('BoardConnection heartbeat', () => {
+  async function watched(options: FakeBoardOptions = {}) {
+    const board = await startFakeBoard(options)
+    const conn = new BoardConnection({ url: board.url, identity: me, createSocket: plainSocketFactory, timeoutMs: 2_000, heartbeatMs: 50 })
+    cleanups.push(() => board.close(), () => conn.close())
+    let closedAt: number | null = null
+    conn.on('close', () => (closedAt = Date.now()))
+    await conn.connect()
+    return { board, conn, closedAt: () => closedAt }
+  }
+
+  it('terminates a socket whose relay went silent, closing its subscriptions', async () => {
+    const { board, conn, closedAt } = await watched()
+    const r = recorder()
+    conn.subscribe('s', [{ kinds: [1059] }], r.handlers)
+    await until(() => r.eose() === 1)
+    const silentAt = Date.now()
+    board.goSilent()
+    await until(() => closedAt() !== null)
+    expect(closedAt()! - silentAt).toBeLessThan(400)
+    expect(conn.isOpen).toBe(false)
+    expect(r.closed).toEqual(['error: connection closed'])
+  })
+
+  it('keeps a quiet socket open while the relay answers pings', async () => {
+    const { conn, closedAt } = await watched()
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    expect(closedAt()).toBeNull()
+    expect(conn.isOpen).toBe(true)
+  })
+
+  it('does not count time blocked inside an event handler as silence', async () => {
+    const { board, conn, closedAt } = await watched()
+    // Enough frames behind the blocked one that ws pauses the socket, so pongs stop being read too.
+    const behind = Array.from({ length: 60 }, (_, i) => wrapFor(`detrás ${i}`, 701))
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    const r = recorder(async (raw) => {
+      if ((raw as NostrEvent).content === 'lento') await gate
+    })
+    conn.subscribe('s', [{ kinds: [1059] }], r.handlers)
+    await until(() => r.eose() === 1)
+    board.inject(wrapFor('lento', 700))
+    for (const event of behind) board.inject(event)
+    await until(() => r.events.length === 1)
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    expect(closedAt()).toBeNull()
+    release()
+    await until(() => r.events.length === 1 + behind.length)
+    expect(conn.isOpen).toBe(true)
+  })
+})
+
 describe('pinned socket factory', () => {
   it.each(['ws://relay.example.com', 'wss://127.0.0.1:7777', 'wss://[::1]', 'wss://localhost:9', 'wss://relay.example.com/?x=1'])(
     'refuses %s before opening any socket',

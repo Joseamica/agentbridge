@@ -15,10 +15,15 @@ export type BoardConnectionOptions = {
   identity: Identity
   createSocket?: SocketFactory
   timeoutMs?: number
+  // Ruling 25: how often an open connection pings the relay. Three intervals with no frame and no
+  // pong end the connection. Default 30 000 ms.
+  heartbeatMs?: number
   log?: (line: string) => void
 }
 
 type Subscription = { filters: Filter[]; handlers: SubscriptionHandlers; retriedAuth: boolean }
+// Per socket: when a frame or pong last arrived, and whether the reader is blocked in a handler.
+type Liveness = { lastActivity: number; readerBusy: boolean }
 
 const CLOSED_REASON = 'error: connection closed'
 
@@ -37,6 +42,7 @@ export class BoardConnection extends EventEmitter {
   private readonly identity: Identity
   private readonly createSocket: SocketFactory
   private readonly timeoutMs: number
+  private readonly heartbeatMs: number
   private readonly log: (line: string) => void
   private socket: WebSocket | null = null
   private opening: Promise<void> | null = null
@@ -52,6 +58,7 @@ export class BoardConnection extends EventEmitter {
     this.identity = options.identity
     this.createSocket = options.createSocket ?? pinnedSocketFactory
     this.timeoutMs = options.timeoutMs ?? 10_000
+    this.heartbeatMs = options.heartbeatMs ?? 30_000
     this.log = options.log ?? (() => {})
   }
 
@@ -78,13 +85,15 @@ export class BoardConnection extends EventEmitter {
       // The stream must exist before the first frame can arrive; it owns all reading from here on.
       const stream = createWebSocketStream(socket, { readableObjectMode: true })
       stream.on('error', (err) => this.log(`${this.url}: ${err.message}`))
-      void this.readFrames(stream)
+      const liveness: Liveness = { lastActivity: Date.now(), readerBusy: false }
+      void this.readFrames(stream, liveness)
       const timer = setTimeout(() => {
         socket.terminate()
         reject(new Error(`timed out connecting to ${this.url}`))
       }, this.timeoutMs)
       socket.on('open', () => {
         clearTimeout(timer)
+        this.startHeartbeat(socket, liveness)
         resolve()
       })
       socket.on('error', (err) => {
@@ -123,15 +132,55 @@ export class BoardConnection extends EventEmitter {
     this.socket?.close()
   }
 
-  private async readFrames(stream: AsyncIterable<unknown>): Promise<void> {
+  private async readFrames(stream: AsyncIterable<unknown>, liveness: Liveness): Promise<void> {
     try {
-      for await (const chunk of stream) await this.onFrame(chunk)
+      for await (const chunk of stream) {
+        liveness.readerBusy = true
+        try {
+          await this.onFrame(chunk)
+        } finally {
+          liveness.readerBusy = false
+          liveness.lastActivity = Date.now()
+        }
+      }
     } catch (err) {
       // Handler exceptions are caught inside onFrame/runHandler, so anything reaching here is a
       // genuine stream failure. The socket's own 'close' handler still runs the actual cleanup;
       // this just makes sure the error itself is not silently swallowed.
       this.log(`${this.url}: read loop failed: ${err instanceof Error ? err.message : String(err)}`)
     }
+  }
+
+  // Ruling 25: a half-open socket (after sleep, a Wi-Fi change or a NAT drop) never reports an
+  // error, so the connection pings and ends the socket after 3 intervals with no frame and no pong.
+  // Time the reader spends blocked inside a handler does not count: ws stops reading the socket
+  // while we fall behind, pongs included, and that backpressure is deliberate. An OK timeout never
+  // ends the socket either, because OK frames legitimately wait behind the same backpressure.
+  private startHeartbeat(socket: WebSocket, liveness: Liveness): void {
+    const touch = () => {
+      liveness.lastActivity = Date.now()
+    }
+    socket.on('message', touch)
+    socket.on('pong', touch)
+    let lastTick = Date.now()
+    const timer = setInterval(() => {
+      const now = Date.now()
+      // A tick that fires this late means the process itself was stalled (synchronous work, sleep),
+      // so frames and pongs may be waiting unread behind this very timer: judge on the next tick.
+      const stalled = now - lastTick > 2 * this.heartbeatMs
+      lastTick = now
+      if (liveness.readerBusy) {
+        liveness.lastActivity = now
+      } else if (!stalled && now - liveness.lastActivity > 3 * this.heartbeatMs) {
+        clearInterval(timer)
+        this.log(`${this.url}: no frames or pongs for ${3 * this.heartbeatMs} ms, closing the connection`)
+        socket.terminate()
+        return
+      }
+      socket.ping()
+    }, this.heartbeatMs)
+    timer.unref()
+    socket.once('close', () => clearInterval(timer))
   }
 
   // Runs a subscription callback and never lets it escape: a throwing onEvent/onEose/onClosed

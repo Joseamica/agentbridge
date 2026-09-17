@@ -15,6 +15,9 @@ export type FakeBoardOptions = {
   maxLimit?: number
   dropIncoming?: (event: NostrEvent) => boolean
   beforeEose?: (subscriptionId: string, filters: Filter[]) => unknown[]
+  // Answer WebSocket pings (default true). The server is built with autoPong off, so this is the
+  // only thing that answers them.
+  respondToPings?: boolean
 }
 
 export type FakeBoard = {
@@ -25,6 +28,9 @@ export type FakeBoard = {
   options: FakeBoardOptions
   inject(event: NostrEvent): void
   disconnectAll(): void
+  // Every session open right now stops sending frames and answering pings, like a half-open socket
+  // after sleep or a NAT drop. Sessions opened afterwards behave normally.
+  goSilent(): void
   close(): Promise<void>
 }
 
@@ -39,10 +45,10 @@ function matches(filter: Filter, event: NostrEvent): boolean {
   return true
 }
 
-type Session = { socket: WebSocket; challenge: string; authed: Set<string>; subs: Map<string, Filter[]> }
+type Session = { socket: WebSocket; challenge: string; authed: Set<string>; subs: Map<string, Filter[]>; silent: boolean }
 
 export async function startFakeBoard(initial: FakeBoardOptions = {}): Promise<FakeBoard> {
-  const server = new WebSocketServer({ host: '127.0.0.1', port: 0, perMessageDeflate: false })
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0, perMessageDeflate: false, autoPong: false })
   await new Promise<void>((resolve) => server.once('listening', () => resolve()))
   const url = `ws://127.0.0.1:${(server.address() as AddressInfo).port}`
   const events: NostrEvent[] = []
@@ -63,6 +69,9 @@ export async function startFakeBoard(initial: FakeBoardOptions = {}): Promise<Fa
     disconnectAll() {
       for (const s of sessions) s.socket.terminate()
     },
+    goSilent() {
+      for (const s of sessions) s.silent = true
+    },
     close: () =>
       new Promise<void>((resolve) => {
         for (const s of sessions) s.socket.terminate()
@@ -71,7 +80,7 @@ export async function startFakeBoard(initial: FakeBoardOptions = {}): Promise<Fa
   }
 
   const send = (s: Session, frame: unknown[]) => {
-    if (s.socket.readyState === WebSocket.OPEN) s.socket.send(JSON.stringify(frame))
+    if (!s.silent && s.socket.readyState === WebSocket.OPEN) s.socket.send(JSON.stringify(frame))
   }
 
   function broadcast(event: NostrEvent) {
@@ -83,10 +92,13 @@ export async function startFakeBoard(initial: FakeBoardOptions = {}): Promise<Fa
   }
 
   server.on('connection', (socket) => {
-    const session: Session = { socket, challenge: randomBytes(16).toString('hex'), authed: new Set(), subs: new Map() }
+    const session: Session = { socket, challenge: randomBytes(16).toString('hex'), authed: new Set(), subs: new Map(), silent: false }
     sessions.add(session)
     socket.on('close', () => sessions.delete(session))
     const o = () => board.options
+    socket.on('ping', (data) => {
+      if (!session.silent && o().respondToPings !== false) socket.pong(data)
+    })
     if ((o().requireAuthToRead || o().requireAuthToWrite) && o().sendAuthChallenge !== false) send(session, ['AUTH', session.challenge])
 
     socket.on('message', (data) => {

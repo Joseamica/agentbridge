@@ -190,6 +190,18 @@ describe('BoardPool.subscribeLive', () => {
     await live.close()
   })
 
+  it('reconnects when the relay goes silent without closing the socket', async () => {
+    const b = await board()
+    const live = pool({ heartbeatMs: 50, reconnectDelaysMs: [20] }).subscribeLive<NostrEvent>([b.url], {
+      precheck: () => null,
+      process: async () => {},
+    })
+    await until(() => reqCount(b) === 1)
+    b.goSilent()
+    await until(() => reqCount(b) === 2)
+    await live.close()
+  })
+
   it('stops reconnecting once the subscription is closed', async () => {
     const b = await board()
     const live = pool().subscribeLive<NostrEvent>([b.url], { precheck: () => null, process: async () => {} })

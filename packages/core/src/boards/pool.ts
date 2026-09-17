@@ -10,6 +10,8 @@ export type PoolOptions = {
   identity: Identity
   createSocket?: SocketFactory
   timeoutMs?: number
+  // Passed to every connection: see BoardConnectionOptions.heartbeatMs.
+  heartbeatMs?: number
   reconnectDelaysMs?: readonly number[]
   now?: () => number
   log?: (line: string) => void
@@ -51,6 +53,7 @@ export class BoardPool {
         identity: this.options.identity,
         createSocket: this.options.createSocket,
         timeoutMs: this.options.timeoutMs,
+        heartbeatMs: this.options.heartbeatMs,
         log: this.options.log,
       })
       created.on('close', () => {
