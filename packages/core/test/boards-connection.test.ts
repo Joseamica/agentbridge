@@ -328,6 +328,13 @@ describe('BoardConnection', () => {
     await expect(conn.connect()).resolves.toBeUndefined()
     expect(conn.isOpen).toBe(true)
   })
+
+  it('refuses heartbeat intervals that would turn into a reconnect storm', () => {
+    for (const heartbeatMs of [0, -5, 1.5, 9, 2 ** 31]) {
+      expect(() => new BoardConnection({ url: 'ws://127.0.0.1:1', identity: me, heartbeatMs })).toThrow(RangeError)
+    }
+    expect(() => new BoardConnection({ url: 'ws://127.0.0.1:1', identity: me, heartbeatMs: 10 })).not.toThrow()
+  })
 })
 
 // Ruling 25: a half-open socket (laptop sleep, Wi-Fi change, NAT drop) never errors on its own.

@@ -171,8 +171,19 @@ export function claimDue(
         postponeForCap.run(input.now + NOSTR.capPostponeSeconds, input.now, row.recipient, row.rumor_id)
         continue
       }
-      const item = toItem(row)
-      if (!input.authorize(item)) {
+      // A row whose content cannot be read back, or whose authorization throws, is abandoned on its
+      // own. Letting the throw escape rolled back the whole claim, so one bad row blocked every
+      // later claimDue for good.
+      let item: OutboxItem
+      let allowed: boolean
+      try {
+        item = toItem(row)
+        allowed = input.authorize(item)
+      } catch {
+        abandon.run(input.now, row.recipient, row.rumor_id)
+        continue
+      }
+      if (!allowed) {
         abandon.run(input.now, row.recipient, row.rumor_id)
         continue
       }
@@ -186,6 +197,20 @@ export function claimDue(
 export function stillClaimed(store: Store, input: ClaimRef & { now: number }): boolean {
   const row = selectRow(store, input.recipient, input.rumorId)
   return row?.state === 'pending' && row.claimed_by === input.owner && (row.claimed_until ?? 0) > input.now
+}
+
+// Extends a claim by a full claim period. The publisher calls it after mining, which can take longer
+// than the claim itself on slow machines. `claimed_by` still naming the caller proves nobody else
+// claimed the row meanwhile, because claimDue overwrites it — so a lapsed claim can be renewed.
+export function renewClaim(store: Store, input: ClaimRef & { now: number }): 'ok' | 'claim_lost' {
+  return store.tx(() => {
+    const row = selectRow(store, input.recipient, input.rumorId)
+    if (row?.state !== 'pending' || row.claimed_by !== input.owner) return 'claim_lost'
+    store.db
+      .prepare('UPDATE outbox SET claimed_until = ?, updated_at = ? WHERE recipient = ? AND rumor_id = ?')
+      .run(input.now + NOSTR.claimSeconds, input.now, input.recipient, input.rumorId)
+    return 'ok'
+  })
 }
 
 export function reservePublish(store: Store, input: ClaimRef & { now: number }): 'reserved' | 'claim_lost' | 'over_budget' {

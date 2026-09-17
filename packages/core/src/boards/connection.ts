@@ -60,7 +60,13 @@ export class BoardConnection extends EventEmitter {
     this.identity = options.identity
     this.createSocket = options.createSocket ?? pinnedSocketFactory
     this.timeoutMs = options.timeoutMs ?? 10_000
-    this.heartbeatMs = options.heartbeatMs ?? 30_000
+    const heartbeatMs = options.heartbeatMs ?? 30_000
+    // 0, a negative or fractional value, or anything above setInterval's maximum becomes a ~1 ms
+    // interval: instant terminations and a reconnect storm (plan 1 final review).
+    if (!Number.isInteger(heartbeatMs) || heartbeatMs < 10 || heartbeatMs > 2_147_483_647) {
+      throw new RangeError('heartbeatMs must be an integer from 10 to 2147483647')
+    }
+    this.heartbeatMs = heartbeatMs
     this.log = options.log ?? (() => {})
   }
 
@@ -132,6 +138,13 @@ export class BoardConnection extends EventEmitter {
 
   close(): void {
     this.socket?.close()
+  }
+
+  // Drops the socket at once, without the close handshake. Shutdown uses it: against a relay that
+  // stopped reading, close() waits up to 30 s for a close frame that never comes, and every query
+  // still in flight waits for its own timeout.
+  terminate(): void {
+    this.socket?.terminate()
   }
 
   private async readFrames(stream: AsyncIterable<unknown>, liveness: Liveness): Promise<void> {

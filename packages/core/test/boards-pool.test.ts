@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { createServer, type AddressInfo, type Socket } from 'node:net'
 import { finalizeEvent, type NostrEvent } from 'nostr-tools/pure'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -45,6 +46,33 @@ const until = async (check: () => boolean, tries = 500) => {
   expect(check()).toBe(true)
 }
 const reqCount = (b: FakeBoard) => b.frames.filter((f) => f[0] === 'REQ').length
+
+// A relay that completes the WebSocket handshake and then never reads again, so a close frame is
+// never answered — like a relay process that hung.
+async function stuckRelay(): Promise<{ url: string; accepted: () => number; close(): Promise<void> }> {
+  const sockets = new Set<Socket>()
+  let accepted = 0
+  const server = createServer((socket) => {
+    sockets.add(socket)
+    socket.once('data', (chunk) => {
+      const key = /sec-websocket-key:\s*(\S+)/i.exec(chunk.toString('latin1'))?.[1] ?? ''
+      const accept = createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64')
+      socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`)
+      accepted++
+      socket.pause()
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+  return {
+    url: `ws://127.0.0.1:${(server.address() as AddressInfo).port}`,
+    accepted: () => accepted,
+    close: () =>
+      new Promise<void>((resolve) => {
+        for (const socket of sockets) socket.destroy()
+        server.close(() => resolve())
+      }),
+  }
+}
 
 describe('BoardPool.publish', () => {
   it('reports each relay separately and never throws', async () => {
@@ -324,6 +352,20 @@ describe('BoardPool.close', () => {
     await until(() => sockets.size === 1)
     const started = Date.now()
     await p.close()
+    expect(Date.now() - started).toBeLessThan(1_000)
+  })
+
+  it('ends an in-flight query at once when closed against a relay that stopped reading', async () => {
+    const relay = await stuckRelay()
+    cleanups.push(() => relay.close())
+    const p = pool()
+    const pending = p.query(relay.url, { kinds: [1059] }, 5_000)
+    await until(() => relay.accepted() === 1)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const started = Date.now()
+    await p.close()
+    const result = await pending
+    expect(result.complete).toBe(false)
     expect(Date.now() - started).toBeLessThan(1_000)
   })
 })

@@ -114,9 +114,14 @@ describe('recoverHistory', () => {
   })
 
   it('never trusts a page size larger than the limit it asked for', async () => {
-    const { board, recover, remaining } = await setup({ maxLimit: 300 })
+    // Ruling 17 guard. The day-4 page (200 stored + 60 extras = 260 events) must stay under the query
+    // cap (limit 200 + 64), or the page ends incomplete before largestPage is ever updated and this
+    // test stops guarding anything (plan 1 final review, Ruling 29). Without the clamp, largestPage
+    // becomes 260; day 5's escalated 400-limit page then gets only the relay's 250 events, looks
+    // short against 260, and the window is marked complete with 100 events unseen.
+    const { board, recover, remaining } = await setup({ maxLimit: 250 })
     for (let i = 0; i < 200; i++) board.inject(event(dayStart(4) + 1000 + i))
-    const extras = Array.from({ length: 150 }, (_, i) => event(dayStart(4) + 1 + i))
+    const extras = Array.from({ length: 60 }, (_, i) => event(dayStart(4) + 1 + i))
     board.options.beforeEose = (_id, filters) => {
       const day4 = filters.find((f) => f.since === dayStart(4))
       if (!day4) return []

@@ -225,7 +225,7 @@ export class BoardPool {
     this.closed = true
     const live = [...this.live]
     for (const subscription of live) subscription.stop()
-    for (const conn of this.connections.values()) conn.close()
+    for (const conn of this.connections.values()) conn.terminate()
     this.connections.clear()
     await Promise.all(live.map((subscription) => subscription.close()))
   }

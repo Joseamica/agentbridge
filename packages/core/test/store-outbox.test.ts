@@ -12,6 +12,7 @@ import {
   openStore,
   postpone,
   purgeOutbox,
+  renewClaim,
   reservePublish,
   resolveOutboxMessage,
   stillClaimed,
@@ -233,5 +234,48 @@ describe('cleanup', () => {
     expect(purgeOutbox(store, T0 + NOSTR.contentRetentionSeconds - 1)).toBe(0)
     expect(purgeOutbox(store, T0 + NOSTR.contentRetentionSeconds)).toBe(1)
     expect(rowState(2)?.state).toBe('pending')
+  })
+})
+
+describe('claimDue guards', () => {
+  it('abandons only the row whose authorization throws', () => {
+    enqueue(store, input(1))
+    enqueue(store, input(2))
+    const claimed = claimDue(store, {
+      owner: 'a',
+      now: T0,
+      limit: 10,
+      authorize: (item) => {
+        if (item.rumorId === hex(1)) throw new Error('boom')
+        return true
+      },
+    })
+    expect(claimed.map((i) => i.rumorId)).toEqual([hex(2)])
+    expect(rowState(1)?.state).toBe('abandoned')
+    expect(rowState(2)?.state).toBe('pending')
+  })
+})
+
+describe('renewClaim', () => {
+  it('extends a claim still owned by the caller, even after it lapsed', () => {
+    enqueue(store, input(1))
+    claimOne('a', T0)
+    const later = T0 + NOSTR.claimSeconds + 30
+    expect(renewClaim(store, { recipient: RECIPIENT, rumorId: hex(1), owner: 'a', now: later })).toBe('ok')
+    expect(stillClaimed(store, { recipient: RECIPIENT, rumorId: hex(1), owner: 'a', now: later + NOSTR.claimSeconds - 1 })).toBe(true)
+  })
+
+  it('refuses once another owner claimed the row', () => {
+    enqueue(store, input(1))
+    claimOne('a', T0)
+    claimOne('b', T0 + NOSTR.claimSeconds)
+    expect(renewClaim(store, { recipient: RECIPIENT, rumorId: hex(1), owner: 'a', now: T0 + NOSTR.claimSeconds })).toBe('claim_lost')
+  })
+
+  it('refuses for a row that is no longer pending', () => {
+    enqueue(store, input(1))
+    claimOne('a', T0)
+    markPublished(store, { recipient: RECIPIENT, rumorId: hex(1), owner: 'a', now: T0 })
+    expect(renewClaim(store, { recipient: RECIPIENT, rumorId: hex(1), owner: 'a', now: T0 })).toBe('claim_lost')
   })
 })
