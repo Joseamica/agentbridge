@@ -1,6 +1,7 @@
 import { finalizeEvent, type NostrEvent } from 'nostr-tools/pure'
 import { afterEach, describe, expect, it } from 'vitest'
 import { BoardPool, NOSTR, type PoolOptions } from '@agentbridge/core'
+import { sanitizeRelayText } from '../src/boards/pool'
 import { plainSocketFactory, startFakeBoard, type FakeBoard, type FakeBoardOptions } from './support/fake-board'
 import { testIdentity } from './support/keys'
 
@@ -132,10 +133,44 @@ describe('BoardPool.subscribeLive', () => {
     })
     await until(() => reqCount(b) === 1)
     for (let n = 1; n <= total; n++) b.inject(fake(n))
-    await until(() => processed === total, 3_000)
+    // 1_500 tries * 10ms = 15s, safely under the 20s test timeout (3_000 tries would poll for up
+    // to 30s).
+    await until(() => processed === total, 1_500)
     expect(waiting).toContain(true)
     expect(waiting.at(-1)).toBe(false)
     await live.close()
+  })
+
+  it('close() finishes every event already accepted while producers wait on a full queue', async () => {
+    const b = await board()
+    const waiting: boolean[] = []
+    const processed: number[] = []
+    let accepted = 0
+    let releaseFirst!: () => void
+    const firstGate = new Promise<void>((resolve) => (releaseFirst = resolve))
+    let heldFirst = false
+    const live = pool({ onPressure: (_relay, w) => waiting.push(w) }).subscribeLive<NostrEvent>([b.url], {
+      precheck: (raw) => {
+        accepted++
+        return raw as NostrEvent
+      },
+      process: async (e) => {
+        if (!heldFirst) {
+          heldFirst = true
+          await firstGate
+        }
+        processed.push(Number(e.content))
+      },
+    })
+    await until(() => reqCount(b) === 1)
+    const total = NOSTR.receiveQueueMax + 20
+    for (let n = 1; n <= total; n++) b.inject(fake(n))
+    await until(() => waiting.includes(true))
+    const closing = live.close()
+    releaseFirst()
+    await closing
+    expect(processed).toHaveLength(accepted)
+    expect(new Set(processed).size).toBe(accepted)
   })
 
   it('reconnects after the relay drops the connection', async () => {
@@ -173,5 +208,71 @@ describe('BoardPool.subscribeLive', () => {
     await p.close()
     await new Promise((r) => setTimeout(r, 200))
     expect(reqCount(b)).toBe(1)
+  })
+
+  // Ruling 13: each reconnect cycle used to attach a new .then() reaction to a `stop` promise
+  // that never settled until close(), retaining roughly 460 B per cycle for as long as the
+  // subscription kept reconnecting. A direct leak assertion is impractical here, so this test
+  // instead makes many reconnect cycles happen quickly and checks that close() still resolves
+  // cleanly afterwards — the structural fix (per-cycle stoppers, removed in a finally) does not
+  // need this test to fail before the fix; it is a regression guard, not a repro.
+  it('does not pile up retained reactions across many reconnect cycles', async () => {
+    const b = await board({ rejectReads: true })
+    const live = pool({ reconnectDelaysMs: [5] }).subscribeLive<NostrEvent>([b.url], {
+      precheck: () => null,
+      process: async () => {},
+    })
+    await until(() => reqCount(b) >= 20)
+    await expect(live.close()).resolves.toBeUndefined()
+  })
+
+  it('keeps backing off when a relay ends the subscription right after EOSE', async () => {
+    const b = await board()
+    const live = pool({ reconnectDelaysMs: [20, 400] }).subscribeLive<NostrEvent>([b.url], {
+      precheck: () => null,
+      process: async () => {},
+    })
+    await until(() => reqCount(b) === 1)
+    // The fake board sends EOSE right after REQ; give it a moment to arrive and be recorded.
+    await new Promise((r) => setTimeout(r, 20))
+    b.disconnectAll()
+    await until(() => reqCount(b) === 2)
+    // Disconnecting again this soon after EOSE means the subscription never stayed open for
+    // STABLE_SUBSCRIPTION_MS, so the backoff must keep escalating to delays[1] (400ms), not reset
+    // to delays[0] (20ms).
+    b.disconnectAll()
+    await new Promise((r) => setTimeout(r, 150))
+    expect(reqCount(b)).toBe(2)
+    await until(() => reqCount(b) === 3)
+    await live.close()
+  })
+
+  it('treats an empty reconnect delay list as the default schedule', async () => {
+    const b = await board({ rejectReads: true })
+    const live = pool({ reconnectDelaysMs: [] }).subscribeLive<NostrEvent>([b.url], {
+      precheck: () => null,
+      process: async () => {},
+    })
+    await new Promise((r) => setTimeout(r, 300))
+    expect(reqCount(b)).toBeLessThanOrEqual(2)
+    await live.close()
+  })
+})
+
+describe('sanitizeRelayText', () => {
+  it('caps length at 200 characters and strips control characters', () => {
+    expect(sanitizeRelayText('a'.repeat(250))).toBe('a'.repeat(200))
+    expect(sanitizeRelayText('bad\x00\x01\x1f\x7fname')).toBe('bad    name')
+  })
+
+  it('bounds the CLOSED reason before it reaches the pool log', async () => {
+    const b = await board({ rejectReads: true })
+    const lines: string[] = []
+    const live = pool({ log: (line) => lines.push(line) }).subscribeLive<NostrEvent>([b.url], {
+      precheck: () => null,
+      process: async () => {},
+    })
+    await until(() => lines.some((l) => l.includes('restricted: reads are disabled')))
+    await live.close()
   })
 })

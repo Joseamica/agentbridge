@@ -23,11 +23,11 @@ export class ReceiveQueue<T> {
 
   async push(source: string, item: T): Promise<void> {
     if (this.items.length >= this.options.max) {
-      this.options.onPressure?.(source, true)
+      this.notifyPressure(source, true)
       while (this.items.length >= this.options.max) {
         await new Promise<void>((resolve) => this.capacityWaiters.push(resolve))
       }
-      this.options.onPressure?.(source, false)
+      this.notifyPressure(source, false)
     }
     this.items.push({ source, item })
     void this.drain()
@@ -38,6 +38,27 @@ export class ReceiveQueue<T> {
     return new Promise((resolve) => this.idleWaiters.push(resolve))
   }
 
+  // Ruling 15a: onPressure is an observer, not part of delivery. A throwing callback must not lose
+  // the item it was called about (which has already passed precheck) and must not stop other
+  // waiters from being woken. There is no logger on this class, so the error is simply dropped.
+  private notifyPressure(source: string, waiting: boolean): void {
+    try {
+      this.options.onPressure?.(source, waiting)
+    } catch {
+      // ignored — see comment above
+    }
+  }
+
+  // Ruling 15a: onError is an observer too. `drain` is started fire-and-forget via `void`, so a
+  // throwing onError would otherwise escape as an unhandled rejection and stop draining entirely.
+  private notifyError(err: unknown, source: string): void {
+    try {
+      this.options.onError?.(err, source)
+    } catch {
+      // ignored — see comment above
+    }
+  }
+
   private async drain(): Promise<void> {
     if (this.draining) return
     this.draining = true
@@ -46,9 +67,15 @@ export class ReceiveQueue<T> {
         const next = this.items.shift()!
         this.capacityWaiters.shift()?.()
         try {
-          await this.options.process(next.item, next.source)
+          // Ruling 15a: wrapping in Promise.resolve().then(...) turns even a synchronous throw
+          // from a non-async `process` into a promise rejection, so `await` always yields the
+          // microtask queue at least once before this loop re-checks `items.length`. Without that
+          // yield, a producer just woken by the `capacityWaiters.shift()` above (whose own
+          // continuation is also a microtask) might not have pushed its item yet, and this loop
+          // could wrongly conclude the queue is idle before that push lands.
+          await Promise.resolve().then(() => this.options.process(next.item, next.source))
         } catch (err) {
-          this.options.onError?.(err, next.source)
+          this.notifyError(err, next.source)
         }
       }
     } finally {

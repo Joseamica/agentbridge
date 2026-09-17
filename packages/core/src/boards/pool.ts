@@ -21,8 +21,21 @@ export type QueryResult = { events: unknown[]; complete: boolean; closedReason: 
 export type LiveHandlers<T> = { precheck(raw: unknown, relay: string): T | null; process(item: T, relay: string): Promise<void> }
 
 const DEFAULT_RECONNECT_DELAYS_MS: readonly number[] = [1_000, 2_000, 5_000, 10_000, 30_000, 60_000]
+// Ruling 14: a subscription only counts as healthy — and earns a backoff reset — once it has
+// stayed open this long after its EOSE. Without a minimum, a relay that sends EOSE and closes
+// immediately would force a full re-subscription (re-downloading up to two days of events) on
+// every cycle, at the fastest configured delay, forever.
+const STABLE_SUBSCRIPTION_MS = 60_000
 const newSubscriptionId = () => randomBytes(8).toString('hex')
 const messageOf = (err: unknown) => (err instanceof Error ? err.message : String(err))
+
+// Ruling 15b: any relay-supplied string that reaches `log` (a CLOSED reason, an error message
+// derived from one) is untrusted and unbounded. Control characters are blanked and the result is
+// capped well under typical terminal/log-line limits. Deliberately not exported from index.ts —
+// this is an internal detail of how the pool logs, not part of the package's public surface.
+export function sanitizeRelayText(text: string): string {
+  return text.replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200)
+}
 
 export class BoardPool {
   private readonly connections = new Map<string, BoardConnection>()
@@ -102,18 +115,23 @@ export class BoardPool {
   }
 
   subscribeLive<T>(relays: readonly string[], handlers: LiveHandlers<T>): { close(): Promise<void> } {
-    const delays = this.options.reconnectDelaysMs ?? DEFAULT_RECONNECT_DELAYS_MS
+    // Ruling 14: an empty array is a caller mistake, not "reconnect with no delay" — fall back to
+    // the default schedule rather than hammering the relay.
+    const delays = this.options.reconnectDelaysMs?.length ? this.options.reconnectDelaysMs : DEFAULT_RECONNECT_DELAYS_MS
     const now = this.options.now ?? nowSeconds
     const wakers = new Set<() => void>()
+    // Ruling 13: per-cycle stoppers, each removed once its cycle ends, instead of every cycle
+    // attaching a fresh `.then()` reaction to one long-lived `stop` promise that never settles
+    // until close() — which retained roughly 460 B per reconnect cycle for as long as the
+    // subscription kept reconnecting.
+    const stoppers = new Set<() => void>()
     let stopped = false
-    let signalStop!: () => void
-    const stop = new Promise<void>((resolve) => (signalStop = resolve))
 
     const queue = new ReceiveQueue<T>({
       max: NOSTR.receiveQueueMax,
       process: (item, relay) => handlers.process(item, relay),
       onPressure: (relay, waiting) => this.options.onPressure?.(relay, waiting),
-      onError: (err, relay) => this.options.log?.(`${relay}: processing failed: ${messageOf(err)}`),
+      onError: (err, relay) => this.options.log?.(`${relay}: processing failed: ${sanitizeRelayText(messageOf(err))}`),
     })
 
     const sleep = (ms: number) =>
@@ -130,11 +148,17 @@ export class BoardPool {
     const run = async (relay: string) => {
       let attempt = 0
       while (!stopped) {
+        // Ruling 14: set once EOSE arrives (in wall-clock time, not the pool's injectable `now`,
+        // which is in seconds and meant for filters); reset to null at the top of every cycle.
+        let stableSince: number | null = null
         try {
           const conn = await this.connection(relay)
           if (stopped) break
           const id = newSubscriptionId()
-          const closed = new Promise<string>((resolve) => {
+          let stopper!: () => void
+          const reason = await new Promise<string>((resolve) => {
+            stopper = () => resolve('stopped')
+            stoppers.add(stopper)
             conn.subscribe(id, [{ kinds: [NOSTR.wrapKind], '#p': [this.options.identity.publicKey], since: now() - NOSTR.liveSinceSeconds }], {
               onEvent: async (raw) => {
                 if (stopped) return
@@ -142,18 +166,20 @@ export class BoardPool {
                 if (item !== null) await queue.push(relay, item)
               },
               onEose: () => {
-                attempt = 0
+                stableSince = Date.now()
               },
-              onClosed: (reason) => resolve(reason),
+              onClosed: (closedReason) => resolve(closedReason),
             })
-          })
-          const reason = await Promise.race([closed, stop.then(() => 'stopped')])
+          }).finally(() => stoppers.delete(stopper))
           conn.unsubscribe(id)
           if (stopped) break
-          this.options.log?.(`${relay}: live subscription closed (${reason})`)
+          this.options.log?.(`${relay}: live subscription closed (${sanitizeRelayText(reason)})`)
+          // Ruling 14: only a subscription that proved itself stable — EOSE, then staying open for
+          // STABLE_SUBSCRIPTION_MS — earns a backoff reset. Otherwise keep escalating.
+          if (stableSince !== null && Date.now() - stableSince >= STABLE_SUBSCRIPTION_MS) attempt = 0
         } catch (err) {
           if (stopped) break
-          this.options.log?.(`${relay}: ${messageOf(err)}`)
+          this.options.log?.(`${relay}: ${sanitizeRelayText(messageOf(err))}`)
         }
         await sleep(delays[Math.min(attempt, delays.length - 1)]!)
         attempt++
@@ -164,7 +190,7 @@ export class BoardPool {
     const close = async () => {
       if (!stopped) {
         stopped = true
-        signalStop()
+        for (const stop of [...stoppers]) stop()
         for (const wake of [...wakers]) wake()
       }
       await Promise.all(loops)
