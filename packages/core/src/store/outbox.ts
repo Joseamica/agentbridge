@@ -206,6 +206,15 @@ export function claimDue(
   })
 }
 
+// Whether a claim could still find work: a pending row that is due and not claimed by anyone right now.
+export function hasDueOutbox(store: Store, now: number): boolean {
+  return (
+    store.db
+      .prepare("SELECT 1 FROM outbox WHERE state = 'pending' AND next_attempt_at <= ? AND (claimed_until IS NULL OR claimed_until <= ?) LIMIT 1")
+      .get(now, now) !== undefined
+  )
+}
+
 export function stillClaimed(store: Store, input: ClaimRef & { now: number }): boolean {
   const row = selectRow(store, input.recipient, input.rumorId)
   return row?.state === 'pending' && row.claimed_by === input.owner && (row.claimed_until ?? 0) > input.now
