@@ -76,4 +76,72 @@ CREATE TABLE cursors (
 );
 `,
   },
+  {
+    version: 2,
+    name: 'responder: settings, inbox questions, attempts, channel lock',
+    sql: `
+ALTER TABLE requests ADD COLUMN decision_rumor_json TEXT;
+ALTER TABLE requests ADD COLUMN decision_resent_at INTEGER;
+
+CREATE TABLE settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE inbox_questions (
+  sender_pubkey TEXT NOT NULL CHECK (length(sender_pubkey) = 64),
+  question_id TEXT NOT NULL,
+  rumor_id TEXT NOT NULL CHECK (length(rumor_id) = 64),
+  rumor_created_at INTEGER NOT NULL,
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  text TEXT,
+  state TEXT NOT NULL CHECK (state IN ('queued', 'dispatched', 'answered', 'rejected')),
+  admitted INTEGER NOT NULL CHECK (admitted IN (0, 1)),
+  receipt_rumor_json TEXT,
+  decision TEXT CHECK (decision IN ('answer', 'rejected')),
+  reject_reason TEXT CHECK (reject_reason IN ('expired', 'limit', 'unanswered', 'stale_generation')),
+  decision_rumor_json TEXT,
+  expired_attempts INTEGER NOT NULL DEFAULT 0 CHECK (expired_attempts >= 0),
+  received_at INTEGER NOT NULL,
+  regenerated_at INTEGER,
+  decided_at INTEGER,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (sender_pubkey, question_id)
+);
+CREATE INDEX inbox_questions_queue ON inbox_questions (state, received_at);
+CREATE INDEX inbox_questions_sender ON inbox_questions (sender_pubkey, received_at);
+
+CREATE TABLE attempts (
+  attempt_id TEXT PRIMARY KEY,
+  sender_pubkey TEXT NOT NULL,
+  question_id TEXT NOT NULL,
+  code TEXT NOT NULL,
+  epoch INTEGER NOT NULL,
+  deadline_ms INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('active', 'answered', 'expired', 'cancelled')),
+  cancel_reason TEXT CHECK (cancel_reason IN ('revoked', 'recovered', 'purged')),
+  created_at INTEGER NOT NULL,
+  ended_at INTEGER,
+  FOREIGN KEY (sender_pubkey, question_id) REFERENCES inbox_questions (sender_pubkey, question_id) ON DELETE CASCADE
+);
+CREATE INDEX attempts_state ON attempts (state);
+CREATE INDEX attempts_code ON attempts (code);
+
+-- Every code ever handed to Claude. Never purged: a late reply naming an old code must never match a
+-- newer question, even after that old question and its attempts were deleted.
+CREATE TABLE question_codes (
+  code TEXT PRIMARY KEY,
+  first_used_at INTEGER NOT NULL
+);
+
+CREATE TABLE channel_lock (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  pid INTEGER NOT NULL,
+  process_start TEXT NOT NULL,
+  epoch INTEGER NOT NULL CHECK (epoch >= 1),
+  acquired_at INTEGER NOT NULL
+);
+`,
+  },
 ]
