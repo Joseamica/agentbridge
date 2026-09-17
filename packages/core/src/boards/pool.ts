@@ -1,0 +1,183 @@
+import { randomBytes } from 'node:crypto'
+import type { NostrEvent } from 'nostr-tools/pure'
+import type { Identity } from '../identity'
+import { NOSTR, nowSeconds } from '../nostr-constants'
+import { BoardConnection, type Filter } from './connection'
+import { ReceiveQueue } from './receive-queue'
+import type { SocketFactory } from './socket'
+
+export type PoolOptions = {
+  identity: Identity
+  createSocket?: SocketFactory
+  timeoutMs?: number
+  reconnectDelaysMs?: readonly number[]
+  now?: () => number
+  log?: (line: string) => void
+  onPressure?: (relay: string, waiting: boolean) => void
+}
+
+export type PublishOutcome = { accepted: string[]; rejected: Array<{ relay: string; reason: string }> }
+export type QueryResult = { events: unknown[]; complete: boolean; closedReason: string | null }
+export type LiveHandlers<T> = { precheck(raw: unknown, relay: string): T | null; process(item: T, relay: string): Promise<void> }
+
+const DEFAULT_RECONNECT_DELAYS_MS: readonly number[] = [1_000, 2_000, 5_000, 10_000, 30_000, 60_000]
+const newSubscriptionId = () => randomBytes(8).toString('hex')
+const messageOf = (err: unknown) => (err instanceof Error ? err.message : String(err))
+
+export class BoardPool {
+  private readonly connections = new Map<string, BoardConnection>()
+  private readonly liveClosers = new Set<() => Promise<void>>()
+
+  constructor(private readonly options: PoolOptions) {}
+
+  private async connection(relay: string): Promise<BoardConnection> {
+    let conn = this.connections.get(relay)
+    if (!conn) {
+      const created = new BoardConnection({
+        url: relay,
+        identity: this.options.identity,
+        createSocket: this.options.createSocket,
+        timeoutMs: this.options.timeoutMs,
+        log: this.options.log,
+      })
+      created.on('close', () => {
+        if (this.connections.get(relay) === created) this.connections.delete(relay)
+      })
+      this.connections.set(relay, created)
+      conn = created
+    }
+    try {
+      await conn.connect()
+    } catch (err) {
+      if (this.connections.get(relay) === conn) this.connections.delete(relay)
+      throw err
+    }
+    return conn
+  }
+
+  async publish(relays: readonly string[], event: NostrEvent, beforeSend: () => boolean = () => true): Promise<PublishOutcome> {
+    const outcome: PublishOutcome = { accepted: [], rejected: [] }
+    const targets = [...new Set(relays)].slice(0, NOSTR.maxRelaysPerContact)
+    await Promise.all(
+      targets.map(async (relay) => {
+        try {
+          const result = await (await this.connection(relay)).publish(event, beforeSend)
+          if (result.ok) outcome.accepted.push(relay)
+          else outcome.rejected.push({ relay, reason: result.message })
+        } catch (err) {
+          outcome.rejected.push({ relay, reason: `error: ${messageOf(err)}` })
+        }
+      }),
+    )
+    return outcome
+  }
+
+  async query(relay: string, filter: Filter, timeoutMs = this.options.timeoutMs ?? 10_000): Promise<QueryResult> {
+    let conn: BoardConnection
+    try {
+      conn = await this.connection(relay)
+    } catch (err) {
+      return { events: [], complete: false, closedReason: `error: ${messageOf(err)}` }
+    }
+    const id = newSubscriptionId()
+    const events: unknown[] = []
+    return new Promise<QueryResult>((resolve) => {
+      let finished = false
+      const finish = (result: QueryResult) => {
+        if (finished) return
+        finished = true
+        clearTimeout(timer)
+        conn.unsubscribe(id)
+        resolve(result)
+      }
+      const timer = setTimeout(() => finish({ events, complete: false, closedReason: 'error: timed out waiting for EOSE' }), timeoutMs)
+      conn.subscribe(id, [filter], {
+        onEvent: (raw) => {
+          events.push(raw)
+        },
+        onEose: () => finish({ events, complete: true, closedReason: null }),
+        onClosed: (reason) => finish({ events, complete: false, closedReason: reason }),
+      })
+    })
+  }
+
+  subscribeLive<T>(relays: readonly string[], handlers: LiveHandlers<T>): { close(): Promise<void> } {
+    const delays = this.options.reconnectDelaysMs ?? DEFAULT_RECONNECT_DELAYS_MS
+    const now = this.options.now ?? nowSeconds
+    const wakers = new Set<() => void>()
+    let stopped = false
+    let signalStop!: () => void
+    const stop = new Promise<void>((resolve) => (signalStop = resolve))
+
+    const queue = new ReceiveQueue<T>({
+      max: NOSTR.receiveQueueMax,
+      process: (item, relay) => handlers.process(item, relay),
+      onPressure: (relay, waiting) => this.options.onPressure?.(relay, waiting),
+      onError: (err, relay) => this.options.log?.(`${relay}: processing failed: ${messageOf(err)}`),
+    })
+
+    const sleep = (ms: number) =>
+      new Promise<void>((resolve) => {
+        const wake = () => {
+          clearTimeout(timer)
+          wakers.delete(wake)
+          resolve()
+        }
+        const timer = setTimeout(wake, ms)
+        wakers.add(wake)
+      })
+
+    const run = async (relay: string) => {
+      let attempt = 0
+      while (!stopped) {
+        try {
+          const conn = await this.connection(relay)
+          if (stopped) break
+          const id = newSubscriptionId()
+          const closed = new Promise<string>((resolve) => {
+            conn.subscribe(id, [{ kinds: [NOSTR.wrapKind], '#p': [this.options.identity.publicKey], since: now() - NOSTR.liveSinceSeconds }], {
+              onEvent: async (raw) => {
+                if (stopped) return
+                const item = handlers.precheck(raw, relay)
+                if (item !== null) await queue.push(relay, item)
+              },
+              onEose: () => {
+                attempt = 0
+              },
+              onClosed: (reason) => resolve(reason),
+            })
+          })
+          const reason = await Promise.race([closed, stop.then(() => 'stopped')])
+          conn.unsubscribe(id)
+          if (stopped) break
+          this.options.log?.(`${relay}: live subscription closed (${reason})`)
+        } catch (err) {
+          if (stopped) break
+          this.options.log?.(`${relay}: ${messageOf(err)}`)
+        }
+        await sleep(delays[Math.min(attempt, delays.length - 1)]!)
+        attempt++
+      }
+    }
+
+    const loops = [...new Set(relays)].slice(0, NOSTR.maxRelaysPerContact).map((relay) => run(relay))
+    const close = async () => {
+      if (!stopped) {
+        stopped = true
+        signalStop()
+        for (const wake of [...wakers]) wake()
+      }
+      await Promise.all(loops)
+      await queue.idle()
+      this.liveClosers.delete(close)
+    }
+    this.liveClosers.add(close)
+    return { close }
+  }
+
+  async close(): Promise<void> {
+    await Promise.all([...this.liveClosers].map((close) => close()))
+    for (const conn of this.connections.values()) conn.close()
+    this.connections.clear()
+  }
+}
