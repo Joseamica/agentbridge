@@ -431,6 +431,7 @@ git commit -m "fix(core): restore the history page-size guard, terminate sockets
     - `inbox_questions`: PK `(sender_pubkey, question_id)`
     - `attempts`: PK `attempt_id`, FK to `inbox_questions` with `ON DELETE CASCADE`
     - `channel_lock`: single row, `id = 1`
+    - `question_codes(code PK, first_used_at)`: every code ever handed to Claude. It is never purged, so a code is never reused, even after its question and attempts were deleted.
     - `requests.decision_rumor_json` and `requests.decision_resent_at`
     - `inbox_questions.regenerated_at` (the question's own regeneration clock)
   - `DEFAULT_RELAYS: readonly string[]`
@@ -489,7 +490,7 @@ describe('schema v2', () => {
     const store = await newStore()
     expect(MIGRATIONS.map((m) => m.version)).toEqual([1, 2])
     const tables = (store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((r) => r.name)
-    expect(tables).toEqual(expect.arrayContaining(['settings', 'inbox_questions', 'attempts', 'channel_lock']))
+    expect(tables).toEqual(expect.arrayContaining(['settings', 'inbox_questions', 'attempts', 'channel_lock', 'question_codes']))
     const columns = (store.db.prepare('PRAGMA table_info(requests)').all() as Array<{ name: string }>).map((c) => c.name)
     expect(columns).toEqual(expect.arrayContaining(['decision_rumor_json', 'decision_resent_at']))
     const inboxColumns = (store.db.prepare('PRAGMA table_info(inbox_questions)').all() as Array<{ name: string }>).map((c) => c.name)
@@ -645,6 +646,13 @@ CREATE TABLE attempts (
 );
 CREATE INDEX attempts_state ON attempts (state);
 CREATE INDEX attempts_code ON attempts (code);
+
+-- Every code ever handed to Claude. Never purged: a late reply naming an old code must never match a
+-- newer question, even after that old question and its attempts were deleted.
+CREATE TABLE question_codes (
+  code TEXT PRIMARY KEY,
+  first_used_at INTEGER NOT NULL
+);
 
 CREATE TABLE channel_lock (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -1683,7 +1691,7 @@ git commit -m "feat(core): question admission with stored final decisions, revoc
   - `type ReserveOutcome = { kind: 'reserved'; attempt: ActiveAttempt } | { kind: 'busy' } | { kind: 'empty' } | { kind: 'fenced' }`
   - `reserveNextQuestion(store, { epoch, nowMs, attemptTimeoutMs, identity, newCode?, newAttemptId? }): ReserveOutcome`
     - It skips, and rejects with `stale_generation` without sending, any queued question whose contact is no longer approved with its generation.
-    - The code it hands out was never used by any stored attempt (it draws again, up to 50 times), so a late reply naming an old code can never be taken as the answer to a newer question.
+    - The code it hands out was never handed out before (checked against `question_codes`, which is never purged; it draws again, up to 50 times), so a late reply naming an old code can never be taken as the answer to a newer question.
   - `getAttemptState(store, attemptId): { state: AttemptState; cancelReason: AttemptCancelReason | null } | null`
   - `type ExpireOutcome = { kind: 'requeued' } | { kind: 'rejected_unanswered' } | { kind: 'not_due' } | { kind: 'not_active' } | { kind: 'fenced' }`
   - `expireAttempt(store, { epoch, attemptId, nowMs, identity }): ExpireOutcome`
@@ -1770,6 +1778,19 @@ describe('reserveNextQuestion', () => {
     })
     expect(getInboxQuestion(store, asker.publicKey, uuid(1))?.state).toBe('dispatched')
     expect(reserve()).toEqual({ kind: 'busy' })
+  })
+
+  it('never reuses a code, even after the question that used it was purged', () => {
+    admit(1)
+    const first = reserveNextQuestion(store, { epoch, nowMs: T0_MS, attemptTimeoutMs: TIMEOUT, identity: responder, newCode: () => 'AAAA' })
+    if (first.kind !== 'reserved') throw new Error('expected a reservation')
+    answer({ code: 'AAAA' })
+    store.db.prepare('DELETE FROM inbox_questions').run()
+    admit(2, T0 + 1)
+    const draws = ['AAAA', 'CCCC']
+    const second = reserveNextQuestion(store, { epoch, nowMs: T0_MS, attemptTimeoutMs: TIMEOUT, identity: responder, newCode: () => draws.shift() ?? 'ZZZZ' })
+    expect(second).toMatchObject({ kind: 'reserved', attempt: { code: 'CCCC' } })
+    expect(answer({ code: 'AAAA' })).toEqual({ kind: 'wrong_code', activeCode: 'CCCC' })
   })
 
   it('never reuses a code an earlier attempt still holds', () => {
@@ -1983,15 +2004,16 @@ export function reserveNextQuestion(
         continue
       }
       const attemptId = (input.newAttemptId ?? randomUUID)()
-      // Attempts live as long as their question (9 days). A code none of them ever used can never be
-      // matched by a late reply that was meant for an older question.
+      // question_codes is never purged: a code handed out once is never handed out again, so a late
+      // reply meant for an older question (even one purged long ago) can never match a newer one.
       const draw = input.newCode ?? newQuestionCode
-      const codeTaken = store.db.prepare('SELECT 1 FROM attempts WHERE code = ? LIMIT 1')
+      const codeTaken = store.db.prepare('SELECT 1 FROM question_codes WHERE code = ?')
       let code = draw()
       for (let tries = 1; codeTaken.get(code) !== undefined; tries++) {
         if (tries >= 50) throw new Error('dispatch: could not draw an unused question code')
         code = draw()
       }
+      store.db.prepare('INSERT INTO question_codes (code, first_used_at) VALUES (?, ?)').run(code, now)
       const deadlineMs = input.nowMs + input.attemptTimeoutMs
       store.db
         .prepare(
@@ -3320,7 +3342,7 @@ git commit -m "feat(core): authorize outgoing messages by current permission and
   - Receiving contract:
     - Precheck registers the wrap as in flight.
     - Processing opens it, runs `handleMessage`, then `onMessage`. A throwing `onMessage` is only logged.
-    - If `handleMessage` throws, the wrap id leaves `SeenIds` and the failure propagates to everyone waiting on it.
+    - If `handleMessage` throws, the wrap id leaves `SeenIds` and a `MessageProcessingError` propagates to everyone waiting on it and to the live queue. Its message is only `could not store a received message (<describeError>)`, so the pool's own log line cannot carry the original text.
     - History handling of a duplicate that is still in flight waits for that processing.
 
 - [ ] **Step 1: Write the failing tests**
@@ -3451,6 +3473,19 @@ describe('Device', () => {
     expect(logs.join('\n')).not.toContain('PRIVATE_DECRYPTED_CANARY')
     await device.syncOnce({ maxMs: 5_000 })
     expect(inboxCount(store)).toBe(1)
+  })
+
+  it('never lets a live processing failure put the error text in a log line', async () => {
+    const { mine, device, logs } = await setup({
+      handle: () => {
+        throw new Error('disk full near PRIVATE_DECRYPTED_CANARY')
+      },
+    })
+    device.start()
+    await until(() => mine.frames.some((f) => f[0] === 'REQ'))
+    mine.inject(await questionWrap(uuid(15)))
+    await until(() => logs.some((line) => line.includes('could not store a received message')))
+    expect(logs.join('\n')).not.toContain('PRIVATE_DECRYPTED_CANARY')
   })
 
   it('makes history wait for a wrap still in flight before counting it as handled', async () => {
@@ -3590,6 +3625,15 @@ export type HistoryRun = { relay: string; completed: number; incomplete: number;
 export type SyncReport = { history: HistoryRun[]; published: PublishReport; timedOut: boolean }
 
 type InFlight = { promise: Promise<void>; resolve(): void; reject(err: unknown): void }
+
+// Thrown when a received message could not be stored. Its message never includes the original error's
+// text (which may carry decrypted content): the live queue logs this message as it is.
+export class MessageProcessingError extends Error {
+  constructor(cause: unknown) {
+    super(`could not store a received message (${describeError(cause)})`)
+    this.name = 'MessageProcessingError'
+  }
+}
 
 
 function inFlight(): InFlight {
@@ -3747,8 +3791,9 @@ export class Device<T> {
     } catch (err) {
       // Nothing was persisted: forget the wrap so another copy, or the next history pass, retries it.
       this.seen.delete(id)
-      pending?.reject(err)
-      throw err
+      const failure = new MessageProcessingError(err)
+      pending?.reject(failure)
+      throw failure
     } finally {
       this.flying.delete(id)
     }
@@ -4294,7 +4339,7 @@ git commit -m "feat(channel): dispatcher that hands Claude one question at a tim
     - Linux: `notify-send AgentBridge <text>`
     - Other platforms: nothing, and no notice slot is claimed.
     - Needs a pending notice (`markRequestNoticePending`, set by whichever process stored the request).
-    - Returns `true` only when a notice was actually shown.
+    - Returns `true` only when a notice was actually shown. It never throws or rejects: a store error (for example a busy database) is logged with `describeError` and gives `false`, because the channel calls it from a timer.
   - `responderMessageHandler({ wakeDispatcher, notifyRequests, log })` (in `inbound.ts`) returns the `Device` `onMessage` callback. It:
     - wakes the dispatcher for a queued question;
     - tries the request notice for a stored request;
@@ -4505,7 +4550,19 @@ describe('notifyNewRequests', () => {
     }
     markRequestNoticePending(store, T0)
     expect(await notifyNewRequests({ store, now: T0, platform: 'linux', run: failing, log: (line) => logs.push(line) })).toBe(false)
-    expect(logs).toEqual(['request notice failed (ENOENT)'])
+    expect(logs).toEqual(['request notice failed (Error (ENOENT))'])
+  })
+
+  it('never rejects when the store fails', async () => {
+    const logs: string[] = []
+    const busy: Store = {
+      ...store,
+      tx: () => {
+        throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR' })
+      },
+    }
+    expect(await notifyNewRequests({ store: busy, now: T0, platform: 'darwin', run: recordRun, log: (line) => logs.push(line) })).toBe(false)
+    expect(logs).toEqual(['request notice failed (Error (ERR_SQLITE_ERROR))'])
   })
 
   it('keeps third-party text out of the notification', () => {
@@ -4708,7 +4765,7 @@ Create `packages/channel/src/notify.ts`:
 
 ```ts
 import { execFile } from 'node:child_process'
-import { claimRequestNoticeSlot, type Store } from '@agentbridge/core'
+import { claimRequestNoticeSlot, describeError, type Store } from '@agentbridge/core'
 
 export const REQUEST_NOTICE_TEXT = 'AgentBridge: tienes solicitudes nuevas'
 
@@ -4736,12 +4793,13 @@ export async function notifyNewRequests(input: {
 }): Promise<boolean> {
   const command = commandFor(input.platform ?? process.platform)
   if (!command) return false
-  if (!claimRequestNoticeSlot(input.store, input.now)) return false
+  // Called from a timer: nothing here may throw or reject, a busy database included.
   try {
+    if (!claimRequestNoticeSlot(input.store, input.now)) return false
     await (input.run ?? runWithoutShell)(command.file, command.args)
     return true
   } catch (err) {
-    input.log?.(`request notice failed (${(err as NodeJS.ErrnoException).code ?? 'error'})`)
+    input.log?.(`request notice failed (${describeError(err)})`)
     return false
   }
 }
