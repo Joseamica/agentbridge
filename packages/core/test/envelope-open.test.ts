@@ -10,7 +10,7 @@ import {
   type Message,
   type OpenContext,
 } from '@agentbridge/core'
-import { craftWrap } from './support/craft'
+import { craftWrap, type CraftOptions } from './support/craft'
 import { testIdentity } from './support/keys'
 
 const sender = testIdentity(1)
@@ -28,6 +28,17 @@ function openRaw(raw: unknown, ctx = context()) {
 const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 const genuine = async (message: Message = question, to = recipient.publicKey) =>
   copy(await wrapRumor(createRumor(message, sender, NOW), sender, to, { now: NOW }))
+const flipLastHex = (hex: string) => `${hex.slice(0, -1)}${hex.endsWith('0') ? '1' : '0'}`
+const editJson = (edit: (layer: Record<string, unknown>) => Record<string, unknown>) => (json: string) =>
+  JSON.stringify(edit(JSON.parse(json) as Record<string, unknown>))
+const crafted = (extra: Partial<CraftOptions>) =>
+  craftWrap({ sender, recipientPubkey: recipient.publicKey, content: question, now: NOW, bits: 16, ...extra })
+
+// NIP-44 pads every layer into fixed-size buckets, so a seal or a rumor whose JSON is over its cap
+// can never be encrypted inside the next layer's cap. Both caps are measured on the parsed JSON
+// serialized again, though, and a number written in exponent form (18e8) serializes back six bytes
+// longer (1800000000). That is how a layer just over its cap can still arrive.
+const exponentNow = (json: string) => json.replace(`"created_at":${NOW}`, '"created_at":18e8')
 
 describe('receive pipeline', () => {
   it('opens a genuine question and reports the authenticated sender', async () => {
@@ -76,6 +87,42 @@ describe('receive pipeline', () => {
     expect(openRaw(wrongKind)).toMatchObject({ stage: 'seal' })
   })
 
+  it('rejects a seal that claims the sender but carries a flipped signature', async () => {
+    const wrap = await crafted({ sealJson: editJson((seal) => ({ ...seal, sig: flipLastHex(String(seal.sig)) })) })
+    expect(openRaw(wrap)).toMatchObject({ stage: 'seal' })
+  })
+
+  it('rejects a seal whose signature is valid for its id but whose id does not match its content', async () => {
+    const wrap = await crafted({ sealJson: editJson((seal) => ({ ...seal, created_at: Number(seal.created_at) - 1 })) })
+    expect(openRaw(wrap)).toMatchObject({ stage: 'seal' })
+  })
+
+  it('rejects a seal just over 40 960 bytes', async () => {
+    // Opened directly: precheck is not under test, and mining 16 bits over a 55 KB wrap is slow.
+    const wrap = await crafted({ bits: undefined, sealBytes: NOSTR.maxSealBytes + 1, sealJson: exponentNow })
+    expect(Buffer.byteLength(JSON.stringify(wrap))).toBeLessThanOrEqual(NOSTR.maxWrapBytes)
+    expect(openWrap({ ok: true, wrap, powBits: NOSTR.powMessageBits }, context())).toMatchObject({ stage: 'seal' })
+  })
+
+  it('rejects a seal dated in the future', async () => {
+    expect(openRaw(await crafted({ sealCreatedAt: NOW + 3_600 }))).toMatchObject({ stage: 'seal' })
+  })
+
+  it('rejects a rumor just over 28 672 bytes', async () => {
+    const wrap = await crafted({ bits: undefined, rumorBytes: NOSTR.maxRumorBytes + 1, rumorJson: exponentNow })
+    expect(Buffer.byteLength(JSON.stringify(wrap))).toBeLessThanOrEqual(NOSTR.maxWrapBytes)
+    expect(openWrap({ ok: true, wrap, powBits: NOSTR.powMessageBits }, context())).toMatchObject({ stage: 'rumor' })
+  })
+
+  it('rejects a rumor whose id does not match its content', async () => {
+    expect(openRaw(await crafted({ rumorId: 'a'.repeat(64) }))).toMatchObject({ stage: 'rumor' })
+  })
+
+  it('rejects a malformed rumor', async () => {
+    const wrap = await crafted({ rumorJson: editJson((rumor) => ({ ...rumor, created_at: String(rumor.created_at) })) })
+    expect(openRaw(wrap)).toMatchObject({ stage: 'rumor' })
+  })
+
   it('rejects impersonation: a rumor claiming the sender inside a seal signed by someone else', async () => {
     const wrap = await craftWrap({ sender, sealSigner: attacker, recipientPubkey: recipient.publicKey, content: question, now: NOW, bits: 16 })
     expect(openRaw(wrap)).toMatchObject({ stage: 'rumor' })
@@ -101,6 +148,25 @@ describe('receive pipeline', () => {
     let cheap = await craft()
     while (leadingZeroBits(cheap.id) >= NOSTR.powRequestBits) cheap = await craft()
     expect(openRaw(cheap)).toMatchObject({ stage: 'request_pow' })
+  })
+
+  it('opens a connection request carrying exactly 22 bits of proof of work', async () => {
+    const request: Message = { v: 1, type: 'connect_request', requestId: questionId, name: 'Ana', note: '', relays: ['wss://nos.lol'] }
+    const ctx = context()
+    const pre = precheckWrap(await crafted({ content: request }), ctx)
+    if (!pre.ok) throw new Error(`precheck failed: ${pre.detail}`)
+    expect(openWrap({ ...pre, powBits: NOSTR.powRequestBits }, ctx)).toMatchObject({ ok: true, message: request })
+  })
+
+  it('rejects a wrap tagged to this identity and to someone else', async () => {
+    expect(openRaw(await crafted({ extraWrapTags: [['p', attacker.publicKey]] }))).toMatchObject({ stage: 'structure' })
+  })
+
+  it('reports a replayed wrap with a flipped signature as a duplicate before checking its signature', async () => {
+    const wrap = await genuine()
+    const ctx = context()
+    expect(openRaw(wrap, ctx)).toMatchObject({ ok: true })
+    expect(openRaw({ ...wrap, sig: flipLastHex(wrap.sig) }, ctx)).toMatchObject({ stage: 'duplicate' })
   })
 
   it('never includes decrypted content in failure details', async () => {
