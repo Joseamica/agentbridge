@@ -4,6 +4,7 @@ import type { Identity } from '../identity'
 import { NOSTR, nowSeconds } from '../nostr-constants'
 import { BoardConnection, type Filter } from './connection'
 import { ReceiveQueue } from './receive-queue'
+import { sanitizeRelayText } from './relay-text'
 import type { SocketFactory } from './socket'
 
 export type PoolOptions = {
@@ -31,14 +32,6 @@ const STABLE_SUBSCRIPTION_MS = 60_000
 const QUERY_EXTRA_EVENTS = 64
 const newSubscriptionId = () => randomBytes(8).toString('hex')
 const messageOf = (err: unknown) => (err instanceof Error ? err.message : String(err))
-
-// Ruling 15b: any relay-supplied string that reaches `log` (a CLOSED reason, an error message
-// derived from one) is untrusted and unbounded. Control characters are blanked and the result is
-// capped well under typical terminal/log-line limits. Deliberately not exported from index.ts —
-// this is an internal detail of how the pool logs, not part of the package's public surface.
-export function sanitizeRelayText(text: string): string {
-  return text.replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200)
-}
 
 type LiveSubscription = { stop(): void; close(): Promise<void> }
 

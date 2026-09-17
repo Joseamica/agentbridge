@@ -143,11 +143,19 @@ describe('installSqliteWarningFilter', () => {
     installSqliteWarningFilter()
     const seen: string[] = []
     const listener = (w: Error) => seen.push(`${w.name}: ${w.message}`)
+    // Node prints warnings from its own 'warning' listener. Only this test's listener stays attached
+    // while the two warnings are emitted, so the one that passes the filter is observed, not printed.
+    const others = process.listeners('warning')
+    process.removeAllListeners('warning')
     process.on('warning', listener)
-    process.emitWarning('SQLite is an experimental feature and might change at any time', 'ExperimentalWarning')
-    process.emitWarning('Something else is experimental', 'ExperimentalWarning')
-    await new Promise((r) => setImmediate(r))
-    process.off('warning', listener)
+    try {
+      process.emitWarning('SQLite is an experimental feature and might change at any time', 'ExperimentalWarning')
+      process.emitWarning('Something else is experimental', 'ExperimentalWarning')
+      await new Promise((r) => setImmediate(r))
+    } finally {
+      process.off('warning', listener)
+      for (const other of others) process.on('warning', other)
+    }
     expect(seen).toEqual(['ExperimentalWarning: Something else is experimental'])
   })
 })

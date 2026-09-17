@@ -1,5 +1,6 @@
+import { EventEmitter } from 'node:events'
 import { getEventHash } from 'nostr-tools/pure'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { leadingZeroBits, mineEvent, type UnsignedEvent } from '@agentbridge/core'
 
 const base: UnsignedEvent = {
@@ -27,12 +28,23 @@ describe('mineEvent', () => {
     expect(Date.now() - started).toBeLessThan(10_000)
   })
 
+  // 32 bits never finishes in a test's lifetime on any machine, so this cannot pass or fail because
+  // the machine is fast: a 5 ms interval must keep ticking while the mining promise is pending. Mining
+  // on the calling thread would never return, and the test would time out.
   it('keeps the event loop responsive while mining', async () => {
+    const controller = new AbortController()
+    const mining = mineEvent(base, 32, { signal: controller.signal })
     let ticks = 0
-    const timer = setInterval(() => ticks++, 10)
-    await mineEvent(base, 18)
-    clearInterval(timer)
-    expect(ticks).toBeGreaterThan(3)
+    await new Promise<void>((resolve) => {
+      const timer = setInterval(() => {
+        if (++ticks < 5) return
+        clearInterval(timer)
+        resolve()
+      }, 5)
+    })
+    controller.abort()
+    await expect(mining).rejects.toThrow(/aborted/)
+    expect(ticks).toBe(5)
   })
 
   it('stops when aborted', async () => {
@@ -40,6 +52,27 @@ describe('mineEvent', () => {
     const mining = mineEvent(base, 32, { signal: controller.signal })
     setTimeout(() => controller.abort(), 50)
     await expect(mining).rejects.toThrow(/aborted/)
+  })
+
+  it('rejects when the worker exits without an answer', { timeout: 2_000 }, async () => {
+    class ExitingWorker extends EventEmitter {
+      constructor() {
+        super()
+        setImmediate(() => this.emit('exit', 1))
+      }
+      terminate() {
+        return Promise.resolve(1)
+      }
+    }
+    vi.resetModules()
+    vi.doMock('node:worker_threads', () => ({ Worker: ExitingWorker }))
+    try {
+      const { mineEvent: mineWithExitingWorker } = await import('../src/envelope/pow')
+      await expect(mineWithExitingWorker(base, 8)).rejects.toThrow('mining worker exited')
+    } finally {
+      vi.doUnmock('node:worker_threads')
+      vi.resetModules()
+    }
   })
 
   it('rejects impossible difficulties', () => {

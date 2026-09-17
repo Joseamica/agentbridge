@@ -10,6 +10,7 @@ import {
   type SocketFactory,
   type SubscriptionHandlers,
 } from '@agentbridge/core'
+import { sanitizeRelayText } from '../src/boards/relay-text'
 import { plainSocketFactory, startFakeBoard, type FakeBoardOptions } from './support/fake-board'
 import { testIdentity } from './support/keys'
 
@@ -290,6 +291,24 @@ describe('BoardConnection', () => {
     expect(newSub.closed).toEqual([])
     const hReqs = reqs.filter((r) => r[1] === 'h')
     expect(hReqs.at(-1)?.[2]).toEqual({ kinds: [2] })
+  })
+
+  it('logs a relay NOTICE with its control characters blanked and its length capped', async () => {
+    const notice = `evil\x1b[2J\r\nforged log line ${'x'.repeat(300)}`
+    const server = new WebSocketServer({ host: '127.0.0.1', port: 0 })
+    await new Promise<void>((resolve) => server.once('listening', () => resolve()))
+    const url = `ws://127.0.0.1:${(server.address() as AddressInfo).port}`
+    server.on('connection', (socket) => socket.send(JSON.stringify(['NOTICE', notice])))
+    cleanups.push(() => new Promise<void>((resolve) => server.close(() => resolve())))
+    const logs: string[] = []
+    const conn = new BoardConnection({ url, identity: me, createSocket: plainSocketFactory, timeoutMs: 2_000, log: (line) => logs.push(line) })
+    cleanups.push(() => conn.close())
+    await conn.connect()
+    await until(() => logs.some((line) => line.startsWith(`${url} notice: `)))
+    const line = logs.find((l) => l.startsWith(`${url} notice: `))!
+    expect(line).toBe(`${url} notice: ${sanitizeRelayText(notice)}`)
+    expect(line).not.toMatch(/[\x00-\x1f\x7f]/)
+    expect(line.length).toBe(`${url} notice: `.length + 200)
   })
 
   // Minor: connect() must call createSocket again on a later attempt after an earlier one threw,

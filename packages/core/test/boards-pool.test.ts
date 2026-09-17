@@ -1,8 +1,9 @@
 import { createServer, type AddressInfo, type Socket } from 'node:net'
 import { finalizeEvent, type NostrEvent } from 'nostr-tools/pure'
 import { afterEach, describe, expect, it } from 'vitest'
+import * as core from '@agentbridge/core'
 import { BoardPool, NOSTR, type PoolOptions } from '@agentbridge/core'
-import { sanitizeRelayText } from '../src/boards/pool'
+import { sanitizeRelayText } from '../src/boards/relay-text'
 import { plainSocketFactory, startFakeBoard, type FakeBoard, type FakeBoardOptions } from './support/fake-board'
 import { testIdentity } from './support/keys'
 
@@ -328,6 +329,10 @@ describe('BoardPool.close', () => {
 })
 
 describe('sanitizeRelayText', () => {
+  it('is internal: the package does not export it', () => {
+    expect(core).not.toHaveProperty('sanitizeRelayText')
+  })
+
   it('caps length at 200 characters and strips control characters', () => {
     expect(sanitizeRelayText('a'.repeat(250))).toBe('a'.repeat(200))
     expect(sanitizeRelayText('bad\x00\x01\x1f\x7fname')).toBe('bad    name')

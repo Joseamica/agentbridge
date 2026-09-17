@@ -55,5 +55,8 @@ export function mineEvent(event: UnsignedEvent, bits: number, options: { signal?
       settle(() => resolve({ ...event, tags: [...event.tags, ['nonce', m.nonce, String(bits)]], id: m.id })),
     )
     worker.once('error', (err) => settle(() => reject(err)))
+    // A worker that ends without posting a nonce (killed, or exited from inside) would otherwise
+    // leave this promise pending forever. After a message or an error, `settle` makes this a no-op.
+    worker.once('exit', () => settle(() => reject(new Error('mining worker exited'))))
   })
 }

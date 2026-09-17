@@ -1,6 +1,6 @@
 import { decrypt, getConversationKey } from 'nostr-tools/nip44'
 import { getEventHash, verifyEvent, type NostrEvent } from 'nostr-tools/pure'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { EnvelopeSizeError, NOSTR, createRumor, leadingZeroBits, wrapRumor, type Message, type Rumor } from '@agentbridge/core'
 import { testIdentity } from './support/keys'
 
@@ -15,6 +15,10 @@ function unwrap(wrap: NostrEvent) {
   const rumor = JSON.parse(decrypt(seal.content, getConversationKey(recipient.secretKey, seal.pubkey)))
   return { seal, rumor }
 }
+
+afterEach(() => {
+  vi.restoreAllMocks()
+})
 
 describe('createRumor', () => {
   it('builds an unsigned rumor authored by the sender, with the private kind and a valid id', () => {
@@ -54,7 +58,7 @@ describe('wrapRumor', () => {
     expect(wrap.created_at).toBe(NOW - NOSTR.randomizationSeconds / 2)
     expect(wrap.tags).toEqual([
       ['p', recipient.publicKey],
-      ['expiration', String(NOW + NOSTR.wrapExpirationSeconds)],
+      ['expiration', String(NOW + NOSTR.wrapExpirationSeconds + NOSTR.randomizationSeconds / 2)],
       ['nonce', expect.stringMatching(/^\d+$/), '16'],
     ])
     expect(leadingZeroBits(wrap.id)).toBeGreaterThanOrEqual(16)
@@ -65,6 +69,18 @@ describe('wrapRumor', () => {
     expect(seal.created_at).toBeGreaterThanOrEqual(NOW - NOSTR.randomizationSeconds)
     expect(verifyEvent(seal)).toBe(true)
     expect(inner).toEqual(rumor)
+  })
+
+  it('never sets the expiration below seven days, and randomizes it with crypto randomness by default', async () => {
+    const rumor = createRumor(question, sender, NOW)
+    const expiration = (wrap: NostrEvent) => Number(wrap.tags.find((t) => t[0] === 'expiration')?.[1])
+    const lowest = await wrapRumor(rumor, sender, recipient.publicKey, { now: NOW, random: () => 0 })
+    expect(expiration(lowest)).toBe(NOW + NOSTR.wrapExpirationSeconds)
+    const mathRandom = vi.spyOn(Math, 'random')
+    const wrap = await wrapRumor(rumor, sender, recipient.publicKey, { now: NOW })
+    expect(mathRandom).not.toHaveBeenCalled()
+    expect(expiration(wrap)).toBeGreaterThanOrEqual(NOW + NOSTR.wrapExpirationSeconds)
+    expect(expiration(wrap)).toBeLessThan(NOW + NOSTR.wrapExpirationSeconds + NOSTR.randomizationSeconds)
   })
 
   it('produces a brand-new wrap for every retry of the same rumor', async () => {

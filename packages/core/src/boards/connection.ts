@@ -4,6 +4,7 @@ import { finalizeEvent, type NostrEvent } from 'nostr-tools/pure'
 import WebSocket, { createWebSocketStream } from 'ws'
 import type { Identity } from '../identity'
 import { NOSTR } from '../nostr-constants'
+import { sanitizeRelayText } from './relay-text'
 import { pinnedSocketFactory, type SocketFactory } from './socket'
 
 export type Filter = { kinds?: number[]; '#p'?: string[]; since?: number; until?: number; limit?: number }
@@ -26,6 +27,7 @@ type Subscription = { filters: Filter[]; handlers: SubscriptionHandlers; retried
 type Liveness = { lastActivity: number; readerBusy: boolean }
 
 const CLOSED_REASON = 'error: connection closed'
+const messageOf = (err: unknown) => sanitizeRelayText(err instanceof Error ? err.message : String(err))
 
 // Ruling 8/9: the spec's receive pipeline checks event size first, before anything more expensive
 // (such as JSON.parse). The extra 1024 bytes leave room for the ["EVENT","<subscription id>", …]
@@ -84,7 +86,7 @@ export class BoardConnection extends EventEmitter {
       this.socket = socket
       // The stream must exist before the first frame can arrive; it owns all reading from here on.
       const stream = createWebSocketStream(socket, { readableObjectMode: true })
-      stream.on('error', (err) => this.log(`${this.url}: ${err.message}`))
+      stream.on('error', (err) => this.log(`${this.url}: ${messageOf(err)}`))
       const liveness: Liveness = { lastActivity: Date.now(), readerBusy: false }
       void this.readFrames(stream, liveness)
       const timer = setTimeout(() => {
@@ -147,7 +149,7 @@ export class BoardConnection extends EventEmitter {
       // Handler exceptions are caught inside onFrame/runHandler, so anything reaching here is a
       // genuine stream failure. The socket's own 'close' handler still runs the actual cleanup;
       // this just makes sure the error itself is not silently swallowed.
-      this.log(`${this.url}: read loop failed: ${err instanceof Error ? err.message : String(err)}`)
+      this.log(`${this.url}: read loop failed: ${messageOf(err)}`)
     }
   }
 
@@ -190,7 +192,7 @@ export class BoardConnection extends EventEmitter {
     try {
       await action()
     } catch (err) {
-      this.log(`${this.url}: ${what} handler failed: ${err instanceof Error ? err.message : String(err)}`)
+      this.log(`${this.url}: ${what} handler failed: ${messageOf(err)}`)
     }
   }
 
@@ -299,7 +301,7 @@ export class BoardConnection extends EventEmitter {
               this.subs.delete(id)
               await this.runHandler(() => sub.handlers.onClosed(reason), 'closed')
             })
-            .catch((err) => this.log(`${this.url}: auth retry failed: ${err instanceof Error ? err.message : String(err)}`))
+            .catch((err) => this.log(`${this.url}: auth retry failed: ${messageOf(err)}`))
           return
         }
         this.subs.delete(id)
@@ -315,7 +317,7 @@ export class BoardConnection extends EventEmitter {
         return
       }
       case 'NOTICE': {
-        this.log(`${this.url} notice: ${String(frame[1]).slice(0, 200)}`)
+        this.log(`${this.url} notice: ${sanitizeRelayText(String(frame[1]))}`)
         return
       }
     }
@@ -332,7 +334,7 @@ export class BoardConnection extends EventEmitter {
     const id = OVERSIZE_EVENT_HEAD.exec(head)?.[1]
     const sub = id !== undefined ? this.subs.get(id) : undefined
     if (id !== undefined && sub) {
-      this.log(`${this.url}: oversize event (${bytes} bytes) on subscription ${id}`)
+      this.log(`${this.url}: oversize event (${bytes} bytes) on subscription ${sanitizeRelayText(id)}`)
       await this.runHandler(() => sub.handlers.onEvent(null), 'event')
       return
     }
