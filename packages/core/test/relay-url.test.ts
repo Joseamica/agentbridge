@@ -34,6 +34,8 @@ describe('checkRelayUrl', () => {
     'wss://[::1]',
     'wss://10.0.0.8:7777',
     'wss://localhost',
+    'wss://localhost.',
+    'wss://foo.localhost.',
     'wss://intranet',
     'not a url',
     `wss://${'a'.repeat(190)}.example.com`,
@@ -41,6 +43,10 @@ describe('checkRelayUrl', () => {
     const result = checkRelayUrl(input)
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.reason).toMatch(/tablero/)
+  })
+
+  it.each(['wss://localhost.', 'wss://foo.localhost.'])('gives %j the same reason as a plain localhost', (input) => {
+    expect(checkRelayUrl(input)).toEqual(checkRelayUrl('wss://localhost'))
   })
 })
 
@@ -72,7 +78,8 @@ describe('isForbiddenAddress', () => {
     '0.0.0.0', '10.1.2.3', '100.64.0.1', '127.0.0.1', '169.254.169.254', '172.16.5.4', '192.0.0.8', '192.0.2.10',
     '192.168.1.1', '198.18.0.1', '198.51.100.7', '203.0.113.9', '224.0.0.251', '240.0.0.1', '255.255.255.255',
     '::', '::1', '::ffff:127.0.0.1', '::ffff:8.8.8.8', '64:ff9b::a00:1', '100::1', '2001:db8::1', 'fc00::1', 'fd12:3456::1',
-    'fe80::1', 'ff02::1', 'not-an-ip',
+    'fe80::1', 'ff02::1', '::8.8.8.8', 'fec0::1', '64:ff9b:1::a00:1', '2002:c000:204::1', '2001:0:53aa:64c::1', '2001:2::1',
+    '3fff:fff::1', 'not-an-ip',
   ])('forbids %s', (address) => {
     expect(isForbiddenAddress(address)).toBe(true)
   })

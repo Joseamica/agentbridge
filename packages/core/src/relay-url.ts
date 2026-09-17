@@ -28,7 +28,9 @@ export function checkRelayUrl(input: string): RelayUrlCheck {
   }
   const host = url.hostname.replace(/^\[|\]$/g, '')
   if (isIP(host) !== 0) return reject('La dirección del tablero debe usar un nombre de dominio, no una IP.')
-  if (!host.includes('.') || host.endsWith('.localhost') || host === 'localhost') {
+  // A fully qualified name may end in one dot ("localhost." is still localhost).
+  const name = host.endsWith('.') ? host.slice(0, -1) : host
+  if (!name.includes('.') || name.endsWith('.localhost') || name === 'localhost') {
     return reject('La dirección del tablero debe ser un dominio público.')
   }
   const path = url.pathname === '/' ? '' : url.pathname
@@ -62,8 +64,14 @@ for (const [network, prefix] of [
   forbidden4.addSubnet(network, prefix, 'ipv4')
 }
 for (const [network, prefix] of [
-  ['::', 128], ['::1', 128], ['::ffff:0:0', 96], ['64:ff9b::', 96], ['100::', 64], ['2001:db8::', 32], ['fc00::', 7],
-  ['fe80::', 10], ['ff00::', 8],
+  // unspecified, loopback, IPv4-compatible
+  ['::', 128], ['::1', 128], ['::', 96],
+  // IPv4-mapped, NAT64 (well-known and local-use), 6to4, Teredo: each can reach an IPv4 address
+  ['::ffff:0:0', 96], ['64:ff9b::', 96], ['64:ff9b:1::', 48], ['2002::', 16], ['2001::', 32],
+  // discard-only, benchmarking, documentation
+  ['100::', 64], ['2001:2::', 48], ['2001:db8::', 32], ['3fff::', 20],
+  // unique local, link-local, site-local, multicast
+  ['fc00::', 7], ['fe80::', 10], ['fec0::', 10], ['ff00::', 8],
 ] as const) {
   forbidden6.addSubnet(network, prefix, 'ipv6')
 }
