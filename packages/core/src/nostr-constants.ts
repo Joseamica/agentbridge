@@ -30,6 +30,7 @@ export const NOSTR = {
   receiveQueueMax: 200,
   historyDays: 9,
   historyPageLimits: [200, 400, 800],
+  historyMaxQueriesPerWindow: 250,
   claimSeconds: 2 * MINUTE,
   regenerationIntervalSeconds: 10 * MINUTE,
   maxPendingBytesPerRecipient: 1024 * 1024,

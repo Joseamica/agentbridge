@@ -14,6 +14,7 @@ export type FakeBoardOptions = {
   maxFrameBytes?: number
   maxLimit?: number
   dropIncoming?: (event: NostrEvent) => boolean
+  beforeEose?: (subscriptionId: string, filters: Filter[]) => unknown[]
 }
 
 export type FakeBoard = {
@@ -150,6 +151,9 @@ export async function startFakeBoard(initial: FakeBoardOptions = {}): Promise<Fa
         for (const hit of [...out.values()].sort((a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id))) {
           send(session, ['EVENT', id, hit])
         }
+        // Sent as-is, with no matching and no validation: the test decides what a hostile or
+        // racing relay adds before EOSE (e.g. a live event slipping in for the same subscription).
+        for (const extra of o().beforeEose?.(id, filters) ?? []) send(session, ['EVENT', id, extra])
         send(session, ['EOSE', id])
         return
       }

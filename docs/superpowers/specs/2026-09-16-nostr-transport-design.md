@@ -268,9 +268,11 @@ por un mensaje autenticado del contacto cuya `generation` sea ≥ la máxima obs
   por ritmo: aplica contrapresión.
 - **Recuperación histórica**, separada de la recepción en vivo: cubre hasta 9 días hacia atrás por
   ventanas de 1 día. Dentro de cada ventana pagina con `until` y `limit` = 200: si llegan 200
-  resultados, repite con `until` = la fecha más antigua recibida (incluida; el traslape se
-  deduplica). Si los 200 comparten el mismo segundo, repite con `limit` 400 y luego 800; si aún no
+  resultados, repite con `until` = la fecha más antigua que el tablero garantiza haber enviado
+  completa (incluida; el traslape se deduplica), sin contar sobres ajenos que lleguen antes de
+  `EOSE`. Si los 200 comparten el mismo segundo, repite con `limit` 400 y luego 800; si aún no
   alcanza, la ventana queda marcada **incompleta** y se reintenta más tarde.
+  Cada ventana tiene un presupuesto de 250 consultas; al agotarlo queda incompleta.
 - **Cursores:** uno por tablero y por papel, en SQLite. Registran qué ventanas están completas. Una
   ventana solo se marca completa después de persistir todo lo recibido en ella; `EOSE` por sí solo no
   demuestra que esté completa.
