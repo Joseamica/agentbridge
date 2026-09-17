@@ -36,7 +36,11 @@ describe('proof-of-work bundle smoke test', () => {
       banner: { js: REQUIRE_SHIM },
     })
 
-    const stdout = execFileSync('node', [outfile], { cwd: dir, encoding: 'utf8' })
+    // Bound this: a bundled mining worker that hangs blocks execFileSync synchronously, and
+    // vitest's testTimeout cannot reach in and stop it (a reviewer probe showed neither
+    // worker.terminate() nor process.exit() releases it) — without a timeout here, a hang would
+    // freeze the whole suite instead of failing this one test.
+    const stdout = execFileSync('node', [outfile], { cwd: dir, encoding: 'utf8', timeout: 15_000, killSignal: 'SIGKILL' })
     const result = JSON.parse(stdout) as { id: string; bits: number; nonce: string[] }
 
     expect(result.bits).toBeGreaterThanOrEqual(8)
