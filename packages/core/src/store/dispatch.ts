@@ -168,6 +168,11 @@ export function answerQuestion(store: Store, input: AnswerInput): AnswerOutcome 
         now,
       )
     } catch (err) {
+      // Contract with the caller: `text` and `source` arrive already trimmed and non-blank (the
+      // channel's `reply` tool schema enforces this before it ever calls answerQuestion), so the
+      // only createRumor rejection this function maps to an outcome is the size refusal. Any other
+      // rejection (for example a blank field slipping through) is a caller bug, not something a
+      // Claude-facing answer outcome exists for — it rolls this transaction back with nothing stored.
       if (err instanceof EnvelopeSizeError) return { kind: 'too_large' }
       throw err
     }

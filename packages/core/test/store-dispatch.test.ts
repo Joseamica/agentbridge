@@ -116,6 +116,23 @@ describe('reserveNextQuestion', () => {
     expect(getInboxQuestion(store, asker.publicKey, uuid(1))).toMatchObject({ state: 'rejected', rejectReason: 'stale_generation' })
     expect(outboxLabels()).toEqual(['receipt'])
   })
+
+  it('gives up after 50 draws that all collide with an already-used code', () => {
+    admit(1)
+    const first = reserveNextQuestion(store, { epoch, nowMs: T0_MS, attemptTimeoutMs: TIMEOUT, identity: responder, newCode: () => 'AAAA' })
+    if (first.kind !== 'reserved') throw new Error('expected a reservation')
+    answer({ code: 'AAAA' })
+    admit(2, T0 + 1)
+    expect(() =>
+      reserveNextQuestion(store, { epoch, nowMs: T0_MS, attemptTimeoutMs: TIMEOUT, identity: responder, newCode: () => 'AAAA' }),
+    ).toThrow('dispatch: could not draw an unused question code')
+  })
+})
+
+describe('getAttemptState', () => {
+  it('returns null for an attempt id that does not exist', () => {
+    expect(getAttemptState(store, uuid(9999))).toBeNull()
+  })
 })
 
 describe('expireAttempt', () => {
