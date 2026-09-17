@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { NostrEvent } from 'nostr-tools/pure'
 import { afterEach, describe, expect, it } from 'vitest'
-import { BoardPool, DAY_SECONDS, NOSTR, historyWindows, openStore, recoverHistory } from '@agentbridge/core'
+import { BoardPool, DAY_SECONDS, NOSTR, historyWindows, openStore, recoverHistory, type RecoverHistoryInput } from '@agentbridge/core'
 import { plainSocketFactory, startFakeBoard, type FakeBoard, type FakeBoardOptions } from './support/fake-board'
 import { testIdentity } from './support/keys'
 
@@ -33,13 +33,17 @@ async function setup(options: FakeBoardOptions = {}) {
   const pool = new BoardPool({ identity: me, createSocket: plainSocketFactory, timeoutMs: 2_000 })
   cleanups.push(() => board.close(), () => store.close(), () => pool.close())
   const handled: string[] = []
-  const recover = (handle = async (raw: unknown) => void handled.push((raw as NostrEvent).id)) =>
-    recoverHistory({ pool, store, relay: board.url, role: 'responder', recipientPubkey: me.publicKey, now: NOW, handle })
+  const recover = (handle = async (raw: unknown) => void handled.push((raw as NostrEvent).id), extra: Partial<RecoverHistoryInput> = {}) =>
+    recoverHistory({ pool, store, relay: board.url, role: 'responder', recipientPubkey: me.publicKey, now: NOW, handle, ...extra })
   const remaining = () => historyWindows(store, { relay: board.url, role: 'responder', now: NOW }).map((w) => w.since)
   return { board, handled, recover, remaining }
 }
 
 const reqCount = (board: FakeBoard) => board.frames.filter((f) => f[0] === 'REQ').length
+const until = async (check: () => boolean) => {
+  for (let i = 0; i < 300 && !check(); i++) await new Promise((r) => setTimeout(r, 10))
+  expect(check()).toBe(true)
+}
 
 describe('recoverHistory', () => {
   it('reads every event across pages and marks only windows that can no longer change', async () => {
@@ -175,6 +179,20 @@ describe('recoverHistory', () => {
     for (let i = 1; i <= 50; i++) board.inject(event(dayStart(5) + i))
     await recover()
     expect(remaining()).toContain(dayStart(5))
+  })
+
+  // Ruling 26: an aborted recovery sends no further query; the window being read and every later
+  // window count as incomplete.
+  it('stops querying once its signal is aborted and reports every window incomplete', async () => {
+    const { board, recover } = await setup({ ignoreReads: true })
+    const controller = new AbortController()
+    const running = recover(undefined, { signal: controller.signal, queryTimeoutMs: 200 })
+    await until(() => reqCount(board) === 1)
+    controller.abort()
+    const result = await running
+    expect(result.completed).toBe(0)
+    expect(result.incomplete).toBe(result.windows)
+    expect(reqCount(board)).toBeLessThanOrEqual(1)
   })
 
   it('never marks a window complete when handling an event fails', async () => {

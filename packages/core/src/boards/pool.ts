@@ -39,13 +39,19 @@ export function sanitizeRelayText(text: string): string {
   return text.replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200)
 }
 
+type LiveSubscription = { stop(): void; close(): Promise<void> }
+
 export class BoardPool {
   private readonly connections = new Map<string, BoardConnection>()
-  private readonly liveClosers = new Set<() => Promise<void>>()
+  private readonly live = new Set<LiveSubscription>()
+  // Ruling 26: once closed, the pool never connects again. publish rejects every relay and query
+  // returns incomplete, both with 'error: pool closed', and subscribeLive starts nothing.
+  private closed = false
 
   constructor(private readonly options: PoolOptions) {}
 
   private async connection(relay: string): Promise<BoardConnection> {
+    if (this.closed) throw new Error('pool closed')
     let conn = this.connections.get(relay)
     if (!conn) {
       const created = new BoardConnection({
@@ -118,6 +124,7 @@ export class BoardPool {
   }
 
   subscribeLive<T>(relays: readonly string[], handlers: LiveHandlers<T>): { close(): Promise<void> } {
+    if (this.closed) return { close: async () => {} }
     // Ruling 14: an empty array is a caller mistake, not "reconnect with no delay" — fall back to
     // the default schedule rather than hammering the relay.
     const delays = this.options.reconnectDelaysMs?.length ? this.options.reconnectDelaysMs : DEFAULT_RECONNECT_DELAYS_MS
@@ -190,23 +197,33 @@ export class BoardPool {
     }
 
     const loops = [...new Set(relays)].slice(0, NOSTR.maxRelaysPerContact).map((relay) => run(relay))
-    const close = async () => {
-      if (!stopped) {
+    const subscription: LiveSubscription = {
+      stop: () => {
+        if (stopped) return
         stopped = true
         for (const stop of [...stoppers]) stop()
         for (const wake of [...wakers]) wake()
-      }
-      await Promise.all(loops)
-      await queue.idle()
-      this.liveClosers.delete(close)
+      },
+      close: async () => {
+        subscription.stop()
+        await Promise.all(loops)
+        await queue.idle()
+        this.live.delete(subscription)
+      },
     }
-    this.liveClosers.add(close)
-    return { close }
+    this.live.add(subscription)
+    return { close: subscription.close }
   }
 
+  // Ruling 26: stop every live loop first, then close every connection — which also aborts connects
+  // still in progress, so a relay that never finishes its handshake cannot hold close() up — and
+  // only then wait for the loops to exit and their queues to drain.
   async close(): Promise<void> {
-    await Promise.all([...this.liveClosers].map((close) => close()))
+    this.closed = true
+    const live = [...this.live]
+    for (const subscription of live) subscription.stop()
     for (const conn of this.connections.values()) conn.close()
     this.connections.clear()
+    await Promise.all(live.map((subscription) => subscription.close()))
   }
 }

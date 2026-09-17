@@ -1,3 +1,4 @@
+import { createServer, type AddressInfo, type Socket } from 'node:net'
 import { finalizeEvent, type NostrEvent } from 'nostr-tools/pure'
 import { afterEach, describe, expect, it } from 'vitest'
 import { BoardPool, NOSTR, type PoolOptions } from '@agentbridge/core'
@@ -268,6 +269,53 @@ describe('BoardPool.subscribeLive', () => {
     await new Promise((r) => setTimeout(r, 300))
     expect(reqCount(b)).toBeLessThanOrEqual(2)
     await live.close()
+  })
+})
+
+// Ruling 26: closing the pool stops work already started and refuses new work without connecting.
+describe('BoardPool.close', () => {
+  it('refuses to publish, query or subscribe once closed, without touching the relay', async () => {
+    const b = await board()
+    const p = pool()
+    expect(await p.query(b.url, {})).toMatchObject({ complete: true })
+    await p.close()
+    const reqs = reqCount(b)
+    expect(await p.publish([b.url, 'ws://127.0.0.1:1'], signed('tarde'))).toEqual({
+      accepted: [],
+      rejected: [
+        { relay: b.url, reason: 'error: pool closed' },
+        { relay: 'ws://127.0.0.1:1', reason: 'error: pool closed' },
+      ],
+    })
+    expect(await p.query(b.url, {})).toEqual({ events: [], complete: false, closedReason: 'error: pool closed' })
+    const live = p.subscribeLive<NostrEvent>([b.url], { precheck: () => null, process: async () => {} })
+    await expect(live.close()).resolves.toBeUndefined()
+    await new Promise((r) => setTimeout(r, 100))
+    expect(b.frames.filter((f) => f[0] === 'EVENT')).toHaveLength(0)
+    expect(reqCount(b)).toBe(reqs)
+  })
+
+  it('closes promptly while a live subscription is still connecting to a relay that never completes the handshake', async () => {
+    const sockets = new Set<Socket>()
+    const server = createServer((socket) => {
+      sockets.add(socket)
+      socket.on('close', () => sockets.delete(socket))
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+    cleanups.push(
+      () =>
+        new Promise<void>((resolve) => {
+          for (const socket of sockets) socket.destroy()
+          server.close(() => resolve())
+        }),
+    )
+    const url = `ws://127.0.0.1:${(server.address() as AddressInfo).port}`
+    const p = pool({ timeoutMs: 5_000 })
+    p.subscribeLive<NostrEvent>([url], { precheck: () => null, process: async () => {} })
+    await until(() => sockets.size === 1)
+    const started = Date.now()
+    await p.close()
+    expect(Date.now() - started).toBeLessThan(1_000)
   })
 })
 

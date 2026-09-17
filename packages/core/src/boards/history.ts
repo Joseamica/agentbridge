@@ -14,6 +14,10 @@ export type RecoverHistoryInput = {
   now: number
   handle(raw: unknown): Promise<void>
   queryTimeoutMs?: number
+  // Ruling 26: checked before every query. Once aborted no further query is sent, and the window
+  // being read and every window after it count as incomplete (a query already in flight still runs
+  // to its end; closing the pool ends it).
+  signal?: AbortSignal
 }
 
 type Dated = { id: string; created_at: number }
@@ -49,6 +53,7 @@ async function readWindow(
   let level = 0
   let queries = 0
   for (;;) {
+    if (input.signal?.aborted) return false
     // Ruling 18: a relay that keeps handing back one fresh-looking event per query (e.g. a racing
     // live event that echoes whatever `until` was just asked for) can otherwise walk `until` down
     // one second at a time for the whole window, never converging. Bound the cost and report the
