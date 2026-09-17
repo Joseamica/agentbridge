@@ -78,11 +78,15 @@ async function readWindow(
     const trusted = Math.max(NOSTR.minTrustedRelayLimit, relayStats.largestPage)
     const threshold = Math.min(limit, trusted)
     const mayBeTruncated = count >= threshold
+    const previousLargest = relayStats.largestPage
     // Ruling 17: a page can never prove the relay honors limits above what was actually requested.
     relayStats.largestPage = Math.max(relayStats.largestPage, Math.min(count, limit))
-    // Ruling 19a: a page with nothing usable (empty, or entirely events too large to read) can only
-    // be a real gap when it might have been truncated; otherwise there is nothing left to fetch.
-    if (distinct.length === 0) return !mayBeTruncated
+    // Ruling 20 (supersedes Ruling 19a): a page with nothing readable gives no `oldest` to confirm
+    // with. A genuinely empty page (`count === 0`) still proves the window exhausted on its own —
+    // there is nothing there that could have been cut short. A page of unreadable placeholders needs
+    // more: only a strictly larger page already seen from this relay earlier in this call proves it
+    // does not cap right at this page's size and hide older events behind it.
+    if (distinct.length === 0) return count === 0 || (!mayBeTruncated && previousLargest > count)
 
     if (mayBeTruncated) {
       // At least `k` stored (distinct, valid) events sit at or above the relay's cut, so an extra

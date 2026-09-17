@@ -273,6 +273,10 @@ por un mensaje autenticado del contacto cuya `generation` sea ≥ la máxima obs
   `EOSE`. Si los 200 comparten el mismo segundo, repite con `limit` 400 y luego 800; si aún no
   alcanza, la ventana queda marcada **incompleta** y se reintenta más tarde.
   Cada ventana tiene un presupuesto de 250 consultas; al agotarlo queda incompleta.
+  Limitación aceptada: un tablero que corta resultados por debajo de lo pedido y además mezcla sobres
+  ajenos antes de `EOSE`, que corta distinto en cada consulta o que no corta de lo más nuevo a lo
+  más viejo puede esconder sobres de la recuperación histórica; los reintentos del remitente (7 días,
+  hasta 5 tableros) y la recepción en vivo los cubren.
 - **Cursores:** uno por tablero y por papel, en SQLite. Registran qué ventanas están completas. Una
   ventana solo se marca completa después de persistir todo lo recibido en ella; `EOSE` por sí solo no
   demuestra que esté completa.

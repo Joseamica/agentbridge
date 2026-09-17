@@ -110,7 +110,7 @@ describe('recoverHistory', () => {
   })
 
   it('never trusts a page size larger than the limit it asked for', async () => {
-    const { board, handled, recover, remaining } = await setup({ maxLimit: 300 })
+    const { board, recover, remaining } = await setup({ maxLimit: 300 })
     for (let i = 0; i < 200; i++) board.inject(event(dayStart(4) + 1000 + i))
     const extras = Array.from({ length: 150 }, (_, i) => event(dayStart(4) + 1 + i))
     board.options.beforeEose = (_id, filters) => {
@@ -118,16 +118,9 @@ describe('recoverHistory', () => {
       if (!day4) return []
       return extras.filter((e) => e.created_at <= (day4.until ?? Infinity))
     }
-    const day5Ids: string[] = []
-    for (let i = 0; i < 350; i++) {
-      const e = event(dayStart(5) + 100)
-      day5Ids.push(e.id)
-      board.inject(e)
-    }
-    const result = await recover()
+    for (let i = 0; i < 350; i++) board.inject(event(dayStart(5) + 100))
+    await recover()
     expect(remaining()).toContain(dayStart(5))
-    const day5Complete = day5Ids.every((id) => handled.includes(id))
-    expect(day5Complete || result.incomplete >= 1).toBe(true)
   })
 
   it('gives up on a window after its query budget and leaves it incomplete', async () => {
@@ -141,17 +134,47 @@ describe('recoverHistory', () => {
     expect(result.incomplete).toBeGreaterThanOrEqual(1)
     expect(remaining()).toContain(dayStart(5))
     const day5Reqs = board.frames.filter((f) => f[0] === 'REQ' && (f[2] as { since?: number })?.since === dayStart(5))
-    expect(day5Reqs.length).toBeLessThanOrEqual(NOSTR.historyMaxQueriesPerWindow)
+    expect(day5Reqs.length).toBe(NOSTR.historyMaxQueriesPerWindow)
   })
 
   it('completes a window whose only stored event is too large to read', async () => {
     const { board, recover, remaining } = await setup()
+    // Day 4 (read before day 5, newest first) gets two small readable events, so the relay has
+    // already proven a 2-event page before day 5's single unreadable placeholder is judged
+    // (Ruling 20: an all-unreadable page needs proof the relay's cap is larger than its own size).
+    board.inject(event(dayStart(4) + 1))
+    board.inject(event(dayStart(4) + 2))
     const big = event(dayStart(5) + 1)
     big.content = 'x'.repeat(70_000)
     board.inject(big)
     const result = await recover()
     expect(remaining()).not.toContain(dayStart(5))
     expect(result.incomplete).toBe(0)
+  })
+
+  it('leaves a window incomplete when a relay capping below 100 returns only unreadable events', async () => {
+    const { board, recover, remaining } = await setup({ maxLimit: 50 })
+    for (let i = 1; i <= 70; i++) board.inject(event(dayStart(5) + i))
+    for (let i = 0; i < 50; i++) {
+      const big = event(dayStart(5) + 1000 + i)
+      big.content = 'x'.repeat(70_000)
+      board.inject(big)
+    }
+    const result = await recover()
+    expect(remaining()).toContain(dayStart(5))
+    expect(result.incomplete).toBeGreaterThanOrEqual(1)
+  })
+
+  it('leaves a window incomplete when unreadable entries leave no guaranteed cut', async () => {
+    const { board, recover, remaining } = await setup()
+    for (let i = 0; i < 100; i++) {
+      const big = event(dayStart(5) + 1000 + i)
+      big.content = 'x'.repeat(70_000)
+      board.inject(big)
+    }
+    for (let i = 1; i <= 50; i++) board.inject(event(dayStart(5) + i))
+    await recover()
+    expect(remaining()).toContain(dayStart(5))
   })
 
   it('never marks a window complete when handling an event fails', async () => {
