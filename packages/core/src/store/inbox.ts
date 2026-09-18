@@ -112,6 +112,15 @@ function resend(store: Store, input: { recipient: string; relays: readonly strin
 // Of everything enqueue can answer, only these outcomes mean the outbox now actually holds the rumor
 // to send. 'abandoned' (the row was written off, e.g. an unauthorized retry) and
 // 'regeneration_too_soon' (the outbox's own clock, distinct from the question's) do not.
+// 'already_pending' counts as sent here, and the caller below advances the question's own
+// regeneration clock on it: the gate that decides whether to attempt a resend at all already runs
+// before resend() is ever called (the `regenerated_at` check further down), so by the time an
+// outcome comes back the interval has already elapsed, and a send still in flight reaches the asker
+// just as much as a fresh one — there is no separate "still pending" outcome for admitQuestion to
+// report. `regenerateRequestDecision` in responder/connections.ts makes the opposite call on the
+// same 'already_pending' outcome, deliberately: it leaves its own resend clock (`decision_resent_at`)
+// untouched, because that clock's only job is to record the last time something actually changed,
+// and a row still waiting behind a slow relay is not that.
 const SENT_OUTCOMES: ReadonlySet<EnqueueOutcome> = new Set(['enqueued', 'postponed_cap', 'regenerated', 'already_pending'])
 const wasSent = (outcome: EnqueueOutcome | 'nothing'): boolean => outcome !== 'nothing' && SENT_OUTCOMES.has(outcome)
 

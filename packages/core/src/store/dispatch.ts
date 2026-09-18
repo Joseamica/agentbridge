@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { EnvelopeSizeError, createRumor, type Rumor } from '../envelope/seal'
+import { UserFacingError } from '../errors'
 import type { Identity } from '../identity'
 import type { Confidence } from '../protocol'
 import { newQuestionCode } from '../secrets'
@@ -79,8 +80,15 @@ export function reserveNextQuestion(
       const draw = input.newCode ?? newQuestionCode
       const codeTaken = store.db.prepare('SELECT 1 FROM question_codes WHERE code = ?')
       let code = draw()
+      // The alphabet is 32 characters and every code is 4 of them: 32^4 ≈ 1.05 million codes total,
+      // and since question_codes is never purged (see the comment above), that pool only shrinks.
+      // Fifty collisions in a row this far from that ceiling means something is badly wrong (a broken
+      // `newCode`, not organic exhaustion) — this reaches the person as a UserFacingError, not just a
+      // log line, since there is nothing this channel can do about it on its own.
       for (let tries = 1; codeTaken.get(code) !== undefined; tries++) {
-        if (tries >= 50) throw new Error('dispatch: could not draw an unused question code')
+        if (tries >= 50) {
+          throw new UserFacingError('No quedan códigos de pregunta sin usar (existen alrededor de 1,048,576 y ninguno se libera nunca). Contacta a quien mantiene AgentBridge.')
+        }
         code = draw()
       }
       store.db.prepare('INSERT INTO question_codes (code, first_used_at) VALUES (?, ?)').run(code, now)
@@ -185,6 +193,13 @@ export function answerQuestion(store: Store, input: AnswerInput): AnswerOutcome 
          WHERE sender_pubkey = ? AND question_id = ?`,
       )
       .run(JSON.stringify(rumor), now, now, active.sender_pubkey, active.question_id)
+    // The relay guard duplicates resend()'s own in store/inbox.ts (relays.length === 0 there also
+    // means "nothing to send"); it is kept here too because this rumor is freshly minted, not routed
+    // through resend(). The returned EnqueueOutcome is deliberately not inspected: a brand-new rumor
+    // id has never been seen by the outbox before, so enqueue() can only answer 'enqueued' or
+    // 'postponed_cap' (the retry-specific outcomes — 'already_pending', 'regenerated',
+    // 'regeneration_too_soon', 'abandoned' — all require an existing row for this recipient+rumor).
+    // 'no_relays' cannot happen either: the guard above already refused an approved contact with none.
     if (contact.relays.length > 0) {
       enqueue(store, { recipient: active.sender_pubkey, rumor, label: 'answer', powBits: 16, relays: contact.relays, policy: 'once', now })
     }

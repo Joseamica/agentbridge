@@ -312,6 +312,13 @@ export function deleteUnclaimedFor(store: Store, input: { recipient: string; now
 
 // Rows carry full question and answer text, so they follow the 7-day content retention by the
 // rumor's own creation date — pending, published or abandoned alike.
+// Keyed to the rumor's own created_at, not to when this row was (re)armed: a regenerated decision
+// resends the original stored rumor unchanged (see resend() in store/inbox.ts and
+// regenerateRequestDecision in responder/connections.ts), so its outbox row can be older than 7 days
+// the moment it is inserted. If that regeneration happens between day 7 and day 9 of the original
+// question (still within the 9-day forgetting window), the hourly purge run right after it can delete
+// the row before the publisher (which runs roughly every few seconds) gets to it. Nothing is lost: the
+// next retry from the asker re-enqueues the same stored rumor the same way.
 export function purgeOutbox(store: Store, now: number): number {
   return store.tx(() => {
     store.db.prepare('DELETE FROM publish_log WHERE at <= ?').run(now - 60)

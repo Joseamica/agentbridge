@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   LIMITS,
   MAX_EXPIRED_ATTEMPTS,
+  UserFacingError,
   acquireChannelLock,
   admitQuestion,
   answerQuestion,
@@ -124,9 +125,9 @@ describe('reserveNextQuestion', () => {
     if (first.kind !== 'reserved') throw new Error('expected a reservation')
     answer({ code: 'AAAA' })
     admit(2, T0 + 1)
-    expect(() =>
-      reserveNextQuestion(store, { epoch, nowMs: T0_MS, attemptTimeoutMs: TIMEOUT, identity: responder, newCode: () => 'AAAA' }),
-    ).toThrow('dispatch: could not draw an unused question code')
+    expect(() => reserveNextQuestion(store, { epoch, nowMs: T0_MS, attemptTimeoutMs: TIMEOUT, identity: responder, newCode: () => 'AAAA' })).toThrow(
+      UserFacingError,
+    )
   })
 })
 
