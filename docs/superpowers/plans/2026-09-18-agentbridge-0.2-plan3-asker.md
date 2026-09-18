@@ -15,7 +15,7 @@
   - the short-lived cycle (start → sync → operate → sync → close) every command runs
   - commands `link`, `connect`, `contacts`, `ask`, `ticket`, `whoami`, plus the responder-side `requests`, `approve`, `reject`, `revoke` that plan 2 left as library calls
   - the MCP server with `list_contacts`, `ask_contact`, `check_answer` and `connect`
-  - the 0.1 enrollment commands (`enroll`, `invite`, `accept`, `admin`) are deleted here
+  - the 0.1 enrollment commands (`enroll`, `invite`, `accept`, `admin`) stop being routed here; their code leaves with `setup` and `doctor` in plan 4
 - Plan 4 (setup, doctor, packaging, docs, acceptance, deleting `RelayHttpClient`) builds on these interfaces.
 
 **Tech Stack:** Node ≥ 22.13 (`node:sqlite`, `worker_threads`, `node:util parseArgs`), TypeScript 5.9 (type-check only), npm workspaces, `nostr-tools` 2.25.2 and `ws` 8.21.3 (already pinned), `@modelcontextprotocol/sdk`, zod 4, vitest 5, esbuild 0.28, tsx (dev, for multi-process tests).
@@ -62,15 +62,19 @@
 
 Each one resolves something the spec leaves open. Reviewers may challenge them.
 
-- **P1 — `sending → sent` is derived, not pushed.** The outbox already records `last_published_at` when a relay accepts a wrap. `markSentQuestions(store, now)` promotes every `sending` question whose outbox row has that column set, and every sync calls it. No callback is threaded through the publisher, so the promotion also happens when a different process (the MCP server) did the publishing, and it survives a crash between the publish and the update.
+- **P1 — `sending → sent` is both pushed and swept.** `publishDue` gains an `onPublished` hook that fires inside the same round that recorded a relay's acceptance, and `Device` forwards it, so a persistent process (the MCP server) promotes a question the moment it goes out. Because the outbox row is transient — `revoke` deletes unclaimed rows for a contact, and the purge deletes old ones — the promotion is *also* swept from `outbox.last_published_at` at every sync and in the purge loop, which covers a crash between the publish and the update. The question row is the durable record; the outbox row is not.
 - **P2 — The asker does not re-implement the responder's limits.** Five open questions per pair and twenty per day are the responder's rule; the asker sends and shows the `rejected`/`limit` it gets back. One rule, one place.
 - **P3 — Question ids are the ticket ids.** A question's UUID is what `ask` prints and what `check_answer` takes. The CLI also accepts any prefix of at least 6 characters that matches exactly one question, because a person retypes a UUID badly; an ambiguous prefix is a Spanish error that asks for more characters.
 - **P4 — `AskerService` owns no files.** Like `Device`, it takes an already-open identity and store. `openAskerSession` (the CLI's helper) is what touches `~/.agentbridge`, so tests drive the service against a temporary home without going through the CLI.
-- **P5 — The MCP server is the only persistent asker.** It calls `device.start()` (live subscription, retries on a timer, periodic history and purge). Every CLI command uses `syncOnce` under a 10-second deadline instead, and `ask --wait N` keeps the device started only for those N seconds.
+- **P5 — The MCP server is the only persistent asker.** It calls `device.start()` (live subscription, retries on a timer, periodic history and purge). Every CLI command uses `syncOnce` instead, and `ask --wait N` keeps the device started only for those N seconds.
+- **P5b — A deadline that actually bounds the command.** Plan 1's `BoardPool` bounds each query and each connect with its own timeout, but nothing carries the sync's deadline into them, so a sync of 10 s can overshoot by a pool timeout. Task 6 propagates the deadline: `BoardPool.query`, `BoardPool.publish` and the connection handshake take the sync's `AbortSignal`, and a sync waits for what it started before returning. The **network** part of a CLI sync is what the spec's ten seconds bound.
+- **P5c — Mining is CPU, not network, and gets its own budget.** Proof of work happens inside `publishDue`. A `connect_request` costs 22 bits — seconds of CPU — so the publisher takes a separate `miningMs` budget (60 s by default) that is not charged against the sync's network deadline, and `connect` tells the person, in Spanish, that this first step takes a few seconds. Nothing else in the plan exceeds the spec's ten seconds.
 - **P6 — Mining in parallel.** `mineEvent` splits the nonce space across `min(availableParallelism() - 1, 4)` workers, each starting at a different offset and stepping by the worker count. The first to find a nonce wins and the rest are terminated. One worker is left for the main thread, so a laptop stays usable while `connect` mines.
+- **P10 — The four inbox commands sync the responder role.** `requests`, `approve`, `reject` and `revoke` are about messages addressed to this person as a responder, and `handleAskerMessage` deliberately drops those. They therefore run the same short-lived cycle with a second, role-`responder` session: its own cursors, `handleResponderMessage`, and no channel lock and no dispatcher (only the channel takes the lock and hands questions to Claude). Without this, a request published while the channel was closed would never appear in `requests`.
+- **P11 — A question already sent survives its contact being revoked.** The spec's contract is that an unanswered question gets the final decision `rejected`/`stale_generation`, and that the responder regenerates it **when a retry arrives**. Plan 2's `authorizeOutboxItem` refuses any `question` whose contact is not currently approved, which would abandon exactly the retry that fetches that decision. Task 2 narrows the rule: a `question` row is authorized while this person still has an open `outbox_questions` row for it with the same generation, whatever the contact's current state. A *new* question to a revoked contact is still refused, by `createOutboundQuestion`, before anything is stored.
 - **P7 — A question's own relays.** A question goes to the relays stored for that contact at the moment it is created, and a retry reuses the same rumor and the same outbox row, so its relays are the original ones. A `connect_approved` with a different relay list updates the contact, so the *next* question uses the new ones. There is no protocol path to update the relays of an already-approved contact (`docs/known-gaps.md`), and this plan does not invent one.
 - **P8 — `lost` is applied by whoever syncs.** `expireOutboundQuestions(store, now)` runs inside every sync and inside the `Device` purge loop, so a question reaches `lost` whether the person uses the terminal or leaves the MCP server running.
-- **P9 — The 0.1 enrollment commands go now.** `enroll`, `invite`, `accept` and `admin enroll-link` disappear with `packages/cli/src/commands/account.ts` and `clientFor`. `RelayHttpClient` itself stays until plan 4, because `doctor` still imports it.
+- **P9 — The 0.1 enrollment commands leave the command table now, and the code in plan 4.** `enroll`, `invite`, `accept` and `admin enroll-link` stop being commands a person can run. Their implementation stays on disk for one more plan because `setup.ts` still calls `enroll` (`packages/cli/src/commands/setup.ts:10,459`) and `doctor.ts` still imports `RelayHttpClient`; plan 4 rewrites both and deletes `account.ts`, `clientFor` and `http.ts` together. Deleting the file in this plan would break the CLI's own build.
 
 ## Carried from plan 2 and resolved here
 
@@ -86,29 +90,36 @@ packages/core/src/store/outbox-questions.ts     create, read, list, find by pref
                                                 markSentQuestions, applyReceipt, applyAnswer,
                                                 applyRejected, expireOutboundQuestions,
                                                 purgeOutboundQuestions (Task 2)
-packages/core/src/device/device.ts              purge loop also purges and expires asker questions (Task 2)
+packages/core/src/device/device.ts              onPublished hook forwarded to the publisher; purge loop also
+                                                purges and expires asker questions (Task 2); syncOnce's deadline
+                                                reaches the pool (Task 6)
+packages/core/src/device/publisher.ts           onPublished hook; a mining budget separate from the sync deadline (Tasks 2, 5)
+packages/core/src/device/authorize.ts           a question retry stays authorized while its own row is open (Task 2)
+packages/core/src/boards/pool.ts                query, publish and connect take the caller's AbortSignal (Task 6)
 packages/core/src/asker/inbound.ts              handleAskerMessage: step 10 for the asker role (Task 3)
 packages/core/src/envelope/pow.ts               mineEvent across several workers (Task 4)
 packages/core/src/index.ts                      re-exports the new modules
 
-packages/cli/src/asker/service.ts               AskerService: connect, contacts, ask, wait, ticket, sync (Tasks 5, 6)
-packages/cli/src/asker/session.ts               openAskerSession / withAsker: the short-lived cycle (Task 5)
-packages/cli/src/asker/format.ts                Spanish text for contacts and question states (Task 6)
-packages/cli/src/commands/connect.ts            link, connect (Task 7)
-packages/cli/src/commands/contacts.ts           contacts, whoami, requests, approve, reject, revoke (Task 8)
-packages/cli/src/commands/ask.ts                rewritten: ask, ticket (Task 9)
-packages/cli/src/mcp-asker.ts                   rewritten: AskerService behind four MCP tools (Task 10)
-packages/cli/src/router.ts                      command table and USAGE (Task 11)
-packages/cli/src/context.ts                     clientFor deleted (Task 11)
+packages/cli/src/asker/service.ts               AskerService: connect, contacts, ask, wait, ticket, sync (Tasks 6, 7)
+packages/cli/src/asker/session.ts               openAskerSession / withAsker, and withResponderSession for the
+                                                four inbox commands (Task 7)
+packages/cli/src/asker/format.ts                Spanish text for contacts and question states, and the
+                                                terminal-safe rendering of third-party names and notes (Task 8)
+packages/cli/src/commands/connect.ts            link, connect (Task 9)
+packages/cli/src/commands/contacts.ts           contacts, whoami, requests, approve, reject, revoke (Task 10)
+packages/cli/src/commands/ask.ts                rewritten: ask, ticket (Task 11)
+packages/cli/src/mcp-asker.ts                   rewritten: AskerService behind four MCP tools, closing on stdin EOF (Task 11)
+packages/cli/src/router.ts                      command table and USAGE (Task 12)
+packages/cli/src/context.ts                     an optional relayPolicy for tests, like the existing fetchImpl (Task 7)
 
 packages/core/test/…                            one test file per new module
 packages/cli/test/…                             service, session, commands, mcp tools
-tests/asker/support.ts                          harness: a real asker and a real responder over fake boards (Task 12)
-tests/asker/flow.test.ts                        connect → approve → ask → receipt → answer (Task 12)
-tests/asker/scenarios.test.ts                   rejection, revocation, losses, expiry, conflicts (Task 13)
-tests/asker/multiprocess.test.ts                CLI and MCP server on the same store (Task 14)
+tests/asker/support.ts                          harness: a real asker and a real responder over fake boards (Task 13)
+tests/asker/flow.test.ts                        connect → approve → ask → receipt → answer (Task 13)
+tests/asker/scenarios.test.ts                   rejection, revocation, losses, expiry, conflicts (Task 14)
+tests/asker/multiprocess.test.ts                CLI and MCP server on the same store (Task 15)
 
-Deleted: packages/cli/src/commands/account.ts, packages/cli/test/mcp-asker.test.ts (rewritten in place)
+Deleted: nothing. `account.ts` stops being routed but stays until plan 4 rewrites `setup` and `doctor`.
 ```
 
 ## Execution notes from plans 1 and 2
@@ -467,8 +478,10 @@ git commit -m "feat(core): schema v3 and the questions this person sent"
 
 **Files:**
 - Modify: `packages/core/src/store/outbox-questions.ts` (append the transitions)
-- Modify: `packages/core/src/device/device.ts` (the purge loop also ages asker questions)
-- Test: `packages/core/test/store-outbox-questions.test.ts` (append), `packages/core/test/device.test.ts` (append)
+- Modify: `packages/core/src/device/publisher.ts` (an `onPublished` hook)
+- Modify: `packages/core/src/device/device.ts` (forward `onPublished`; the purge loop also ages asker questions)
+- Modify: `packages/core/src/device/authorize.ts` (a question retry stays authorized while its own row is open)
+- Test: `packages/core/test/store-outbox-questions.test.ts` (append), `packages/core/test/device-publisher.test.ts` (append), `packages/core/test/device-authorize.test.ts` (append), `packages/core/test/device.test.ts` (append)
 
 **Interfaces:**
 - Consumes: Task 1's module; plan 1's `claimDue`, `markPublished`, `resolveOutboxMessage`, `purgeOutbox`; plan 2's `Device`.
@@ -479,6 +492,8 @@ git commit -m "feat(core): schema v3 and the questions this person sent"
   - `applyRejected(store, { recipient, questionId, reason, now }): 'applied' | 'ignored'`: the same, to `rejected`.
   - `expireOutboundQuestions(store, now): number`: every question with no final state after `NOSTR.retryWindowSeconds` becomes `lost`, and its outbox row is deleted.
   - `purgeOutboundQuestions(store, now): { contentCleared: number; forgotten: number }`: clears question text and stored answers at 7 days, forgets the row at 9.
+  - `publishDue` gains `onPublished?: (item: OutboxItem) => void`, called after a round recorded a successful publish for that row, and `Device` gains the same option and forwards it. A persistent process therefore promotes a question the moment it goes out, instead of waiting for someone to sync.
+  - `authorizeOutboxItem`'s `question` case is narrowed: a row is authorized while the outbound contact is approved with that generation **or** this person still has an open `outbox_questions` row for that question with the same generation. That is what lets a retry fetch the `rejected`/`stale_generation` the other side stored when they revoked — the spec regenerates that decision only when a retry arrives.
   - `Device`'s purge loop gains two steps, so both retention and `lost` happen on a timer in a persistent process.
 - A second decision for the same question returns `'ignored'`: the caller (Task 3) logs it with identifiers only.
 
@@ -587,6 +602,20 @@ describe('expireOutboundQuestions', () => {
     applyAnswer(store, { recipient: them.publicKey, questionId: id, answer: { text: 'ok', source: 'x', confidence: 'seguro' }, now: T0 + 1 })
     expect(expireOutboundQuestions(store, T0 + NOSTR.retryWindowSeconds + 1)).toBe(0)
     expect(getOutboundQuestion(store, them.publicKey, id)?.state).toBe('answered')
+  })
+})
+
+describe('the publisher promotes a question as it goes out', () => {
+  it('fires onPublished for the row it just published', async () => {
+    approved()
+    const id = ask(31)
+    const published: string[] = []
+    const { publishDue } = await import('@agentbridge/core')
+    // A pool that accepts everything, so the round records a publish.
+    const pool = { publish: async () => ({ accepted: ['wss://relay.example.com'], rejected: [] }) } as never
+    await publishDue({ store, identity: me, pool, now: () => T0, onPublished: (item) => published.push(item.rumorId) })
+    expect(published).toHaveLength(1)
+    expect(getOutboundQuestion(store, them.publicKey, id)?.state).toBe('sent')
   })
 })
 
@@ -743,7 +772,68 @@ export function purgeOutboundQuestions(store: Store, now: number): { contentClea
 }
 ```
 
-- [ ] **Step 4: Wire the two steps into the device's purge loop**
+- [ ] **Step 4: Report a publish as it happens**
+
+In `packages/core/src/device/publisher.ts`, add `onPublished?: (item: OutboxItem) => void` to `PublishDueInput`, and call it right after the branch that counted a published row (guarded, so a throwing callback cannot stop the round):
+
+```ts
+      if (outcome.accepted.length > 0) {
+        if (markPublished(input.store, { recipient: item.recipient, rumorId: item.rumorId, owner, now: now() }) === 'claim_lost') {
+          report.lost++
+        } else {
+          report.published++
+          try {
+            input.onPublished?.(item)
+          } catch {
+            // A caller's bookkeeping must never break the publishing round.
+          }
+        }
+      } else if (…)
+```
+
+> Keep the existing branch structure; the only additions are the `onPublished` option and the guarded call.
+
+In `packages/core/src/device/device.ts`, add `onPublished?: (item: OutboxItem) => void` to `DeviceOptions` and pass it through in both places that call `publishDue` (the background round and `syncOnce`).
+
+- [ ] **Step 5: Let a retry of an already-sent question survive a revocation**
+
+In `packages/core/src/device/authorize.ts`, replace the `question` case with:
+
+```ts
+    case 'question': {
+      const contact = getContact(store, item.recipient, 'outbound')
+      if (contact?.state === 'approved' && contact.generation === message.generation) return true
+      // The other person may have revoked while this question was still open. The spec stores their
+      // final rejected/stale_generation decision and regenerates it only when a retry arrives, so
+      // the retry has to stay authorized: it is the one thing that fetches that decision. A NEW
+      // question to a revoked contact never gets this far — createOutboundQuestion refuses it.
+      const question = getOutboundQuestion(store, item.recipient, message.questionId)
+      return question !== null && question.generation === message.generation && question.state !== 'answered' && question.state !== 'rejected' && question.state !== 'lost'
+    }
+```
+
+and import `getOutboundQuestion` from `../store/outbox-questions`.
+
+Add to `packages/core/test/device-authorize.test.ts`:
+
+```ts
+  it('keeps authorizing a retry of a question that was sent before the contact revoked', () => {
+    // Seeded as approved, one question sent, then the contact revoked.
+    const item = seedQuestionItem({ generation: 1 })
+    applyRevocation(store, { pubkey: them.publicKey, generation: 2, now: T0 + 5 })
+    expect(authorizeOutboxItem(store, item)).toBe(true)
+  })
+
+  it('refuses a question whose own row already ended', () => {
+    const item = seedQuestionItem({ generation: 1 })
+    applyRejected(store, { recipient: them.publicKey, questionId: questionIdOf(item), reason: 'stale_generation', now: T0 + 6 })
+    expect(authorizeOutboxItem(store, item)).toBe(false)
+  })
+```
+
+> `seedQuestionItem` builds the `OutboxItem` the same way the existing tests in that file build theirs (a stored question plus its outbox row); `questionIdOf` reads the id out of the item's rumor content. Write both helpers next to the file's existing ones rather than duplicating their bodies in each test.
+
+- [ ] **Step 6: Wire the two steps into the device's purge loop**
 
 In `packages/core/src/device/device.ts`, import them:
 
@@ -758,18 +848,18 @@ and add two steps to the `steps` array inside `purge()`, after `['outbox', …]`
       ['sent question content', () => purgeOutboundQuestions(this.options.store, now)],
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 7: Run the tests to verify they pass**
 
-Run: `npx vitest run packages/core/test/store-outbox-questions.test.ts packages/core/test/device.test.ts`
+Run: `npx vitest run packages/core/test/store-outbox-questions.test.ts packages/core/test/device.test.ts packages/core/test/device-publisher.test.ts packages/core/test/device-authorize.test.ts`
 Expected: PASS.
 
 Run: `npm run typecheck && npm test`
 Expected: clean, every test passing.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add packages/core/src/store/outbox-questions.ts packages/core/src/device/device.ts packages/core/test/store-outbox-questions.test.ts packages/core/test/device.test.ts
+git add packages/core/src/store/outbox-questions.ts packages/core/src/device packages/core/test/store-outbox-questions.test.ts packages/core/test/device.test.ts packages/core/test/device-publisher.test.ts packages/core/test/device-authorize.test.ts
 git commit -m "feat(core): the asker's question state machine, from sending to lost"
 ```
 ### Task 3: Step 10 for the asker role — routing opened messages
@@ -793,7 +883,7 @@ git commit -m "feat(core): the asker's question state machine, from sending to l
     - `connect_approved` and `connect_rejected` only apply to the pending request with that `requestId`; `connect_approved` and `connect_revoked` only apply with a generation greater than the maximum ever observed. Plan 1's store functions already enforce both, so this file does not repeat the rules.
     - `receipt`, `answer` and `rejected` are keyed by `(senderPubkey, questionId)`, so a message from anyone other than that question's recipient can never touch it.
     - `connect_request` and `question` are `other_role`, and nothing is stored.
-    - An `'ignored'` outcome on a `receipt`/`answer`/`rejected` is what a second decision looks like; Task 5's service logs it with identifiers only.
+    - An `'ignored'` outcome on a `receipt`/`answer`/`rejected` is what a second decision looks like; Task 6's service logs it with identifiers only.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -832,12 +922,16 @@ beforeEach(async () => {
 })
 afterEach(() => store.close())
 
-// An opened message as the receive pipeline hands it over: the rumor plus who sealed it.
+// An opened message exactly as the receive pipeline hands it over. Built by hand (rather than by
+// wrapping and opening for real) so these tests stay fast, but with every field `OpenedMessage`
+// declares, including the ones the router never reads.
 function opened(message: Message, sender = them, createdAt = T0): OpenedMessage {
   const rumor = createRumor(message, sender, createdAt)
-  return { senderPubkey: sender.publicKey, rumor, message }
+  return { ok: true, wrapId: rumor.id, senderPubkey: sender.publicKey, rumor, message, powBits: 16 }
 }
 
+// `satisfies Message` keeps `v: 1` and every `type` as the literal the discriminated union needs;
+// a plain object literal would widen them to `number` and `string` and fail to type-check.
 const handle = (message: Message, sender = them, now = T0) =>
   handleAskerMessage(store, { identity: me, opened: opened(message, sender), now })
 
@@ -853,37 +947,37 @@ function approvedContact(generation = 1): void {
 describe('handleAskerMessage — permissions', () => {
   it('applies an approval for the pending request', () => {
     pendingRequest()
-    const result = handle({ v: 1, type: 'connect_approved', requestId: uuid(1), generation: 1, name: 'Ana', relays: RELAYS })
+    const result = handle({ v: 1, type: 'connect_approved', requestId: uuid(1), generation: 1, name: 'Ana', relays: RELAYS } satisfies Message)
     expect(result).toEqual({ kind: 'permission', type: 'connect_approved', outcome: 'applied' })
     expect(getContact(store, them.publicKey, 'outbound')).toMatchObject({ state: 'approved', generation: 1, declaredName: 'Ana' })
   })
 
   it('ignores an approval whose relays are all unusable, without storing anything', () => {
     pendingRequest()
-    const result = handle({ v: 1, type: 'connect_approved', requestId: uuid(1), generation: 1, name: 'Ana', relays: ['http://x.example.com'] })
+    const result = handle({ v: 1, type: 'connect_approved', requestId: uuid(1), generation: 1, name: 'Ana', relays: ['http://x.example.com'] } satisfies Message)
     expect(result).toEqual({ kind: 'ignored', reason: 'no_relays' })
     expect(getContact(store, them.publicKey, 'outbound')?.state).toBe('pending')
   })
 
   it('ignores an approval for a request id that is not the pending one', () => {
     pendingRequest()
-    const result = handle({ v: 1, type: 'connect_approved', requestId: uuid(2), generation: 1, name: 'Ana', relays: RELAYS })
+    const result = handle({ v: 1, type: 'connect_approved', requestId: uuid(2), generation: 1, name: 'Ana', relays: RELAYS } satisfies Message)
     expect(result).toEqual({ kind: 'permission', type: 'connect_approved', outcome: 'ignored' })
     expect(getContact(store, them.publicKey, 'outbound')?.state).toBe('pending')
   })
 
   it('applies a rejection and then ignores a stale revocation', () => {
     approvedContact(3)
-    expect(handle({ v: 1, type: 'connect_revoked', generation: 2 })).toEqual({ kind: 'permission', type: 'connect_revoked', outcome: 'ignored' })
+    expect(handle({ v: 1, type: 'connect_revoked', generation: 2 } satisfies Message)).toEqual({ kind: 'permission', type: 'connect_revoked', outcome: 'ignored' })
     expect(getContact(store, them.publicKey, 'outbound')?.state).toBe('approved')
 
-    expect(handle({ v: 1, type: 'connect_revoked', generation: 4 })).toEqual({ kind: 'permission', type: 'connect_revoked', outcome: 'applied' })
+    expect(handle({ v: 1, type: 'connect_revoked', generation: 4 } satisfies Message)).toEqual({ kind: 'permission', type: 'connect_revoked', outcome: 'applied' })
     expect(getContact(store, them.publicKey, 'outbound')).toMatchObject({ state: 'revoked', maxGenerationSeen: 4 })
   })
 
   it('applies a rejection of the pending request', () => {
     pendingRequest()
-    expect(handle({ v: 1, type: 'connect_rejected', requestId: uuid(1) })).toEqual({ kind: 'permission', type: 'connect_rejected', outcome: 'applied' })
+    expect(handle({ v: 1, type: 'connect_rejected', requestId: uuid(1) } satisfies Message)).toEqual({ kind: 'permission', type: 'connect_rejected', outcome: 'applied' })
     expect(getContact(store, them.publicKey, 'outbound')?.state).toBe('rejected')
   })
 })
@@ -897,10 +991,10 @@ describe('handleAskerMessage — answers to my questions', () => {
 
   it('records a receipt, then an answer', () => {
     const id = askOne(10)
-    expect(handle({ v: 1, type: 'receipt', questionId: id })).toEqual({ kind: 'question', type: 'receipt', questionId: id, outcome: 'applied' })
+    expect(handle({ v: 1, type: 'receipt', questionId: id } satisfies Message)).toEqual({ kind: 'question', type: 'receipt', questionId: id, outcome: 'applied' })
     expect(getOutboundQuestion(store, them.publicKey, id)?.state).toBe('received')
 
-    const answer = { v: 1, type: 'answer' as const, questionId: id, text: 'así se hace', source: 'README.md', confidence: 'seguro' as const }
+    const answer = { v: 1, type: 'answer', questionId: id, text: 'así se hace', source: 'README.md', confidence: 'seguro' } satisfies Message
     expect(handle(answer)).toEqual({ kind: 'question', type: 'answer', questionId: id, outcome: 'applied' })
     expect(getOutboundQuestion(store, them.publicKey, id)).toMatchObject({
       state: 'answered',
@@ -910,7 +1004,7 @@ describe('handleAskerMessage — answers to my questions', () => {
 
   it('records a rejection with its reason', () => {
     const id = askOne(11)
-    expect(handle({ v: 1, type: 'rejected', questionId: id, reason: 'limit' })).toEqual({
+    expect(handle({ v: 1, type: 'rejected', questionId: id, reason: 'limit' } satisfies Message)).toEqual({
       kind: 'question',
       type: 'rejected',
       questionId: id,
@@ -921,15 +1015,15 @@ describe('handleAskerMessage — answers to my questions', () => {
 
   it('never lets a third party answer a question sent to someone else', () => {
     const id = askOne(12)
-    const answer = { v: 1, type: 'answer' as const, questionId: id, text: 'soy otro', source: 'x', confidence: 'seguro' as const }
+    const answer = { v: 1, type: 'answer', questionId: id, text: 'soy otro', source: 'x', confidence: 'seguro' } satisfies Message
     expect(handle(answer, stranger)).toEqual({ kind: 'question', type: 'answer', questionId: id, outcome: 'ignored' })
     expect(getOutboundQuestion(store, them.publicKey, id)?.state).toBe('sending')
   })
 
   it('reports a second decision as ignored instead of overwriting the first', () => {
     const id = askOne(13)
-    handle({ v: 1, type: 'rejected', questionId: id, reason: 'expired' })
-    const answer = { v: 1, type: 'answer' as const, questionId: id, text: 'tarde', source: 'x', confidence: 'seguro' as const }
+    handle({ v: 1, type: 'rejected', questionId: id, reason: 'expired' } satisfies Message)
+    const answer = { v: 1, type: 'answer', questionId: id, text: 'tarde', source: 'x', confidence: 'seguro' } satisfies Message
     expect(handle(answer)).toEqual({ kind: 'question', type: 'answer', questionId: id, outcome: 'ignored' })
     expect(getOutboundQuestion(store, them.publicKey, id)?.state).toBe('rejected')
   })
@@ -938,11 +1032,11 @@ describe('handleAskerMessage — answers to my questions', () => {
 describe('handleAskerMessage — the responder role', () => {
   it('ignores every message that belongs to the other role and stores nothing', () => {
     const before = store.db.prepare('SELECT count(*) AS n FROM contacts').get() as { n: number }
-    expect(handle({ v: 1, type: 'connect_request', requestId: uuid(3), name: 'Ana', note: '', relays: RELAYS })).toEqual({
+    expect(handle({ v: 1, type: 'connect_request', requestId: uuid(3), name: 'Ana', note: '', relays: RELAYS } satisfies Message)).toEqual({
       kind: 'ignored',
       reason: 'other_role',
     })
-    expect(handle({ v: 1, type: 'question', questionId: uuid(4), generation: 1, text: 'hola' })).toEqual({ kind: 'ignored', reason: 'other_role' })
+    expect(handle({ v: 1, type: 'question', questionId: uuid(4), generation: 1, text: 'hola' } satisfies Message)).toEqual({ kind: 'ignored', reason: 'other_role' })
     expect(store.db.prepare('SELECT count(*) AS n FROM contacts').get()).toEqual(before)
   })
 })
@@ -1072,7 +1166,7 @@ git commit -m "feat(core): route opened messages for the asker role"
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `packages/core/test/envelope-pow.test.ts` (add `availableParallelism` from `node:os` to the imports if the assertions below need it — they do not, but the first test names it in a comment):
+Append to `packages/core/test/envelope-pow.test.ts`. The last test spies on the worker constructor, so the file needs `import * as workerThreads from 'node:worker_threads'`, `import { Worker } from 'node:worker_threads'` and `vi` from vitest:
 
 ```ts
 describe('mineEvent across several workers', () => {
@@ -1105,6 +1199,28 @@ describe('mineEvent across several workers', () => {
   it('refuses a worker count that is not a positive integer', async () => {
     await expect(mineEvent(event, 8, { workers: 0 })).rejects.toThrow(RangeError)
     await expect(mineEvent(event, 8, { workers: 2.5 })).rejects.toThrow(RangeError)
+  })
+
+  it('terminates the lanes it already created when one fails to start', async () => {
+    // A worker allocation can fail (a process at its thread limit). Inject that on the second lane.
+    const realWorker = Worker
+    let created = 0
+    const terminated: number[] = []
+    class FailingWorker extends realWorker {
+      constructor(...args: ConstructorParameters<typeof realWorker>) {
+        created += 1
+        if (created === 2) throw new Error('simulated worker allocation failure')
+        super(...args)
+      }
+      override terminate(): Promise<number> {
+        terminated.push(created)
+        return super.terminate()
+      }
+    }
+    vi.spyOn(workerThreads, 'Worker').mockImplementation(FailingWorker as never)
+    await expect(mineEvent(event, 20, { workers: 3 })).rejects.toThrow('simulated worker allocation failure')
+    expect(terminated.length).toBeGreaterThanOrEqual(1)
+    vi.restoreAllMocks()
   })
 })
 ```
@@ -1174,34 +1290,39 @@ export function mineEvent(event: UnsignedEvent, bits: number, options: { signal?
     }
     const workers: Worker[] = []
     let settled = false
-    // Terminating every worker on the way out is what makes this safe to abort: the losing lanes
-    // are in a tight synchronous loop and would otherwise keep a core busy until they found their
-    // own nonce.
+    // Every exit goes through `settle`, including a failure to *create* a worker: a throw from
+    // `new Worker` would otherwise reject this promise directly, leaving the lanes already created
+    // mining forever and the abort listener attached. Terminating every worker is what makes an
+    // abort real (a losing lane is in a tight synchronous loop), and waiting for those terminations
+    // before settling keeps a losing lane from burning a core into the caller's next operation.
     const settle = (fn: () => void) => {
       if (settled) return
       settled = true
       options.signal?.removeEventListener('abort', onAbort)
-      for (const worker of workers) void worker.terminate()
-      fn()
+      void Promise.allSettled(workers.map((worker) => worker.terminate())).then(fn)
     }
     const onAbort = () => settle(() => reject(new Error('mining aborted')))
     options.signal?.addEventListener('abort', onAbort, { once: true })
 
     let exited = 0
-    for (let lane = 0; lane < lanes; lane++) {
-      const worker = new Worker(WORKER_SOURCE, { eval: true, workerData: { event, bits, start: lane, stride: lanes } })
-      workers.push(worker)
-      worker.once('message', (m: { nonce: string; id: string }) =>
-        settle(() => resolve({ ...event, tags: [...event.tags, ['nonce', m.nonce, String(bits)]], id: m.id })),
-      )
-      worker.once('error', (err) => settle(() => reject(err)))
-      // A worker that ends without posting a nonce (killed, or exited from inside) is only fatal
-      // when it was the last one still searching: while another lane is alive the search goes on.
-      // After a message or an error, `settle` makes this a no-op anyway.
-      worker.once('exit', () => {
-        exited += 1
-        if (exited === workers.length) settle(() => reject(new Error('mining worker exited')))
-      })
+    try {
+      for (let lane = 0; lane < lanes; lane++) {
+        const worker = new Worker(WORKER_SOURCE, { eval: true, workerData: { event, bits, start: lane, stride: lanes } })
+        workers.push(worker)
+        worker.once('message', (m: { nonce: string; id: string }) =>
+          settle(() => resolve({ ...event, tags: [...event.tags, ['nonce', m.nonce, String(bits)]], id: m.id })),
+        )
+        worker.once('error', (err) => settle(() => reject(err)))
+        // A worker that ends without posting a nonce (killed, or exited from inside) is only fatal
+        // when it was the last one still searching: while another lane is alive the search goes on.
+        // After a message or an error, `settle` makes this a no-op anyway.
+        worker.once('exit', () => {
+          exited += 1
+          if (exited === workers.length) settle(() => reject(new Error('mining worker exited')))
+        })
+      }
+    } catch (err) {
+      settle(() => reject(err))
     }
   })
 }
@@ -1215,33 +1336,186 @@ Expected: PASS.
 Run: `npm run typecheck && npm test`
 Expected: clean, every test passing (the existing mining tests use the default worker count).
 
-- [ ] **Step 5: Measure the difference and record it**
+- [ ] **Step 5: Measure the difference on a realistic event, and record it**
 
-Run this one-off measurement from the repository root (it mines one 22-bit event on one lane and one on the default lanes, and prints both):
+Write `scripts/measure-pow.mjs` (a scratch script this task adds and Task 15 reuses) and run it once:
 
 ```bash
-node --input-type=module -e "
-import { mineEvent, defaultMiningWorkers } from './packages/core/src/envelope/pow.ts'
-" 2>/dev/null || npx tsx -e "
-import { defaultMiningWorkers, mineEvent } from './packages/core/src/envelope/pow'
-const event = { pubkey: 'b'.repeat(64), created_at: 1_700_000_000, kind: 1059, tags: [], content: 'medición' }
-for (const workers of [1, defaultMiningWorkers()]) {
-  const started = Date.now()
-  await mineEvent(event, 22, { workers })
-  console.log(\`[pow] 22 bits with \${workers} worker(s): \${Date.now() - started} ms\`)
-}
-"
+npx tsx scripts/measure-pow.mjs
 ```
 
-Put both numbers in the commit message. They are the evidence that `connect` stopped being a hang; plan 4's documentation quotes them.
+```js
+// scripts/measure-pow.mjs — how long a real connection request takes to mine, on one lane and on
+// the default lanes. Three samples each, median reported: a single sample of a toy event is not
+// comparable to the 16 487 ms plan 1 measured against public relays.
+import { defaultMiningWorkers, mineEvent } from '../packages/core/src/envelope/pow.ts'
+import { createRumor, wrapRumor } from '../packages/core/src/envelope/seal.ts'
+import { NOSTR, nowSeconds } from '../packages/core/src/nostr-constants.ts'
+import { generateSecretKey, getPublicKey } from 'nostr-tools/pure'
+
+const secretKey = generateSecretKey()
+const identity = { secretKey, publicKey: getPublicKey(secretKey) }
+const recipient = getPublicKey(generateSecretKey())
+// The event a connect_request really mines: a sealed, encrypted wrap, not a short string.
+const rumor = createRumor(
+  { v: 1, type: 'connect_request', requestId: crypto.randomUUID(), name: 'Medición', note: 'x'.repeat(200), relays: ['wss://relay.example.com'] },
+  identity,
+  nowSeconds(),
+)
+const wrap = await wrapRumor(rumor, identity, recipient, { now: nowSeconds() })
+const unsigned = { pubkey: wrap.pubkey, created_at: wrap.created_at, kind: wrap.kind, tags: [], content: wrap.content }
+
+const median = (values) => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)]
+for (const workers of [1, defaultMiningWorkers()]) {
+  const samples = []
+  for (let i = 0; i < 3; i++) {
+    const started = Date.now()
+    await mineEvent({ ...unsigned, created_at: unsigned.created_at - i }, NOSTR.powRequestBits, { workers })
+    samples.push(Date.now() - started)
+  }
+  console.log(`[pow] 22 bits with ${workers} worker(s): median ${median(samples)} ms of ${samples.join(', ')}`)
+}
+```
+
+Put both medians in the commit message. They are the evidence that `connect` stopped being a hang; plan 4's documentation quotes them.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add packages/core/src/envelope/pow.ts packages/core/test/envelope-pow.test.ts
+git add packages/core/src/envelope/pow.ts packages/core/test/envelope-pow.test.ts scripts/measure-pow.mjs
 git commit -m "perf(core): mine a connection request across several workers"
 ```
-### Task 5: `AskerService` — connect, contacts, ask, and the short-lived cycle
+### Task 5: A deadline that actually bounds a command
+
+**Files:**
+- Modify: `packages/core/src/boards/pool.ts` (`query`, `publish` and `connection` take the caller's signal)
+- Modify: `packages/core/src/boards/connection.ts` (the AUTH/handshake wait honors an aborted signal)
+- Modify: `packages/core/src/device/publisher.ts` (a mining budget of its own)
+- Modify: `packages/core/src/device/device.ts` (`syncOnce` passes its signal to every pool call and waits for what it started)
+- Test: `packages/core/test/boards-pool.test.ts` (append), `packages/core/test/device.test.ts` (append), `packages/core/test/device-publisher.test.ts` (append)
+
+**Interfaces:**
+- Consumes: plan 1's `BoardPool`, `BoardConnection`; plan 2's `Device.syncOnce`, `publishDue`.
+- Produces:
+  - `BoardPool.query(relay, filter, options?: { timeoutMs?: number; signal?: AbortSignal })` — an aborted signal ends the query at once with `complete: false` and a fixed English reason; a query that has not connected yet stops waiting for the connection too.
+  - `BoardPool.publish(relays, event, beforeSend?, options?: { signal?: AbortSignal })` — the same: an aborted signal stops waiting on relays that have not answered, and the relays that already accepted still count.
+  - `publishDue` takes `miningMs?: number` (default 60 000), and `Device` takes the same option and forwards it: the proof-of-work budget for one row, enforced with its own `AbortSignal`, separate from the sync's network deadline. A mining timeout leaves the row pending for the next round, exactly like a postponement.
+  - `Device.syncOnce({ maxMs })` passes its deadline signal into every history query and into publishing, so a sync returns within `maxMs` plus the time the store needs, not plus a pool timeout.
+- Why this task exists: the spec bounds a short-lived client's sync at ten seconds, and the only thing that made that true before was each pool call's own timeout. A slow relay could push a "10-second" sync past twenty. Mining is CPU, not network, so it gets its own budget instead of being charged to that ten seconds.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `packages/core/test/boards-pool.test.ts`:
+
+```ts
+describe('BoardPool honors a caller signal', () => {
+  it('ends a query at once when the caller aborts', async () => {
+    const board = await startFakeBoard({ beforeEose: async () => new Promise(() => {}) })
+    const pool = new BoardPool({ identity, createSocket: plainSocketFactory, timeoutMs: 30_000 })
+    const controller = new AbortController()
+    const started = Date.now()
+    const querying = pool.query(board.url, { kinds: [1059], limit: 10 }, { signal: controller.signal })
+    setTimeout(() => controller.abort(), 50)
+    const result = await querying
+    expect(result.complete).toBe(false)
+    expect(Date.now() - started).toBeLessThan(5_000)
+    await pool.close()
+    await board.close()
+  })
+
+  it('stops waiting for a relay that never answers a publish', async () => {
+    const board = await startFakeBoard({ swallowPublishes: true })
+    const pool = new BoardPool({ identity, createSocket: plainSocketFactory, timeoutMs: 30_000 })
+    const controller = new AbortController()
+    const started = Date.now()
+    const publishing = pool.publish([board.url], event, () => true, { signal: controller.signal })
+    setTimeout(() => controller.abort(), 50)
+    const outcome = await publishing
+    expect(outcome.accepted).toEqual([])
+    expect(Date.now() - started).toBeLessThan(5_000)
+    await pool.close()
+    await board.close()
+  })
+})
+```
+
+> Use whatever the fake board already offers for "answers nothing" (plan 1 gave it failure modes for losing events, answering slowly and disconnecting mid-subscription). If it has no option for swallowing a publish, add one there — it is test support, and Task 15 needs it too.
+
+Append to `packages/core/test/device.test.ts`:
+
+```ts
+  it('returns from syncOnce inside its deadline even when a relay never answers', async () => {
+    const { device } = await setup({ relayBehavior: 'silent' })
+    const started = Date.now()
+    const report = await device.syncOnce({ maxMs: 1_000 })
+    expect(report.timedOut).toBe(true)
+    // The budget plus a small margin for the store, not plus a pool timeout.
+    expect(Date.now() - started).toBeLessThan(3_000)
+  })
+```
+
+Append to `packages/core/test/device-publisher.test.ts`:
+
+```ts
+  it('leaves a row pending when mining runs past its own budget, without touching the sync deadline', async () => {
+    const { store, identity, pool } = await setupPublisher()
+    enqueueConnectRequest(store, { now: T0 })
+    const report = await publishDue({ store, identity, pool, now: () => T0, miningMs: 1 })
+    expect(report.published).toBe(0)
+    expect(report.postponed + report.failed).toBeGreaterThanOrEqual(1)
+    expect(store.db.prepare("SELECT state FROM outbox").get()).toMatchObject({ state: 'pending' })
+  })
+```
+
+> `setupPublisher` and `enqueueConnectRequest` are that file's existing helpers (or the closest ones); a 22-bit row with a 1 ms budget cannot finish, which is the point.
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `npx vitest run packages/core/test/boards-pool.test.ts packages/core/test/device.test.ts packages/core/test/device-publisher.test.ts`
+Expected: FAIL — `query` and `publish` take no signal, and `publishDue` has no mining budget.
+
+- [ ] **Step 3: Carry the signal through the pool**
+
+In `packages/core/src/boards/pool.ts`:
+
+- `connection(relay, signal?)` rejects immediately when `signal?.aborted`, and races its connect promise against the signal's `abort` event so a caller stops waiting even though the connection attempt continues in the background (the pool still owns and closes it).
+- `query(relay, filter, options: { timeoutMs?: number; signal?: AbortSignal } = {})` — keep the current `timeoutMs` behavior and add: an already-aborted signal returns `{ events: [], complete: false, closedReason: 'error: sync deadline reached' }` without connecting; an abort during the query settles it the same way and unsubscribes.
+- `publish(relays, event, beforeSend = () => true, options: { signal?: AbortSignal } = {})` — an abort settles the per-relay promise as rejected-with-reason `'error: sync deadline reached'` for the relays that had not answered, and the ones that already accepted stay in `accepted`.
+
+Keep both signatures backwards compatible (the extra argument is optional), so plan 2's callers keep compiling unchanged.
+
+- [ ] **Step 4: Give mining its own budget**
+
+In `packages/core/src/device/publisher.ts`, add `miningMs?: number` to `PublishDueInput` and, around the `wrapRumor` call, combine the caller's `signal` with a per-row timeout:
+
+```ts
+      const mining = AbortSignal.any([...(input.signal ? [input.signal] : []), AbortSignal.timeout(input.miningMs ?? 60_000)])
+      wrap = await wrapRumor(item.rumor, input.identity, item.recipient, { now: now(), signal: mining })
+```
+
+A mining abort is already handled by the existing catch, which postpones the row instead of counting a failure — that is the behavior this budget wants.
+
+- [ ] **Step 5: Pass the sync's signal everywhere**
+
+In `packages/core/src/device/device.ts`:
+- thread the `syncOnce` deadline's `signal` into `recoverHistory`'s pool queries and into `publishDue` (it already receives `signal`; make sure the pool calls inside `publishDue` get it too, through the new `publish` option);
+- add `miningMs?: number` to `DeviceOptions` and pass it to both `publishDue` calls, so a caller can give proof of work its own budget.
+
+- [ ] **Step 6: Run the tests to verify they pass**
+
+Run: `npx vitest run packages/core/test/boards-pool.test.ts packages/core/test/device.test.ts packages/core/test/device-publisher.test.ts`
+Expected: PASS.
+
+Run: `npm run typecheck && npm test`
+Expected: clean, every test passing — including plan 2's channel tests, which call the pool without the new options.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add packages/core/src/boards packages/core/src/device packages/core/test
+git commit -m "feat(core): let a caller's deadline reach the relays, and give mining its own budget"
+```
+### Task 6: `AskerService` — connect, contacts, ask, and the short-lived cycle
 
 **Files:**
 - Create: `packages/cli/src/asker/service.ts`
@@ -1264,9 +1538,11 @@ git commit -m "perf(core): mine a connection request across several workers"
     - `ask(name: string, text: string): Promise<OutboundQuestion>`
     - `question(idOrPrefix: string): OutboundQuestion` — exact id, or a prefix of at least `MIN_QUESTION_PREFIX` characters that matches exactly one; Spanish `UserFacingError` when there is none or more than one
     - `close(): Promise<void>`
-  - `openAskerSession(options: { home: string; now?; createSocket?; log? }): Promise<{ service: AskerService; close(): Promise<void> }>` (in `session.ts`)
+  - `openAskerSession(options: { home: string; now?; createSocket?; log?; relayPolicy? }): Promise<{ service: AskerService; close(): Promise<void> }>` (in `session.ts`)
   - `withAsker<T>(ctx: CliContext, fn: (service: AskerService) => Promise<T>, options?: { firstSyncMs?: number; lastSyncMs?: number }): Promise<T>` — start → sync → operate → sync → close, always closing.
-- Waiting for an answer is Task 6.
+  - `withResponderSession<T>(ctx: CliContext, fn: (input: { store: Store; identity: Identity; sync: () => Promise<void> }) => Promise<T>): Promise<T>` — the same cycle for the four commands about messages addressed to this person as a responder (`requests`, `approve`, `reject`, `revoke`). It runs a `Device` with `role: 'responder'` and `handleResponderMessage`, and it never takes the channel lock and never starts a dispatcher: only the channel hands questions to Claude (P10).
+  - `CliContext` gains an optional `relayPolicy?: RelayPolicy`, used the way the existing optional `fetchImpl` is: production leaves it undefined, and a test passes a policy that accepts the fake board's `ws://127.0.0.1` URLs.
+- Waiting for an answer is Task 7.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1283,6 +1559,8 @@ import {
   encodeLink,
   getContact,
   getOutboundQuestion,
+  SeenIds,
+  nowSeconds,
   openStore,
   openWrap,
   precheckWrap,
@@ -1322,14 +1600,17 @@ afterEach(async () => {
   await board.close()
 })
 
-// What the other person's relay actually received, opened with their key.
-async function received(): Promise<Message[]> {
+// What the other person's relay actually received, opened with their key. `precheckWrap` and
+// `openWrap` both take an OpenContext and both discriminate on `.ok` (they are plan 1's real
+// signatures; `openWrap` is synchronous).
+function received(): Message[] {
+  const ctx = { identity: them, now: nowSeconds(), seen: new SeenIds() }
   const messages: Message[] = []
   for (const event of board.events) {
-    const prechecked = precheckWrap(event, them.publicKey)
-    if (prechecked.kind !== 'ok') continue
-    const opened = await openWrap(prechecked.wrap, them)
-    if (opened.kind === 'ok') messages.push(opened.opened.message)
+    const prechecked = precheckWrap(event, ctx)
+    if (!prechecked.ok) continue
+    const opened = openWrap(prechecked, ctx)
+    if (opened.ok) messages.push(opened.message)
   }
   return messages
 }
@@ -1341,7 +1622,7 @@ describe('connect', () => {
     expect(getContact(store, them.publicKey, 'outbound')).toMatchObject({ state: 'pending' })
 
     await service.sync(30_000)
-    const messages = await received()
+    const messages = received()
     expect(messages).toHaveLength(1)
     expect(messages[0]).toMatchObject({ type: 'connect_request', name: 'Beto', note: 'soy Beto, del equipo de datos' })
   })
@@ -1385,7 +1666,7 @@ describe('ask', () => {
     expect(question.state).toBe('sending')
 
     await service.sync()
-    expect((await received()).map((m) => m.type)).toContain('question')
+    expect(received().map((m) => m.type)).toContain('question')
     expect(getOutboundQuestion(store, them.publicKey, question.questionId)?.state).toBe('sent')
   })
 
@@ -1468,6 +1749,9 @@ export type ConnectOutcome =
   | { kind: 'already_approved'; pubkey: string; name: string }
 
 const CLI_SYNC_MS = 10_000
+// Proof of work is CPU, not network: it gets its own budget so it never eats the ten seconds the
+// spec gives a short-lived client's sync (see P5b and P5c).
+const CONNECT_MINING_MS = 60_000
 
 // Everything a person does as an asker, in one object the CLI and the MCP server both drive. It owns
 // no files: whoever builds it passes an identity and a store that are already open, so a test can run
@@ -1478,6 +1762,8 @@ export class AskerService {
   private readonly identity: Identity
   private readonly now: () => number
   private readonly log: (line: string) => void
+  private closed = false
+  private syncing: Promise<SyncReport> = Promise.resolve({ history: [], published: { published: 0, failed: 0, postponed: 0, lost: 0 }, timedOut: false })
 
   constructor(options: AskerServiceOptions) {
     this.store = options.store
@@ -1492,6 +1778,9 @@ export class AskerService {
       now: options.now,
       createSocket: options.createSocket,
       log: options.log,
+      // Proof of work is CPU, not network: a 22-bit connection request gets a minute of its own and
+      // never eats the ten seconds a sync is allowed to spend on relays (P5b, P5c).
+      miningMs: CONNECT_MINING_MS,
       onMessage: (opened, outcome) => {
         // A second decision for a question that already ended is the one outcome worth a line: it
         // means the other side sent two. Identifiers only — never the answer's text.
@@ -1520,12 +1809,20 @@ export class AskerService {
   // `sending` to `sent` once a relay accepted its wrap, and what gives up on one that ran out of
   // retry window — both derived from what the sync just did, so they hold for a CLI run and for the
   // MCP server alike.
-  async sync(maxMs: number = CLI_SYNC_MS): Promise<SyncReport> {
-    const report = await this.device.syncOnce({ maxMs })
-    const now = this.now()
-    markSentQuestions(this.store, now)
-    expireOutboundQuestions(this.store, now)
-    return report
+  // Syncs are serialized: `Device.syncOnce` keeps a single in-flight sync in one field, so two
+  // overlapping calls (two MCP tools at once) would leave `close()` waiting for only the last one.
+  // Chaining them also means a tool never starts a sync while the service is closing.
+  sync(maxMs: number = CLI_SYNC_MS): Promise<SyncReport> {
+    if (this.closed) return Promise.resolve({ history: [], published: { published: 0, failed: 0, postponed: 0, lost: 0 }, timedOut: false })
+    this.syncing = this.syncing.then(async () => {
+      if (this.closed) return { history: [], published: { published: 0, failed: 0, postponed: 0, lost: 0 }, timedOut: false }
+      const report = await this.device.syncOnce({ maxMs })
+      const now = this.now()
+      markSentQuestions(this.store, now)
+      expireOutboundQuestions(this.store, now)
+      return report
+    })
+    return this.syncing
   }
 
   async connect(link: string, note: string): Promise<ConnectOutcome> {
@@ -1568,6 +1865,7 @@ export class AskerService {
     return listContacts(this.store, 'outbound')
   }
 
+
   async ask(name: string, text: string): Promise<OutboundQuestion> {
     const recipient = this.resolveContact(name)
     if (!askPermission(this.store, recipient.pubkey)) {
@@ -1596,7 +1894,15 @@ export class AskerService {
     )
   }
 
+  // Nothing new starts once this is called, and everything already running is waited for before the
+  // caller closes the store underneath it.
   async close(): Promise<void> {
+    this.closed = true
+    try {
+      await this.syncing
+    } catch {
+      // A failed sync is not a reason to leave the device open.
+    }
     try {
       await this.device.close()
     } catch (err) {
@@ -1618,7 +1924,18 @@ export class AskerService {
 - [ ] **Step 4: Create `packages/cli/src/asker/session.ts`**
 
 ```ts
-import { CLI_COMMAND, agentbridgeHome, loadIdentity, openStore, type SocketFactory, type Store } from '@agentbridge/core'
+import {
+  CLI_COMMAND,
+  Device,
+  agentbridgeHome,
+  handleResponderMessage,
+  loadIdentity,
+  openStore,
+  type Identity,
+  type RelayPolicy,
+  type SocketFactory,
+  type Store,
+} from '@agentbridge/core'
 import { CliError, type CliContext } from '../context'
 import { AskerService } from './service'
 
@@ -1631,6 +1948,7 @@ export async function openAskerSession(options: {
   now?: () => number
   createSocket?: SocketFactory
   log?: (line: string) => void
+  relayPolicy?: RelayPolicy
 }): Promise<AskerSession> {
   const home = options.home ?? agentbridgeHome()
   const identity = await loadIdentity(home)
@@ -1639,7 +1957,7 @@ export async function openAskerSession(options: {
   }
   let store: Store
   try {
-    store = await openStore(home)
+    store = await openStore(home, options.relayPolicy ? { relayPolicy: options.relayPolicy } : {})
   } catch (err) {
     throw new CliError(`No se pudo abrir la base de datos en ${home}. Revisa los permisos de esa carpeta.`, { cause: err })
   }
@@ -1661,7 +1979,7 @@ export async function withAsker<T>(
   fn: (service: AskerService) => Promise<T>,
   options: { firstSyncMs?: number; lastSyncMs?: number } = {},
 ): Promise<T> {
-  const session = await openAskerSession({ home: ctx.home })
+  const session = await openAskerSession({ home: ctx.home, relayPolicy: ctx.relayPolicy })
   try {
     await session.service.sync(options.firstSyncMs)
     const result = await fn(session.service)
@@ -1669,6 +1987,35 @@ export async function withAsker<T>(
     return result
   } finally {
     await session.close()
+  }
+}
+
+// The same short-lived cycle for the four commands that are about messages addressed to this person
+// as a responder: a request arriving, and the decisions that answer it. `handleAskerMessage` drops
+// those on purpose, so they need their own role, their own cursors and their own handler — but not
+// the channel lock and not a dispatcher: only the channel hands questions to Claude (P10).
+export async function withResponderSession<T>(
+  ctx: CliContext,
+  fn: (input: { store: Store; identity: Identity; sync: () => Promise<void> }) => Promise<T>,
+): Promise<T> {
+  const home = ctx.home
+  const identity = await loadIdentity(home)
+  if (!identity) {
+    throw new CliError(`Todavía no hay una identidad de AgentBridge en esta computadora. Créala con: ${CLI_COMMAND} setup`)
+  }
+  const store = await openStore(home, ctx.relayPolicy ? { relayPolicy: ctx.relayPolicy } : {})
+  const device = new Device({ store, identity, role: 'responder', handleMessage: handleResponderMessage })
+  const sync = async () => {
+    await device.syncOnce({ maxMs: 10_000 })
+  }
+  try {
+    await sync()
+    const result = await fn({ store, identity, sync })
+    await sync()
+    return result
+  } finally {
+    await device.close()
+    store.close()
   }
 }
 ```
@@ -1689,7 +2036,7 @@ Expected: clean, every test passing.
 git add packages/cli/src/asker/service.ts packages/cli/src/asker/session.ts packages/cli/src/context.ts packages/cli/test/asker-service.test.ts
 git commit -m "feat(cli): AskerService and the short-lived sync cycle"
 ```
-### Task 6: Waiting for an answer, and the Spanish every surface prints
+### Task 7: Waiting for an answer, and the Spanish every surface prints
 
 **Files:**
 - Modify: `packages/cli/src/asker/service.ts` (append `waitForAnswer`)
@@ -1697,12 +2044,13 @@ git commit -m "feat(cli): AskerService and the short-lived sync cycle"
 - Test: `packages/cli/test/asker-service.test.ts` (append), `packages/cli/test/asker-format.test.ts`
 
 **Interfaces:**
-- Consumes: Task 5's `AskerService`; core's `getOutboundQuestion`, `type OutboundQuestion`, `type Contact`, `CLI_COMMAND`.
+- Consumes: Task 6's `AskerService`; core's `getOutboundQuestion`, `type OutboundQuestion`, `type Contact`, `CLI_COMMAND`.
 - Produces:
-  - `AskerService.waitForAnswer(ref: { recipient: string; questionId: string }, seconds: number): Promise<OutboundQuestion>` — starts the live subscription if it is not already running, then returns as soon as the question reaches a final state (`answered`, `rejected`, `lost`) or the seconds run out. It never throws on a timeout: the caller shows whatever state it reached.
+  - `AskerService.waitForAnswer(ref: { recipient: string; questionId: string }, seconds: number, options?: { signal?: AbortSignal }): Promise<OutboundQuestion>` — starts the live subscription if it is not already running, then returns as soon as the question reaches a final state (`answered`, `rejected`, `lost`), the seconds run out, the caller aborts, or the service starts closing. It never throws on a timeout: the caller shows whatever state it reached. Its timer is cleared on every exit, so a wait never keeps the process alive.
   - `packages/cli/src/asker/format.ts`:
     - `QUESTION_STATE_ES: Record<OutboundQuestionState, string>` — one short Spanish phrase per state, distinguishing "recibida" (it reached their computer) from "contestada".
-    - `formatQuestion(question, options: { contactName?: string }): string` — what `ask`, `ticket` and `check_answer` print.
+    - `formatQuestion(question, options: { contactName?: string }): string` — what `ask`, `ticket` and `check_answer` print. Every instruction inside it names the question's **full** id: a prefix the person was never shown cannot be disambiguated later (P3).
+    - `forTerminal(text: string, max?: number): string` — third-party text (a declared name, a note) with control characters and ANSI escapes removed and the length capped, so a request cannot repaint the terminal or fake a line of the listing. Used by every command that prints someone else's words.
     - `formatContactLine(contact): string` — one line per contact for `contacts` and `list_contacts`, with no presence: Nostr cannot tell whether someone is online, and the text says so where it matters.
     - `formatRejectReason(reason): string` — the Spanish for `expired`, `limit`, `unanswered` and `stale_generation`.
 - Every string here is Spanish; the MCP tool names, descriptions and log lines stay English.
@@ -1713,7 +2061,7 @@ Create `packages/cli/test/asker-format.test.ts`:
 
 ```ts
 import { describe, expect, it } from 'vitest'
-import { QUESTION_STATE_ES, formatContactLine, formatQuestion, formatRejectReason } from '../src/asker/format'
+import { QUESTION_STATE_ES, forTerminal, formatContactLine, formatInboundContactLine, formatQuestion, formatRejectReason } from '../src/asker/format'
 import type { Contact, OutboundQuestion } from '@agentbridge/core'
 
 const base: OutboundQuestion = {
@@ -1784,6 +2132,14 @@ describe('formatQuestion', () => {
   })
 })
 
+describe('forTerminal', () => {
+  it('strips control characters and ANSI escapes from someone else’s words', () => {
+    expect(forTerminal('Ana\u001b[31m\nSOLICITUD APROBADA')).not.toContain('\u001b')
+    expect(forTerminal('Ana\nBeto')).not.toContain('\n')
+    expect(forTerminal('x'.repeat(300), 80)).toHaveLength(80)
+  })
+})
+
 describe('formatContactLine', () => {
   it('names the person and what this person may do with them', () => {
     expect(formatContactLine(contact({ state: 'approved' }))).toContain('ana')
@@ -1794,6 +2150,11 @@ describe('formatContactLine', () => {
 
   it('never claims to know whether someone is online', () => {
     expect(formatContactLine(contact({}))).not.toMatch(/en línea|desconectad/i)
+  })
+
+  it('says the opposite thing for an inbound contact', () => {
+    expect(formatInboundContactLine(contact({ state: 'approved' }))).toContain('puede preguntarte')
+    expect(formatInboundContactLine(contact({ state: 'approved' }))).not.toContain('puedes preguntarle')
   })
 })
 ```
@@ -1858,7 +2219,11 @@ and this method to `AskerService`, after `question(...)`:
   // so it is started here if the caller did not start it; polling the store (rather than hooking the
   // device's callback) is deliberate — the answer may just as well be written by another process
   // that shares this home, and a poll sees that too.
-  async waitForAnswer(ref: { recipient: string; questionId: string }, seconds: number): Promise<OutboundQuestion> {
+  async waitForAnswer(
+    ref: { recipient: string; questionId: string },
+    seconds: number,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<OutboundQuestion> {
     this.device.start()
     const deadline = Date.now() + Math.max(0, seconds) * 1000
     for (;;) {
@@ -1867,9 +2232,25 @@ and this method to `AskerService`, after `question(...)`:
         throw new UserFacingError('Esa pregunta ya no está guardada en esta computadora.')
       }
       if (question.state === 'answered' || question.state === 'rejected' || question.state === 'lost') return question
-      if (Date.now() >= deadline) return question
-      await new Promise((resolve) => setTimeout(resolve, Math.min(WAIT_POLL_MS, Math.max(0, deadline - Date.now()))))
+      // A closing service, an aborted caller (an MCP request cancelled by Claude) and a spent
+      // budget all end the wait with whatever state the question has right now.
+      if (this.closed || options.signal?.aborted || Date.now() >= deadline) return question
+      await this.pause(Math.min(WAIT_POLL_MS, Math.max(0, deadline - Date.now())), options.signal)
     }
+  }
+
+  // A sleep that always clears its timer, so a wait can never hold the process open.
+  private pause(ms: number, signal?: AbortSignal): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(done, ms)
+      const onAbort = () => done()
+      function done(): void {
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+        resolve()
+      }
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
   }
 ```
 
@@ -1917,12 +2298,18 @@ export function formatQuestion(question: OutboundQuestion, options: { contactNam
     case 'lost':
       return `${header}\nPuedes volver a preguntar cuando quieras.`
     default:
-      return `${header}\nConsulta después con: ${CLI_COMMAND} ticket ${question.questionId.slice(0, 8)}`
+      return `${header}\nConsulta después con: ${CLI_COMMAND} ticket ${question.questionId}`
   }
 }
 
+// Third-party text reaches a terminal here: a declared name or a note can carry newlines or ANSI
+// escapes that repaint the screen or fake a line of a listing. Length alone does not stop that.
+export function forTerminal(text: string, max = 200): string {
+  return [...text.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')].slice(0, max).join('').trim()
+}
+
 export function formatContactLine(contact: Contact): string {
-  const name = contact.localName ?? contact.declaredName ?? contact.pubkey.slice(0, 8)
+  const name = forTerminal(contact.localName ?? contact.declaredName ?? contact.pubkey.slice(0, 8), 80)
   switch (contact.state) {
     case 'approved':
       return `${name} — puedes preguntarle`
@@ -1934,6 +2321,24 @@ export function formatContactLine(contact: Contact): string {
       return `${name} — retiró el permiso`
     case 'requested':
       return `${name} — te pidió permiso a ti`
+  }
+}
+
+// The same contact means the opposite thing in the other direction: an approved *inbound* contact is
+// someone who may ask this person, not someone this person may ask.
+export function formatInboundContactLine(contact: Contact): string {
+  const name = forTerminal(contact.localName ?? contact.declaredName ?? contact.pubkey.slice(0, 8), 80)
+  switch (contact.state) {
+    case 'approved':
+      return `${name} — puede preguntarte`
+    case 'requested':
+      return `${name} — te pidió permiso y sigue esperando`
+    case 'rejected':
+      return `${name} — le dijiste que no`
+    case 'revoked':
+      return `${name} — le retiraste el permiso`
+    case 'pending':
+      return `${name} — solicitud en curso`
   }
 }
 ```
@@ -1952,18 +2357,18 @@ Expected: clean, every test passing.
 git add packages/cli/src/asker/service.ts packages/cli/src/asker/format.ts packages/cli/test/asker-format.test.ts packages/cli/test/asker-service.test.ts
 git commit -m "feat(cli): wait for an answer and say every state in Spanish"
 ```
-### Task 7: `link` and `connect`
+### Task 8: `link` and `connect`
 
 **Files:**
 - Create: `packages/cli/src/commands/connect.ts`
 - Test: `packages/cli/test/commands-connect.test.ts`
 
 **Interfaces:**
-- Consumes: `withAsker`, `openAskerSession` (Task 5), core's `encodeLink`, `getProfile`, `loadIdentity`, `CLI_COMMAND`, `UserFacingError`; CLI's `CliError`, `type CliContext`, `memoryOutput` (tests).
+- Consumes: `withAsker`, `openAskerSession` (Task 6), core's `encodeLink`, `getProfile`, `loadIdentity`, `CLI_COMMAND`, `UserFacingError`; CLI's `CliError`, `type CliContext`, `memoryOutput` (tests).
 - Produces:
   - `link(argv, ctx): Promise<void>` — prints this person's own link (`agentbridge:` + `nprofile`) with their own relays, and one line saying what to do with it. No network: it does not sync.
   - `connect(argv, ctx): Promise<void>` — `connect <enlace> [--note "…"]`. Runs the short-lived cycle with a longer second sync (30 s), because publishing a connection request mines 22 bits of proof of work.
-  - Both are registered by Task 11's router.
+  - Both are registered by Task 12's router.
 - The note is optional and capped at 500 characters by the protocol; a longer one is a Spanish error before anything is stored.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1988,20 +2393,25 @@ let board: FakeBoard
 let home: string
 let ctx: CliContext & { out: ReturnType<typeof memoryOutput> }
 
-// Writes the identity file the way `loadIdentity` reads it, so these tests exercise the real
-// session helper instead of a stub.
+// Every relay here is a local fake board, so the store is opened with a policy that accepts
+// ws://127.0.0.1 — the same relaxation the responder harness uses. The identity file is written in
+// the exact shape `loadIdentity` parses (`version: 1` plus a 64-character hex key); anything else
+// is reported as a damaged identity.
+const allowAnyRelay = (inputs: readonly unknown[]): string[] =>
+  inputs.filter((value): value is string => typeof value === 'string' && value.startsWith('ws')).slice(0, 5)
+
 async function seedHome(): Promise<void> {
   home = join(await mkdtemp(join(tmpdir(), 'ab-connect-')), 'home')
-  const store = await openStore(home)
+  const store = await openStore(home, { relayPolicy: allowAnyRelay })
   setProfile(store, { name: 'Beto', relays: [board.url], now: 2_000_000_000 })
   store.close()
-  await writeFile(join(home, 'identity.json'), JSON.stringify({ secretKey: Buffer.from(me.secretKey).toString('hex') }), { mode: 0o600 })
+  await writeFile(join(home, 'identity.json'), JSON.stringify({ version: 1, secretKey: Buffer.from(me.secretKey).toString('hex') }), { mode: 0o600 })
 }
 
 beforeEach(async () => {
   board = await startFakeBoard()
   await seedHome()
-  ctx = { home, out: memoryOutput(), env: {} } as CliContext & { out: ReturnType<typeof memoryOutput> }
+  ctx = { home, out: memoryOutput(), env: {}, relayPolicy: allowAnyRelay } as CliContext & { out: ReturnType<typeof memoryOutput> }
 })
 
 afterEach(async () => {
@@ -2018,9 +2428,9 @@ describe('link', () => {
 })
 
 describe('connect', () => {
-  it('stores the request and reports it in Spanish', async () => {
+  it('stores the request, publishes it, and says so in Spanish', async () => {
     await connect([encodeLink(them.publicKey, [board.url]), '--note', 'soy Beto'], ctx)
-    const store = await openStore(home)
+    const store = await openStore(home, { relayPolicy: allowAnyRelay })
     expect(getContact(store, them.publicKey, 'outbound')).toMatchObject({ state: 'pending' })
     store.close()
     expect(ctx.out.lines.join('\n')).toMatch(/solicitud/i)
@@ -2028,7 +2438,7 @@ describe('connect', () => {
 
   it('refuses a note longer than the protocol allows, without storing anything', async () => {
     await expect(connect([encodeLink(them.publicKey, [board.url]), '--note', 'x'.repeat(501)], ctx)).rejects.toThrow()
-    const store = await openStore(home)
+    const store = await openStore(home, { relayPolicy: allowAnyRelay })
     expect(getContact(store, them.publicKey, 'outbound')).toBeNull()
     store.close()
   })
@@ -2062,18 +2472,13 @@ import { CliError, type CliContext } from '../context'
 
 const NOTE_MAX_CHARS = 500
 
-// Publishing a connection request mines 22 bits of proof of work, which is seconds of CPU. The
-// ordinary 10-second sync would abort in the middle of it on a slow machine and leave the request
-// unsent until the next command, so this one sync gets a longer budget.
-const CONNECT_SYNC_MS = 30_000
-
 export async function link(_argv: string[], ctx: CliContext): Promise<void> {
   const identity = await loadIdentity(ctx.home)
   if (!identity) throw new CliError(`Todavía no hay una identidad de AgentBridge en esta computadora. Créala con: ${CLI_COMMAND} setup`)
   // Reading the profile needs the store, but nothing here talks to a relay: a link is local.
-  const session = await openAskerSession({ home: ctx.home })
+  const session = await openAskerSession({ home: ctx.home, relayPolicy: ctx.relayPolicy })
   try {
-    const profile = getProfile(session.service.device.options?.store ?? (undefined as never))
+    const profile = session.service.profile()
     ctx.out.log(encodeLink(identity.publicKey, profile.relays))
     ctx.out.log('')
     ctx.out.log('Comparte ese enlace con quien quieras que te pregunte. Esa persona lo usará con:')
@@ -2090,11 +2495,22 @@ export async function connect(argv: string[], ctx: CliContext): Promise<void> {
   const note = (values.note ?? '').trim()
   if (note.length > NOTE_MAX_CHARS) throw new CliError(`La nota puede tener como máximo ${NOTE_MAX_CHARS} caracteres.`)
 
-  const outcome = await withAsker(ctx, (service) => service.connect(target, note), { lastSyncMs: CONNECT_SYNC_MS })
+  ctx.out.log('Preparando la solicitud… esto tarda unos segundos la primera vez (tu computadora resuelve una prueba de trabajo).')
+  // The sync itself stays inside the spec's ten seconds of network time; the proof of work has its
+  // own budget inside the publisher (P5c), so a slow machine does not shorten the network part.
+  const { outcome, published } = await withAsker(ctx, async (service) => {
+    const outcome = await service.connect(target, note)
+    await service.sync()
+    return { outcome, published: service.wasPublished(outcome.pubkey) }
+  })
 
   switch (outcome.kind) {
     case 'requested':
-      ctx.out.log('Solicitud enviada. Esa persona la verá cuando abra su AgentBridge y decide si te da permiso.')
+      if (published) {
+        ctx.out.log('Solicitud enviada. Esa persona la verá cuando abra su AgentBridge y decide si te da permiso.')
+      } else {
+        ctx.out.log('Solicitud guardada, pendiente de envío: ningún tablero la aceptó todavía. Se reintenta sola cada vez que corres un comando.')
+      }
       ctx.out.log(`Mientras tanto puedes revisar con: ${CLI_COMMAND} contacts`)
       return
     case 'already_pending':
@@ -2107,16 +2523,24 @@ export async function connect(argv: string[], ctx: CliContext): Promise<void> {
 }
 ```
 
-> `link` needs the store only to read the profile's relays. Rather than reaching into the device (which has no public `options`), give `AskerService` a small read-only accessor and use it here:
+> Two small accessors on `AskerService` make this command honest, and Task 10 reuses the first:
 >
 > ```ts
 > // packages/cli/src/asker/service.ts, inside AskerService
 > profile(): { name: string | null; relays: string[] } {
 >   return getProfile(this.store)
 > }
-> ```
 >
-> and in `link`, replace the `getProfile(...)` line with `const profile = session.service.profile()`.
+> // Whether anything addressed to that person has actually gone out: the outbox row for their
+> // pending request records the first relay that accepted it. Used to tell "enviada" from
+> // "guardada, pendiente de envío" instead of announcing a send the relays never confirmed.
+> wasPublished(recipient: string): boolean {
+>   const row = this.store.db
+>     .prepare('SELECT last_published_at FROM outbox WHERE recipient = ? ORDER BY rowid DESC LIMIT 1')
+>     .get(recipient) as { last_published_at: number | null } | undefined
+>   return row?.last_published_at != null
+> }
+> ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -2124,7 +2548,7 @@ Run: `npx vitest run packages/cli/test/commands-connect.test.ts`
 Expected: PASS.
 
 Run: `npm run typecheck`
-Expected: clean. (These two commands are not registered yet — Task 11 does that; the tests call them directly.)
+Expected: clean. (These two commands are not registered yet — Task 12 does that; the tests call them directly.)
 
 - [ ] **Step 5: Commit**
 
@@ -2132,21 +2556,22 @@ Expected: clean. (These two commands are not registered yet — Task 11 does tha
 git add packages/cli/src/commands/connect.ts packages/cli/src/asker/service.ts packages/cli/test/commands-connect.test.ts
 git commit -m "feat(cli): link and connect"
 ```
-### Task 8: `contacts`, `whoami`, and the responder's `requests` / `approve` / `reject` / `revoke`
+### Task 9: `contacts`, `whoami`, and the responder's `requests` / `approve` / `reject` / `revoke`
 
 **Files:**
 - Create: `packages/cli/src/commands/contacts.ts`
 - Test: `packages/cli/test/commands-contacts.test.ts`
 
 **Interfaces:**
-- Consumes: `withAsker` (Task 5), `formatContactLine` (Task 6), core's `listContacts`, `listRequests`, `approveConnection`, `rejectConnection`, `revokeConnection`, `REQUEST_ID_LENGTH`, `loadIdentity`, `encodeLink`, `CLI_COMMAND`, `UserFacingError`; CLI's `CliError`, `type CliContext`.
+- Consumes: `withAsker` and `withResponderSession` (Task 7), `formatContactLine`, `formatInboundContactLine`, `forTerminal` (Task 8), core's `listContacts`, `listRequests`, `approveConnection`, `rejectConnection`, `revokeConnection`, `REQUEST_ID_LENGTH`, `loadIdentity`, `encodeLink`, `CLI_COMMAND`, `UserFacingError`; CLI's `CliError`, `type CliContext`.
 - Produces:
   - `contacts(argv, ctx)` — both directions in one view: who this person may ask (outbound), and who may ask them (inbound approved), each with what the state means in Spanish.
   - `whoami(argv, ctx)` — this person's public key, their profile name and their relays. No network.
   - `requests(argv, ctx)` — the pending requests other people sent (plan 2's `listRequests`), each with its 8-character identifier, the declared name, the note, and the warning that approving lets that person read the shared folder.
   - `approve(argv, ctx)` / `reject(argv, ctx)` — `approve <id>` and `reject <id>`, never a numeric index.
   - `revoke(argv, ctx)` — `revoke <nombre>`, with a line saying what it did (how many waiting questions were closed).
-  - All five run the short-lived cycle, so a decision is published before the command returns.
+  - `contacts` and `whoami` run the asker cycle. `requests`, `approve`, `reject` and `revoke` run `withResponderSession` instead (P10): a request is a message addressed to this person as a responder, and the asker's handler drops those — so without a responder-role sync, a request published while the channel was closed would never appear.
+  - Every piece of third-party text printed here (a declared name, a note) goes through `forTerminal` first.
 - The responder commands live here, next to `contacts`, because they are the same "who may talk to whom" surface for the person using the terminal.
 
 - [ ] **Step 1: Write the failing tests**
@@ -2184,7 +2609,7 @@ let home: string
 let ctx: CliContext & { out: ReturnType<typeof memoryOutput> }
 
 async function withStore<T>(fn: (store: Store) => T): Promise<T> {
-  const store = await openStore(home)
+  const store = await openStore(home, { relayPolicy: allowAnyRelay })
   try {
     return fn(store)
   } finally {
@@ -2192,12 +2617,15 @@ async function withStore<T>(fn: (store: Store) => T): Promise<T> {
   }
 }
 
+const allowAnyRelay = (inputs: readonly unknown[]): string[] =>
+  inputs.filter((value): value is string => typeof value === 'string' && value.startsWith('ws')).slice(0, 5)
+
 beforeEach(async () => {
   board = await startFakeBoard()
   home = join(await mkdtemp(join(tmpdir(), 'ab-contacts-')), 'home')
   await withStore((store) => setProfile(store, { name: 'Yo', relays: [board.url], now: T0 }))
-  await writeFile(join(home, 'identity.json'), JSON.stringify({ secretKey: Buffer.from(me.secretKey).toString('hex') }), { mode: 0o600 })
-  ctx = { home, out: memoryOutput(), env: {} } as CliContext & { out: ReturnType<typeof memoryOutput> }
+  await writeFile(join(home, 'identity.json'), JSON.stringify({ version: 1, secretKey: Buffer.from(me.secretKey).toString('hex') }), { mode: 0o600 })
+  ctx = { home, out: memoryOutput(), env: {}, relayPolicy: allowAnyRelay } as CliContext & { out: ReturnType<typeof memoryOutput> }
 })
 
 afterEach(async () => {
@@ -2275,9 +2703,29 @@ describe('requests, approve and reject', () => {
     expect(await withStore((store) => listRequests(store, T0))).toEqual([])
   })
 
-  it('refuses a numeric index instead of an identifier', async () => {
+  it('refuses a list position but accepts an all-digit identifier', async () => {
     await incoming()
     await expect(approve(['1'], ctx)).rejects.toThrow()
+    // A key prefix is hexadecimal: '12345678' is a perfectly valid identifier, not an index.
+    await expect(approve(['12345678'], ctx)).rejects.toThrow(/solicitud/i)
+  })
+
+  it('never lets a declared name repaint the listing', async () => {
+    await withStore((store) =>
+      recordIncomingRequest(store, {
+        pubkey: ana.publicKey,
+        requestId: uuid(9),
+        requestRumorId: 'f'.repeat(64),
+        declaredName: 'Ana\u001b[2K\rAPROBADA',
+        note: 'linea1\nlinea2',
+        relays: [board.url],
+        now: T0,
+      }),
+    )
+    await requests([], ctx)
+    const printed = ctx.out.lines.join('\n')
+    expect(printed).not.toContain('\u001b')
+    expect(printed).toContain('linea1 linea2')
   })
 })
 
@@ -2319,17 +2767,18 @@ Expected: FAIL — `packages/cli/src/commands/contacts.ts` does not exist.
 ```ts
 import {
   CLI_COMMAND,
+  REQUEST_ID_LENGTH,
   approveConnection,
   encodeLink,
-  listContacts,
   listRequests,
   loadIdentity,
+  nowSeconds,
   rejectConnection,
   revokeConnection,
   type Contact,
 } from '@agentbridge/core'
-import { formatContactLine } from '../asker/format'
-import { withAsker } from '../asker/session'
+import { forTerminal, formatContactLine, formatInboundContactLine } from '../asker/format'
+import { withAsker, withResponderSession } from '../asker/session'
 import { CliError, type CliContext } from '../context'
 
 export async function contacts(_argv: string[], ctx: CliContext): Promise<void> {
@@ -2347,11 +2796,12 @@ export async function contacts(_argv: string[], ctx: CliContext): Promise<void> 
 
   ctx.out.log('')
   ctx.out.log('Quién puede preguntarte a ti:')
-  const allowed = inbound.filter((contact: Contact) => contact.state === 'approved')
+  // The same contact means the opposite thing in this direction, so it gets its own formatter.
+  const allowed = inbound.filter((contact: Contact) => contact.state === 'approved' || contact.state === 'requested')
   if (allowed.length === 0) {
     ctx.out.log(`  (todavía nadie) — revisa las solicitudes con: ${CLI_COMMAND} requests`)
   } else {
-    for (const contact of allowed) ctx.out.log(`  ${formatContactLine(contact)}`)
+    for (const contact of allowed) ctx.out.log(`  ${formatInboundContactLine(contact)}`)
   }
 }
 
@@ -2366,7 +2816,7 @@ export async function whoami(_argv: string[], ctx: CliContext): Promise<void> {
 }
 
 export async function requests(_argv: string[], ctx: CliContext): Promise<void> {
-  const pending = await withAsker(ctx, async (service) => service.requests())
+  const pending = await withResponderSession(ctx, async ({ store, identity }) => listRequests(store, nowSeconds()))
   if (pending.length === 0) {
     ctx.out.log('No tienes solicitudes nuevas.')
     return
@@ -2374,92 +2824,74 @@ export async function requests(_argv: string[], ctx: CliContext): Promise<void> 
   ctx.out.log('Solicitudes nuevas:')
   for (const request of pending) {
     ctx.out.log('')
-    ctx.out.log(`  ${request.id}  ${request.declaredName}`)
-    if (request.note) ctx.out.log(`  nota: ${request.note}`)
+    ctx.out.log(`  ${request.id}  ${forTerminal(request.declaredName, 80)}`)
+    if (request.note) ctx.out.log(`  nota: ${forTerminal(request.note)}`)
   }
   ctx.out.log('')
   ctx.out.log('Si apruebas a alguien, su agente podrá leer tu carpeta compartida y preguntarte.')
   ctx.out.log(`Acepta con: ${CLI_COMMAND} approve <id>   ·   rechaza con: ${CLI_COMMAND} reject <id>`)
 }
 
+// A person may paste a valid identifier made only of digits (a key prefix is hexadecimal), so the
+// index guard is about shape and length, not about digits: an identifier is at least 8 hex
+// characters, and anything shorter that looks like a list position is the mistake worth catching.
 function requireId(argv: string[], verb: 'approve' | 'reject'): string {
   const id = argv[0]
   if (!id) throw new CliError(`Uso: ${CLI_COMMAND} ${verb} <id>   (el id de ${CLI_COMMAND} requests, no un número de la lista)`)
-  if (/^\d+$/.test(id)) {
-    throw new CliError(`Ese es un número de la lista, no un identificador. Copia el id que aparece junto al nombre en: ${CLI_COMMAND} requests`)
+  if (id.length < REQUEST_ID_LENGTH) {
+    throw new CliError(
+      `Ese identificador es muy corto. Copia los ${REQUEST_ID_LENGTH} caracteres que aparecen junto al nombre en: ${CLI_COMMAND} requests`,
+    )
   }
-  return id
+  if (!/^[0-9a-f]+$/i.test(id)) {
+    throw new CliError(`Ese identificador no tiene la forma correcta. Cópialo tal cual de: ${CLI_COMMAND} requests`)
+  }
+  return id.toLowerCase()
 }
 
 export async function approve(argv: string[], ctx: CliContext): Promise<void> {
   const id = requireId(argv, 'approve')
-  const contact = await withAsker(ctx, async (service) => service.approve(id))
-  const name = contact.localName ?? contact.declaredName ?? id
+  const contact = await withResponderSession(ctx, async ({ store, identity }) =>
+    approveConnection(store, { identity, idPrefix: id, now: nowSeconds() }).contact,
+  )
+  const name = forTerminal(contact.localName ?? contact.declaredName ?? id, 80)
   ctx.out.log(`Listo: ${name} ya puede preguntarte. Su agente puede leer tu carpeta compartida.`)
   ctx.out.log(`Si te arrepientes: ${CLI_COMMAND} revoke ${name}`)
 }
 
 export async function reject(argv: string[], ctx: CliContext): Promise<void> {
   const id = requireId(argv, 'reject')
-  const contact = await withAsker(ctx, async (service) => service.reject(id))
-  ctx.out.log(`Listo: ${contact.declaredName ?? id} no puede preguntarte.`)
+  const contact = await withResponderSession(ctx, async ({ store, identity }) =>
+    rejectConnection(store, { identity, idPrefix: id, now: nowSeconds() }).contact,
+  )
+  ctx.out.log(`Listo: ${forTerminal(contact.declaredName ?? id, 80)} no puede preguntarte.`)
 }
 
 export async function revoke(argv: string[], ctx: CliContext): Promise<void> {
   const name = argv[0]
   if (!name) throw new CliError(`Uso: ${CLI_COMMAND} revoke <nombre>   (el nombre que aparece en ${CLI_COMMAND} contacts)`)
-  const result = await withAsker(ctx, async (service) => service.revoke(name))
-  ctx.out.log(`Listo: ${name} ya no puede preguntarte.`)
+  const result = await withResponderSession(ctx, async ({ store, identity }) =>
+    revokeConnection(store, { identity, name, now: nowSeconds() }),
+  )
+  ctx.out.log(`Listo: ${forTerminal(name, 80)} ya no puede preguntarte.`)
   if (result.rejectedQuestions > 0) {
     ctx.out.log(`Cerré ${result.rejectedQuestions} pregunta(s) suya(s) que estaban esperando respuesta.`)
   }
 }
 ```
 
-- [ ] **Step 4: Add the four responder passthroughs to `AskerService`**
+- [ ] **Step 4: Add one accessor to `AskerService`**
 
-The service is the single object both surfaces drive, so the responder-side commands go through it too (each one is plan 2's library call, run inside this identity's own store):
+`contacts` shows both directions, and the outbound half already comes from the service. Add the inbound half next to it (the four decisions do **not** go through the service: they run in the responder session, which is the only place with the right role and cursors):
 
 ```ts
-  // packages/cli/src/asker/service.ts — add these imports
-  import {
-    approveConnection,
-    listContacts as listStoreContacts,
-    listRequests,
-    rejectConnection,
-    revokeConnection,
-    type PendingRequestView,
-  } from '@agentbridge/core'
-
-  // …and these methods to AskerService
-
+  // packages/cli/src/asker/service.ts, inside AskerService
   inboundContacts(): Contact[] {
-    return listStoreContacts(this.store, 'inbound')
-  }
-
-  profile(): { name: string | null; relays: string[] } {
-    return getProfile(this.store)
-  }
-
-  requests(): PendingRequestView[] {
-    return listRequests(this.store, this.now())
-  }
-
-  approve(idPrefix: string): Contact {
-    return approveConnection(this.store, { identity: this.identity, idPrefix, now: this.now() }).contact
-  }
-
-  reject(idPrefix: string): Contact {
-    return rejectConnection(this.store, { identity: this.identity, idPrefix, now: this.now() }).contact
-  }
-
-  revoke(name: string): { contact: Contact; rejectedQuestions: number } {
-    const result = revokeConnection(this.store, { identity: this.identity, name, now: this.now() })
-    return { contact: result.contact, rejectedQuestions: result.rejectedQuestions }
+    return listContacts(this.store, 'inbound')
   }
 ```
 
-> Replace the `listContacts` import already used by `contacts()` with the aliased one, so both directions read the same function.
+> `listContacts` is already imported in that file for `contacts()`; this reuses it with the other direction.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
@@ -2475,19 +2907,19 @@ Expected: clean.
 git add packages/cli/src/commands/contacts.ts packages/cli/src/asker/service.ts packages/cli/test/commands-contacts.test.ts
 git commit -m "feat(cli): contacts, whoami, requests, approve, reject and revoke"
 ```
-### Task 9: `ask` and `ticket` over the new state
+### Task 10: `ask` and `ticket` over the new state
 
 **Files:**
 - Modify (rewrite): `packages/cli/src/commands/ask.ts`
 - Test: `packages/cli/test/commands-ask.test.ts`
 
 **Interfaces:**
-- Consumes: `withAsker`, `openAskerSession` (Task 5), `formatQuestion` (Task 6), core's `CLI_COMMAND`, `LIMITS`; CLI's `CliError`, `type CliContext`.
+- Consumes: `withAsker`, `openAskerSession` (Task 6), `formatQuestion` (Task 7), core's `CLI_COMMAND`, `LIMITS`; CLI's `CliError`, `type CliContext`.
 - Produces:
   - `ask(argv, ctx)` — `ask <nombre> <pregunta…> [--wait <segundos>|--no-wait]`. Stores and publishes the question, prints its identifier, and (unless `--no-wait`) keeps the connection open up to `--wait` seconds (default 120) waiting for the answer.
   - `ticket(argv, ctx)` — `ticket <id> [--wait <segundos>]`. Syncs, shows the state, and waits when asked.
   - `parseWaitSeconds(raw, fallback)` stays as it is today (a mistyped `--wait` is a local Spanish error in both commands).
-  - The old `formatTicket`, `waitForTicket` and `isTerminal` go away with the relay ticket view: Task 6's `formatQuestion` replaces them, and the MCP server (Task 10) imports that instead.
+  - The old `formatTicket`, `waitForTicket` and `isTerminal` go away with the relay ticket view: Task 7's `formatQuestion` replaces them, and the MCP server (Task 11) imports that instead.
 - A person who only uses the terminal sees, once per `ask`, the line that says retries happen whenever they run a command — the spec asks for exactly that.
 
 - [ ] **Step 1: Write the failing tests**
@@ -2524,8 +2956,11 @@ let board: FakeBoard
 let home: string
 let ctx: CliContext & { out: ReturnType<typeof memoryOutput> }
 
+const allowAnyRelay = (inputs: readonly unknown[]): string[] =>
+  inputs.filter((value): value is string => typeof value === 'string' && value.startsWith('ws')).slice(0, 5)
+
 async function withStore<T>(fn: (store: Store) => T): Promise<T> {
-  const store = await openStore(home)
+  const store = await openStore(home, { relayPolicy: allowAnyRelay })
   try {
     return fn(store)
   } finally {
@@ -2541,8 +2976,8 @@ beforeEach(async () => {
     createOutboundRequest(store, { pubkey: ana.publicKey, requestId: uuid(1), relays: [board.url], now: T0 })
     applyApproval(store, { pubkey: ana.publicKey, requestId: uuid(1), generation: 1, name: 'Ana', relays: [board.url], now: T0 })
   })
-  await writeFile(join(home, 'identity.json'), JSON.stringify({ secretKey: Buffer.from(me.secretKey).toString('hex') }), { mode: 0o600 })
-  ctx = { home, out: memoryOutput(), env: {} } as CliContext & { out: ReturnType<typeof memoryOutput> }
+  await writeFile(join(home, 'identity.json'), JSON.stringify({ version: 1, secretKey: Buffer.from(me.secretKey).toString('hex') }), { mode: 0o600 })
+  ctx = { home, out: memoryOutput(), env: {}, relayPolicy: allowAnyRelay } as CliContext & { out: ReturnType<typeof memoryOutput> }
 })
 
 afterEach(async () => {
@@ -2550,13 +2985,15 @@ afterEach(async () => {
 })
 
 describe('ask', () => {
-  it('sends the question, prints its identifier and says how retries work', async () => {
+  it('sends the question, prints its whole identifier and says how retries work', async () => {
     await ask(['ana', '¿cómo', 'se', 'despliega?', '--no-wait'], ctx)
     const questions = await withStore((store) => listOutboundQuestions(store))
     expect(questions).toHaveLength(1)
     expect(questions[0]).toMatchObject({ text: '¿cómo se despliega?', state: 'sent' })
     const printed = ctx.out.lines.join('\n')
-    expect(printed).toContain(questions[0]!.questionId.slice(0, 8))
+    // The whole id, never a prefix: a prefix the person was never shown cannot be disambiguated
+    // later if two questions happen to share it.
+    expect(printed).toContain(questions[0]!.questionId)
     expect(printed).toMatch(/cada vez que corres un comando/i)
   })
 
@@ -2654,17 +3091,26 @@ export async function ask(argv: string[], ctx: CliContext): Promise<void> {
     // The second sync inside withAsker publishes it; sync here too so the identifier we print is
     // already accompanied by a real send attempt when the person chose not to wait.
     await service.sync()
-    ctx.out.log(`Pregunta enviada a ${name}. Identificador: ${question.questionId.slice(0, 8)}`)
+    // What actually happened is in the stored state: `sent` means a relay took it, `sending` means
+    // it is saved and still trying. Saying "enviada" either way would be a lie when every relay is
+    // down, which is exactly when a person needs the truth.
+    const stored = service.question(question.questionId)
+    ctx.out.log(
+      stored.state === 'sending'
+        ? `Pregunta guardada para ${name}, pendiente de envío: ningún tablero la aceptó todavía.`
+        : `Pregunta enviada a ${name}.`,
+    )
+    ctx.out.log(`Identificador: ${question.questionId}`)
     ctx.out.log(RETRY_NOTE)
     if (waitSeconds === 0) {
-      ctx.out.log(`Consulta la respuesta con: ${CLI_COMMAND} ticket ${question.questionId.slice(0, 8)} --wait 60`)
+      ctx.out.log(`Consulta la respuesta con: ${CLI_COMMAND} ticket ${question.questionId} --wait 60`)
       return
     }
     ctx.out.log('')
     const settled = await service.waitForAnswer({ recipient: question.recipient, questionId: question.questionId }, waitSeconds)
     ctx.out.log(formatQuestion(settled, { contactName: name }))
     if (settled.state !== 'answered' && settled.state !== 'rejected' && settled.state !== 'lost') {
-      ctx.out.log(`Sigue pendiente. Consulta después con: ${CLI_COMMAND} ticket ${question.questionId.slice(0, 8)} --wait 60`)
+      ctx.out.log(`Sigue pendiente. Consulta después con: ${CLI_COMMAND} ticket ${question.questionId} --wait 60`)
     }
   })
 }
@@ -2961,11 +3407,37 @@ export async function mcp(_argv: string[], ctx: CliContext): Promise<void> {
   // retries, history and purge on timers. Every CLI command syncs once instead.
   session.service.start()
   const server = createAskerServer(session.service, { log })
-  await server.connect(new StdioServerTransport())
-  await new Promise<void>((resolve) => {
+
+  // The SDK's stdio transport listens for 'data' and 'error', not for 'end': when Claude Code closes
+  // the pipe, nothing here would ever resolve and the process would stay alive holding sockets. Every
+  // way this process can be told to stop is registered before connecting, and the cleanup is
+  // idempotent so two of them arriving together is harmless.
+  let stopping: Promise<void> | null = null
+  const stop = (): Promise<void> => {
+    stopping ??= (async () => {
+      try {
+        await server.close()
+      } catch (err) {
+        log(`closing the MCP server failed (${describeError(err)})`)
+      }
+      await session.close()
+    })()
+    return stopping
+  }
+  const ended = new Promise<void>((resolve) => {
+    process.stdin.once('end', resolve)
+    process.stdin.once('close', resolve)
+    process.once('SIGINT', resolve)
+    process.once('SIGTERM', resolve)
     server.onclose = () => resolve()
   })
-  await session.close()
+
+  try {
+    await server.connect(new StdioServerTransport())
+    await ended
+  } finally {
+    await stop()
+  }
 }
 ```
 
@@ -2983,12 +3455,10 @@ Expected: clean, every test passing.
 git add packages/cli/src/commands/ask.ts packages/cli/src/mcp-asker.ts packages/cli/test/commands-ask.test.ts packages/cli/test/mcp-asker.test.ts
 git commit -m "feat(cli): ask, ticket and the four asker MCP tools over stored state"
 ```
-### Task 10: The command table, the help text, and deleting the 0.1 enrollment commands
+### Task 11: The command table and the help text, without the 0.1 enrollment commands
 
 **Files:**
 - Modify (rewrite the table and USAGE): `packages/cli/src/router.ts`
-- Modify: `packages/cli/src/context.ts` (delete `clientFor`)
-- Delete: `packages/cli/src/commands/account.ts`
 - Test: `packages/cli/test/router.test.ts`
 
 **Interfaces:**
@@ -2996,8 +3466,9 @@ git commit -m "feat(cli): ask, ticket and the four asker MCP tools over stored s
 - Produces:
   - `COMMANDS` holds: `setup`, `setup-responder`, `doctor`, `link`, `connect`, `contacts`, `whoami`, `requests`, `approve`, `reject`, `revoke`, `ask`, `ticket`, `mcp`.
   - `USAGE` is rewritten for the flow without a server of our own: no `enroll`, `invite`, `accept` or `admin`, no `AGENTBRIDGE_RELAY_URL`, no `AGENTBRIDGE_ADMIN_TOKEN`. Command names stay English; every explanation is Spanish and every example uses `CLI_COMMAND`.
-  - `run()` keeps translating `parseArgs` errors and `CliError`, and now also prints a `UserFacingError`'s message as written (it is Spanish by construction) with exit code 1.
+  - `run()` keeps translating `parseArgs` errors and `CliError`, prints a `UserFacingError`'s message as written (it is Spanish by construction) with exit code 1, and — the change that matters for privacy — stops printing an unexpected error's own message: those can carry a path, relay text or decrypted content, so the person sees a fixed Spanish sentence and only `describeError(err)` names the type.
 - `RelayError` handling stays until plan 4 deletes `RelayHttpClient` with `doctor`.
+- **`packages/cli/src/commands/account.ts` and `clientFor` stay on disk** (P9). `setup.ts` still calls `enroll` and `doctor.ts` still constructs a `RelayHttpClient`; deleting either file here breaks the build of the whole CLI. Plan 4 rewrites `setup` and `doctor` and removes all three together.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3119,13 +3590,31 @@ and, inside `run`'s `catch`, add `UserFacingError` next to the existing `CliErro
     }
 ```
 
-- [ ] **Step 4: Delete the 0.1 enrollment surface**
+- [ ] **Step 4: Hide unexpected errors behind a fixed sentence**
 
-```bash
-git rm packages/cli/src/commands/account.ts
+In `run`'s `catch`, replace the last branch:
+
+```ts
+    ctx.out.error(`Algo falló al ejecutar ese comando. Vuelve a intentarlo; si sigue fallando, corre: ${CLI_COMMAND} doctor`)
+    log(`command ${name} failed (${describeError(err)})`)
+    return 2
 ```
 
-and delete `clientFor` from `packages/cli/src/context.ts`, along with the now-unused `RelayHttpClient` import there. `doctor.ts` imports `RelayHttpClient` directly and keeps working until plan 4.
+where `log` writes to stderr with the same swallow-its-own-failure guard the channel uses. Add a test:
+
+```ts
+  it('never prints the text of an unexpected error', async () => {
+    const c = ctx()
+    const boom = Object.assign(new Error('/Users/alguien/carpeta compartida: CANARIO'), { code: 'EACCES' })
+    const failing: Record<string, Command> = { boom: async () => { throw boom } }
+    expect(await runWith(failing, ['boom'], c)).toBe(2)
+    const printed = [...c.out.lines, ...c.out.errors].join('\n')
+    expect(printed).not.toContain('CANARIO')
+    expect(printed).not.toContain('carpeta compartida')
+  })
+```
+
+> `runWith` is a small exported seam for the test: `run` keeps its signature and delegates to it with the real table. If you prefer not to add a seam, drive the same case through a real command whose store path is unreadable.
 
 - [ ] **Step 5: Run everything**
 
@@ -3133,27 +3622,27 @@ Run: `npx vitest run packages/cli/test/router.test.ts`
 Expected: PASS.
 
 Run: `npm run typecheck && npm test`
-Expected: clean, every test passing. If a test still imports the deleted `account.ts` or `clientFor`, delete that test file too: its commands no longer exist.
+Expected: clean, every test passing. `account.ts` is no longer reachable from the command table, but it still compiles because `setup` uses it — that is deliberate (P9).
 
 - [ ] **Step 6: Check the bundles still build and start**
 
-Run: `node scripts/build.mjs && node plugins/agentbridge/dist/cli.js --help | head -5`
+Run: `node scripts/build.mjs && node packages/cli/dist/main.js --help | head -5`
 Expected: the new Spanish help text, with no mention of `enroll`.
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add -A packages/cli
-git commit -m "feat(cli): the 0.2 command table, and goodbye to the enrollment commands"
+git commit -m "feat(cli): the 0.2 command table, without the enrollment commands"
 ```
-### Task 11: End-to-end, both people at once
+### Task 12: End-to-end, both people at once
 
 **Files:**
 - Create: `tests/asker/support.ts`
 - Test: `tests/asker/flow.test.ts`
 
 **Interfaces:**
-- Consumes: `startResponder`, `startFakeBoard`, `until`, `allowAnyRelay`, `type Cleanups`, `type ResponderHarness` from `tests/responder/support.ts` (plan 2), plus `AskerService` (Task 5) and the core store functions.
+- Consumes: `startResponder`, `startFakeBoard`, `until`, `allowAnyRelay`, `type Cleanups`, `type ResponderHarness` from `tests/responder/support.ts` (plan 2), plus `AskerService` (Task 6) and the core store functions.
 - Produces (test support only, used by Tasks 12 and 13):
   - `startAsker({ identity, relays, cleanups, home?, name?, now? }): Promise<AskerHarness>`: opens a store with `allowAnyRelay`, sets the profile, builds an `AskerService` over the fake boards, and registers its `close()` in `cleanups`.
   - `type AskerHarness = { home: string; store: Store; service: AskerService; sync(maxMs?: number): Promise<void>; close(): Promise<void> }`
@@ -3228,7 +3717,7 @@ Create `tests/asker/flow.test.ts`:
 
 ```ts
 import { afterEach, describe, expect, it } from 'vitest'
-import { getContact, getOutboundQuestion, listOutboundQuestions, nowSeconds } from '@agentbridge/core'
+import { encodeLink, getContact, getOutboundQuestion, listRequests, nowSeconds } from '@agentbridge/core'
 import { startFakeBoard, startResponder, testIdentity, until, type Cleanups } from '../responder/support'
 import { approveFromResponder, startAsker } from './support'
 
@@ -3254,13 +3743,17 @@ describe('the whole round trip', () => {
       const asker = await startAsker({ identity: beto, relays: [board.url], cleanups })
 
       // 1. Beto asks Ana for permission.
-      const link = `agentbridge:${(await import('@agentbridge/core')).encodeLink(ana.publicKey, [board.url]).slice('agentbridge:'.length)}`
-      const outcome = await asker.service.connect(link, 'soy Beto, del equipo de datos')
+      const outcome = await asker.service.connect(encodeLink(ana.publicKey, [board.url]), 'soy Beto, del equipo de datos')
       expect(outcome.kind).toBe('requested')
-      await asker.sync(240_000)
+      // The network part stays inside the ordinary ten seconds; the 22-bit proof of work runs on its
+      // own budget inside the publisher, so this may take a few seconds of CPU before it returns.
+      await asker.sync()
 
       // 2. Ana sees it and approves.
-      await until(() => listRequestsLength(responder) === 1, 20_000, 'the request to reach Ana')
+      await until(async () => {
+        await asker.sync()
+        return listRequests(responder.store, nowSeconds()).length === 1
+      }, 120_000, 'the request to reach Ana')
       await approveFromResponder(responder, beto.publicKey)
       await until(() => getContact(responder.store, beto.publicKey, 'inbound')?.state === 'approved')
 
@@ -3292,12 +3785,9 @@ describe('the whole round trip', () => {
   )
 })
 
-function listRequestsLength(responder: { store: Parameters<typeof getContact>[0] }): number {
-  return (responder.store.db.prepare("SELECT count(*) AS n FROM contacts WHERE direction = 'inbound' AND state = 'requested'").get() as { n: number }).n
-}
 ```
 
-> Import `encodeLink` at the top of the file instead of the inline dynamic import above if your editor prefers it; the dynamic form is only there to keep the example self-contained.
+
 
 - [ ] **Step 3: Run it and watch it fail, then pass**
 
@@ -3379,13 +3869,13 @@ Expected: clean, every test passing.
 git add tests/asker/support.ts tests/asker/flow.test.ts tests/responder/support.ts
 git commit -m "test: the whole round trip, asker and responder over fake boards"
 ```
-### Task 12: Asker scenarios — losses, rejections, revocation, expiry and late decisions
+### Task 13: Asker scenarios — losses, rejections, revocation, expiry and late decisions
 
 **Files:**
 - Test: `tests/asker/scenarios.test.ts`
 
 **Interfaces:**
-- Consumes: `startAsker`, `seedApprovedPair` (Task 11), the responder harness, and the core store functions.
+- Consumes: `startAsker`, `seedApprovedPair` (Task 12), the responder harness, and the core store functions.
 - Produces: nothing new. This task proves the spec's integration list for the asker side.
 
 Each test names the rule it protects, and each one would fail if that rule were removed.
@@ -3494,15 +3984,28 @@ describe('what the asker does with what arrives', () => {
     expect(getOutboundQuestion(asker.store, ana.publicKey, question.questionId)).toMatchObject({ state: 'rejected', answer: null })
   }, 60_000)
 
-  it('never lets a stranger answer a question meant for someone else', async () => {
+  it('never lets a stranger touch a question meant for someone else', async () => {
     const { board, asker } = await askerWithApproval()
     const question = await asker.service.ask('ana', 'solo para Ana')
     await asker.sync()
+    const before = getOutboundQuestion(asker.store, ana.publicKey, question.questionId)!
+    const outboxBefore = asker.store.db.prepare('SELECT count(*) AS n FROM outbox').get() as { n: number }
 
     await anaSends(board, { v: 1, type: 'answer', questionId: question.questionId, text: 'soy otro', source: 'x', confidence: 'seguro' }, stranger)
     await asker.sync()
     await asker.sync()
-    expect(getOutboundQuestion(asker.store, ana.publicKey, question.questionId)?.state).not.toBe('answered')
+
+    // Nothing at all changed: not the state, not the stored answer, and above all not the retries —
+    // a stranger who could silently stop them would be as harmful as one who could answer.
+    expect(getOutboundQuestion(asker.store, ana.publicKey, question.questionId)).toEqual(before)
+    expect(asker.store.db.prepare('SELECT count(*) AS n FROM outbox').get()).toEqual(outboxBefore)
+
+    // And the real answer still works afterwards.
+    await anaSends(board, { v: 1, type: 'answer', questionId: question.questionId, text: 'soy Ana', source: 'chat', confidence: 'seguro' })
+    await until(async () => {
+      await asker.sync()
+      return getOutboundQuestion(asker.store, ana.publicKey, question.questionId)?.state === 'answered'
+    })
   }, 60_000)
 
   it('reaches the other person even when one of their boards is dead', async () => {
@@ -3567,18 +4070,88 @@ describe('time', () => {
     expect(asker.store.db.prepare('SELECT count(*) AS n FROM outbox').get()).toMatchObject({ n: 0 })
   }, 60_000)
 
-  it('keeps a question alive across many syncs until something decides it', async () => {
+  it('republishes the same question on the retry schedule until something decides it', async () => {
     const clock = { now: 2_000_000_000 }
-    const { asker } = await askerWithApproval(clock)
+    const { board, asker } = await askerWithApproval(clock)
     const question = await asker.service.ask('ana', 'paciencia')
-    for (let i = 0; i < 3; i++) {
-      clock.now += 3_600
+    await asker.sync()
+    const first = board.events.filter((event) => event.kind === 1059).length
+    expect(first).toBeGreaterThanOrEqual(1)
+
+    // Nothing is due yet: a sync one minute later publishes nothing new.
+    clock.now += 60
+    await asker.sync()
+    expect(board.events.filter((event) => event.kind === 1059).length).toBe(first)
+
+    // Five minutes in, the first retry is due; half an hour after that, the second.
+    clock.now += NOSTR.retryFirstHourIntervalSeconds
+    await asker.sync()
+    const second = board.events.filter((event) => event.kind === 1059).length
+    expect(second).toBeGreaterThan(first)
+
+    clock.now += 3_600 + NOSTR.retryAfterFirstHourIntervalSeconds
+    await asker.sync()
+    expect(board.events.filter((event) => event.kind === 1059).length).toBeGreaterThan(second)
+
+    // Every one of them carried the same question, with the same rumor id.
+    expect(getOutboundQuestion(asker.store, ana.publicKey, question.questionId)).toMatchObject({ state: 'sent', rumorId: question.rumorId })
+  }, 60_000)
+
+  it('stops republishing the moment an answer lands', async () => {
+    const clock = { now: 2_000_000_000 }
+    const { board, asker } = await askerWithApproval(clock)
+    const question = await asker.service.ask('ana', '¿ya?')
+    await asker.sync()
+    await anaSends(board, { v: 1, type: 'answer', questionId: question.questionId, text: 'ya', source: 'chat', confidence: 'seguro' })
+    await until(async () => {
       await asker.sync()
-    }
-    expect(getOutboundQuestion(asker.store, ana.publicKey, question.questionId)?.state).toBe('sent')
+      return getOutboundQuestion(asker.store, ana.publicKey, question.questionId)?.state === 'answered'
+    })
+    const after = board.events.filter((event) => event.kind === 1059).length
+    clock.now += NOSTR.retryFirstHourIntervalSeconds * 3
+    await asker.sync()
+    expect(board.events.filter((event) => event.kind === 1059).length).toBe(after)
   }, 60_000)
 })
 ```
+
+Append one more scenario, which is the spec's "quien pregunta solo con CLI, apagado y luego sincronizando":
+
+```ts
+describe('a person who only uses the terminal', () => {
+  it('picks up an answer that arrived while every process was closed', async () => {
+    const board = await startFakeBoard()
+    cleanups.push(() => board.close())
+    const home = join(await mkdtemp(join(tmpdir(), 'ab-reopen-')), 'home')
+
+    // First run: ask, then close everything.
+    const first = await startAsker({ identity: beto, relays: [board.url], cleanups, home })
+    const now = nowSeconds()
+    createOutboundRequest(first.store, { pubkey: ana.publicKey, requestId: uuid(1), relays: [board.url], now })
+    applyApproval(first.store, { pubkey: ana.publicKey, requestId: uuid(1), generation: 1, name: 'Ana', relays: [board.url], now })
+    const question = await first.service.ask('ana', '¿me contestas luego?')
+    await first.sync()
+    await first.close()
+
+    // Ana answers while nothing of Beto's is running.
+    const rumor = createRumor(
+      { v: 1, type: 'answer', questionId: question.questionId, text: 'sí, aquí está', source: 'chat', confidence: 'seguro' },
+      ana,
+      nowSeconds(),
+    )
+    board.inject(await wrapRumor(rumor, ana, beto.publicKey, { now: nowSeconds() }))
+
+    // Second run, same home: one sync brings it home.
+    const second = await startAsker({ identity: beto, relays: [board.url], cleanups, home })
+    await until(async () => {
+      await second.sync()
+      return getOutboundQuestion(second.store, ana.publicKey, question.questionId)?.state === 'answered'
+    }, 30_000, 'the answer to be picked up on the next run')
+  }, 90_000)
+})
+```
+
+> This test needs `mkdtemp`, `tmpdir` and `join` imported at the top of the file.
 
 - [ ] **Step 2: Run them**
 
@@ -3587,7 +4160,7 @@ Expected: PASS. A failure here is a defect in Tasks 1–10, not something to wea
 
 - [ ] **Step 3: Prove one of them is load-bearing**
 
-Pick the "never lets a stranger answer" test. Copy `packages/core/src/store/outbox-questions.ts` aside under `$TMPDIR`, delete the `recipient` part of the lookup in `applyAnswer`'s `decide` (so any sender matches), run that one test and watch it fail, then restore the file with `git show HEAD:packages/core/src/store/outbox-questions.ts > packages/core/src/store/outbox-questions.ts` and watch it pass. Put both runs in the report. Never use `git stash`.
+Pick the "never lets a stranger touch a question" test. Copy `packages/core/src/store/outbox-questions.ts` aside under `$TMPDIR`, then remove the recipient from **both** places that key the write — `decide`'s lookup and `applyAnswer`'s `UPDATE ... WHERE recipient = ?` — so a stranger's answer really can reach another person's question. (Removing it from only one of them leaves the update matching nothing, and the old assertion would have passed while the stranger still deleted the outbox row: that is the false positive this test was rewritten to close.) Run that one test, watch it fail, restore the file with `git show HEAD:packages/core/src/store/outbox-questions.ts > packages/core/src/store/outbox-questions.ts`, and watch it pass. Put both runs in the report. Never use `git stash`.
 
 - [ ] **Step 4: Commit**
 
@@ -3595,24 +4168,25 @@ Pick the "never lets a stranger answer" test. Copy `packages/core/src/store/outb
 git add tests/asker/scenarios.test.ts
 git commit -m "test: asker scenarios for losses, rejections, revocation and expiry"
 ```
-### Task 13: Two processes on the same home
+### Task 14: Two processes on the same home
 
 **Files:**
 - Test: `tests/asker/multiprocess.test.ts`
 
 **Interfaces:**
-- Consumes: the CLI's built bundle (`plugins/agentbridge/dist/cli.js`, built by `node scripts/build.mjs`), `openStore`, `loadOrCreateIdentity`, the asker harness.
+- Consumes: the CLI's built bundle (`packages/cli/dist/main.js`, built by `node scripts/build.mjs`), `openStore`, `loadOrCreateIdentity`, the asker harness.
 - Produces: nothing new. This task proves the spec's multi-process requirements that belong to the asker:
   - the MCP server and a CLI command update the same question and claim the same outbox row without either losing work;
   - two `setup`-style identity creations at the same time produce one identity, never two;
-  - a CLI command always ends, even when a relay is slow or dead.
+  - a CLI command always ends, even when a relay is slow or dead;
+  - the MCP server exits when Claude Code closes its stdin, even with relay sockets open.
 
 - [ ] **Step 1: Write the tests**
 
 Create `tests/asker/multiprocess.test.ts`:
 
 ```ts
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -3635,7 +4209,8 @@ import { startFakeBoard, testIdentity, until, type Cleanups } from '../responder
 import { startAsker } from './support'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
-const cli = join(root, 'plugins', 'agentbridge', 'dist', 'cli.js')
+// scripts/build.mjs writes the CLI bundle here (the channel's bundle is the one under plugins/).
+const cli = join(root, 'packages', 'cli', 'dist', 'main.js')
 const ana = testIdentity(76)
 const beto = testIdentity(77)
 const uuid = (n: number) => `00000000-0000-4000-8000-${n.toString(16).padStart(12, '0')}`
@@ -3658,7 +4233,7 @@ async function seedHome(board: { url: string }): Promise<string> {
   createOutboundRequest(store, { pubkey: ana.publicKey, requestId: uuid(1), relays: [board.url], now: nowSeconds() })
   applyApproval(store, { pubkey: ana.publicKey, requestId: uuid(1), generation: 1, name: 'Ana', relays: [board.url], now: nowSeconds() })
   store.close()
-  await writeFile(join(home, 'identity.json'), JSON.stringify({ secretKey: Buffer.from(beto.secretKey).toString('hex') }), { mode: 0o600 })
+  await writeFile(join(home, 'identity.json'), JSON.stringify({ version: 1, secretKey: Buffer.from(beto.secretKey).toString('hex') }), { mode: 0o600 })
   return home
 }
 
@@ -3706,6 +4281,33 @@ describe('two identity creations at once', () => {
   })
 })
 
+describe('the MCP server', () => {
+  it('exits when its stdin closes, even with a live subscription', async () => {
+    const board = await startFakeBoard()
+    cleanups.push(() => board.close())
+    const home = await seedHome(board)
+
+    const child = spawn(process.execPath, [cli, 'mcp'], {
+      cwd: root,
+      env: { ...process.env, AGENTBRIDGE_HOME: home },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    cleanups.push(async () => {
+      if (child.exitCode === null) child.kill('SIGKILL')
+    })
+
+    // Let it start, connect and open its live subscription before closing the pipe.
+    await until(() => board.frames.some((frame) => frame[0] === 'REQ'), 30_000, 'the MCP server to subscribe')
+    child.stdin.end()
+
+    const exited = await Promise.race([
+      new Promise<boolean>((resolve) => child.once('exit', () => resolve(true))),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 20_000)),
+    ])
+    expect(exited).toBe(true)
+  }, 90_000)
+})
+
 describe('a command always ends', () => {
   it('finishes even when the relay never answers', async () => {
     const board = await startFakeBoard({ slow: true })
@@ -3720,8 +4322,10 @@ describe('a command always ends', () => {
       stdio: 'pipe',
       timeout: 90_000,
     })
-    // Two syncs of at most 10 s each, plus process start-up: far under the timeout above.
-    expect(Date.now() - started).toBeLessThan(80_000)
+    // Two syncs of at most 10 s each, plus process start-up. The margin is the contractual budget
+    // (20 s of network) plus 20 s for a cold Node start on a loaded machine — well under the 90 s
+    // timeout above, and tight enough to fail if a sync ever waits for a pool timeout instead.
+    expect(Date.now() - started).toBeLessThan(40_000)
   }, 120_000)
 })
 ```
@@ -3739,7 +4343,7 @@ Expected: PASS. These spawn real processes: every one has a timeout and the fake
 git add tests/asker/multiprocess.test.ts
 git commit -m "test: a CLI process and a live asker sharing one home"
 ```
-### Task 14: Full verification
+### Task 15: Full verification
 
 **Files:**
 - No new files. This task only verifies; commit a fix only if a check fails, and name what it fixes.
@@ -3749,7 +4353,7 @@ git commit -m "test: a CLI process and a live asker sharing one home"
 - Produces: evidence that plan 3 is complete:
   - the type-check and the offline suite pass twice in a row;
   - both bundles build and start, and the CLI's help text is the 0.2 one;
-  - the 0.1 enrollment surface is gone from the CLI;
+  - the 0.1 enrollment commands are unreachable from the command table (their code leaves with `setup` and `doctor` in plan 4);
   - mining a connection request is measurably faster than plan 1's 16.5 s.
 
 - [ ] **Step 1: Type-check and the whole suite, twice**
@@ -3761,25 +4365,34 @@ Expected: clean, and the same file and test counts both times. Report both count
 
 ```bash
 node scripts/build.mjs
-node plugins/agentbridge/dist/cli.js --help | head -20
+node packages/cli/dist/main.js --help | head -20
 AGENTBRIDGE_HOME=$(mktemp -d) node plugins/agentbridge/dist/server.js < /dev/null
 ```
 
 Expected: the CLI prints the 0.2 Spanish help with `link`, `connect`, `requests`, `approve`, `reject`, `revoke`, `ask`, `ticket` and `mcp`, and no `enroll`, `invite`, `accept` or `admin`. The channel bundle exits 1 with the Spanish hint to run `setup` (there is no identity in that empty home).
 
-- [ ] **Step 3: The 0.1 enrollment surface is gone**
+- [ ] **Step 3: The 0.1 enrollment commands are unreachable**
 
 ```bash
-git grep -n "enroll\|invite\|acceptInvite\|adminEnrollLink\|clientFor" -- packages/cli | grep -v "packages/cli/src/commands/setup.ts" | grep -v "packages/cli/src/commands/doctor.ts"
+git grep -n "enroll\|invite\|accept\|admin" -- packages/cli/src/router.ts
+git grep -rn "from './commands/account'" -- packages/cli/src | grep -v setup.ts
 ```
 
-Expected: no matches outside `setup.ts` and `doctor.ts` (plan 4 rewrites those two). Any other hit is dead code this plan was supposed to delete.
+Expected: nothing from either command. `account.ts` still exists and still compiles — `setup.ts` calls `enroll` and plan 4 removes both together (P9) — but nothing routes to it and no other file imports it.
 
-- [ ] **Step 4: Mining is faster than it was**
+- [ ] **Step 4: Mining is faster than it was, measured on a real connection request**
 
-Run the measurement from Task 4 again and put the two numbers (one worker, default workers) in the report next to plan 1's live figure of 16 487 ms. This is the number plan 4's documentation quotes when it tells a person how long `connect` takes.
+Run Task 4's measurement script again — the single `npx tsx` command, not the `||` form — and put its numbers in the report next to plan 1's live figure of 16 487 ms. It mines the same shape of event a `connect_request` actually produces (a wrap of a sealed request, not a toy string), three samples per configuration, and reports the median for one worker and for the default worker count. That median is the number plan 4's documentation quotes when it tells a person how long `connect` takes.
 
-- [ ] **Step 5: The asker never claims to know who is online**
+- [ ] **Step 5: A short-lived command stays inside its budget**
+
+```bash
+AGENTBRIDGE_HOME=$(mktemp -d) timeout 60 node packages/cli/dist/main.js contacts; echo "exit=$?"
+```
+
+Expected: it ends on its own (exit 1 with the Spanish "run setup" message in an empty home, or exit 0 once a home exists), never the timeout's 124.
+
+- [ ] **Step 6: The asker never claims to know who is online**
 
 ```bash
 git grep -n "en línea\|online" -- packages/cli/src packages/core/src | grep -v "test"
@@ -3787,7 +4400,7 @@ git grep -n "en línea\|online" -- packages/cli/src packages/core/src | grep -v 
 
 Expected: no match that describes a person's presence. Nostr cannot tell, and the tools say so instead.
 
-- [ ] **Step 6: Report**
+- [ ] **Step 7: Report**
 
 Write the evidence into the task report: both suite runs, the bundle output, the two greps, and the mining numbers. If every check passed, this task has no commit.
 ## What plan 4 starts from
