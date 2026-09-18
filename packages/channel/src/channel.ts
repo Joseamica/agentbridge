@@ -1,4 +1,4 @@
-import { ConfidenceSchema, LIMITS, describeError, type AnswerOutcome } from '@agentbridge/core'
+import { ConfidenceSchema, LIMITS, describeError, normalizeCode, type AnswerOutcome } from '@agentbridge/core'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
@@ -50,7 +50,7 @@ export function cancelNotice(code: string, reason: CancelReason): string {
 }
 
 export function replyResult(outcome: AnswerOutcome, typedCode: string): { text: string; isError: boolean } {
-  const typed = typedCode.trim().toUpperCase()
+  const typed = normalizeCode(typedCode)
   switch (outcome.kind) {
     case 'answered':
       return { text: `Respuesta guardada. Se está enviando a ${outcome.fromName} y le llegará en cuanto alguno de sus tableros la reciba.`, isError: false }

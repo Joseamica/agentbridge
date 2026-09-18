@@ -48,7 +48,9 @@ type AttemptRow = {
 }
 
 const seconds = (ms: number) => Math.floor(ms / 1000)
-const normalizeCode = (code: string) => code.trim().toUpperCase()
+// Shared with the channel, which echoes a typed code back in its Spanish tool text: the same
+// normalization on both sides means an answer's code and the store's own match can never drift.
+export const normalizeCode = (code: string) => code.trim().toUpperCase()
 const displayName = (contact: Contact) => contact.localName ?? contact.declaredName ?? 'contacto'
 const isCurrent = (contact: Contact | null, generation: number): contact is Contact => contact?.state === 'approved' && contact.generation === generation
 

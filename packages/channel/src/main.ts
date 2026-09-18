@@ -52,6 +52,14 @@ async function main(): Promise<void> {
     log,
     onMessage: responderMessageHandler({ wakeDispatcher: () => wiring.dispatcher?.wake(), notifyRequests, log }),
   })
+
+  // A request stored by another process (a CLI sync) leaves a pending notice in SQLite: try it at start
+  // and every minute. Declared before the dispatcher below (whose onFenced calls shutdown(), and
+  // shutdown()'s first statement clears this timer) so a fence that somehow fired during construction
+  // could never read this `const` while it is still in its temporal dead zone.
+  const noticeTimer = setInterval(notifyRequests, 60_000)
+  noticeTimer.unref()
+
   const dispatcher = new Dispatcher({
     store,
     identity,
@@ -64,22 +72,25 @@ async function main(): Promise<void> {
   })
   wiring.dispatcher = dispatcher
 
-  // A request stored by another process (a CLI sync) leaves a pending notice in SQLite: try it at start
-  // and every minute.
-  const noticeTimer = setInterval(notifyRequests, 60_000)
-  noticeTimer.unref()
-
   let stopping = false
   async function shutdown(code: number): Promise<void> {
     if (stopping) return
     stopping = true
     clearInterval(noticeTimer)
-    await dispatcher.stop()
-    await device.close()
-    // A fenced channel no longer owns the lock; releasing by its old epoch would be a no-op anyway.
-    if (code === 0) releaseChannelLock(store, { epoch })
-    store.close()
-    process.exit(code)
+    try {
+      await dispatcher.stop()
+      await device.close()
+      // A fenced channel no longer owns the lock; releasing by its old epoch would be a no-op anyway.
+      if (code === 0) releaseChannelLock(store, { epoch })
+      store.close()
+    } catch (err) {
+      // Every caller below fires this with `void`: a throw here (SQLITE_BUSY closing a contended
+      // home, for example) must never escape as an unhandled rejection, or process.exit below never
+      // runs and a clean SIGTERM turns into a dirty exit that still holds the lock.
+      log(`shutdown failed (${describeError(err)})`)
+    } finally {
+      process.exit(code)
+    }
   }
   process.on('SIGTERM', () => void shutdown(0))
   process.on('SIGINT', () => void shutdown(0))

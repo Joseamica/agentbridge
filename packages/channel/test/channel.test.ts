@@ -85,6 +85,20 @@ describe('channel MCP server', () => {
     expect(calls).toEqual([])
   })
 
+  it('rejects a whitespace-only answer without calling the backend', async () => {
+    const result = await reply({ code: 'ABCD', answer: '   ', source: 'plan.md', confidence: 'seguro' })
+    expect(result.isError).toBe(true)
+    expect(textOf(result)).toMatch(/answer/)
+    expect(calls).toEqual([])
+  })
+
+  it('rejects a whitespace-only source without calling the backend', async () => {
+    const result = await reply({ code: 'ABCD', answer: 'x', source: '  ', confidence: 'seguro' })
+    expect(result.isError).toBe(true)
+    expect(textOf(result)).toMatch(/source/)
+    expect(calls).toEqual([])
+  })
+
   it('turns an unexpected backend error into a generic tool error that does not repeat the error text', async () => {
     failWith = new Error('disk I/O error near PRIVATE_DECRYPTED_CANARY')
     const result = await reply({ code: 'ABCD', answer: 'x', source: 'y', confidence: 'seguro' })

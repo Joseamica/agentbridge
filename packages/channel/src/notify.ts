@@ -29,6 +29,9 @@ export async function notifyNewRequests(input: {
   if (!command) return false
   // Called from a timer: nothing here may throw or reject, a busy database included.
   try {
+    // The slot is spent here, before the command below even runs: a machine with no osascript/
+    // notify-send (or one that times out) silently loses this notice instead of retrying it. That
+    // trade is deliberate — the alternative is a flaky notifier popping up the same notice twice.
     if (!claimRequestNoticeSlot(input.store, input.now)) return false
     await (input.run ?? runWithoutShell)(command.file, command.args)
     return true

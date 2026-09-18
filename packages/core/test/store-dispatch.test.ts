@@ -12,6 +12,7 @@ import {
   expireAttempt,
   getAttemptState,
   getInboxQuestion,
+  normalizeCode,
   openStore,
   recordIncomingRequest,
   rejectUnansweredFor,
@@ -224,5 +225,11 @@ describe('answerQuestion', () => {
     admit(1)
     reserve()
     expect(answer({ epoch: epoch + 1 })).toEqual({ kind: 'fenced' })
+  })
+})
+
+describe('normalizeCode', () => {
+  it('trims and upper-cases a code, so the channel and the store can never drift on the same code', () => {
+    expect(normalizeCode(' abcd ')).toBe('ABCD')
   })
 })
