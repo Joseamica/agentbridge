@@ -5,9 +5,14 @@ import type { NostrEvent } from 'nostr-tools/pure'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   Device,
+  NOSTR,
   SeenIds,
+  applyApproval,
   approveRequest,
+  createOutboundQuestion,
+  createOutboundRequest,
   createRumor,
+  getOutboundQuestion,
   handleResponderMessage,
   nowSeconds,
   openStore,
@@ -27,6 +32,9 @@ import { testIdentity } from './support/keys'
 const responder = testIdentity(91)
 const asker = testIdentity(92)
 const uuid = (k: number) => `00000000-0000-4000-8000-${k.toString(16).padStart(12, '0')}`
+const ASKER_T0 = 2_000_000_000
+const askerClock = { now: ASKER_T0 }
+const askerUuid = (n: number) => `${n.toString(16).padStart(8, '0')}-0000-4000-8000-000000000000`
 const cleanups: Array<() => unknown> = []
 afterEach(async () => {
   for (const fn of cleanups.splice(0).reverse()) await fn()
@@ -40,13 +48,15 @@ const until = async (check: () => boolean, ms = 10_000) => {
   }
 }
 
-async function setup(options: { mine?: FakeBoardOptions; handle?: typeof handleResponderMessage; log?: (line: string) => void } = {}) {
+async function setup(
+  options: { mine?: FakeBoardOptions; handle?: typeof handleResponderMessage; log?: (line: string) => void; now?: () => number } = {},
+) {
   const mine = await startFakeBoard(options.mine ?? {})
   const theirs = await startFakeBoard()
   const store = await openStore(join(await mkdtemp(join(tmpdir(), 'ab-device-')), 'home'), {
     relayPolicy: (inputs) => inputs.filter((x): x is string => typeof x === 'string'),
   })
-  const now = nowSeconds()
+  const now = options.now ? options.now() : nowSeconds()
   setProfile(store, { name: 'Ana', relays: [mine.url], now })
   recordIncomingRequest(store, { pubkey: asker.publicKey, requestId: uuid(1), requestRumorId: '1'.repeat(64), declaredName: 'Beto', note: '', relays: [theirs.url], now })
   approveRequest(store, { pubkey: asker.publicKey, now })
@@ -60,11 +70,12 @@ async function setup(options: { mine?: FakeBoardOptions; handle?: typeof handleR
     onMessage: (_opened, outcome) => outcomes.push(outcome),
     createSocket: plainSocketFactory,
     log: options.log ?? ((line) => logs.push(line)),
+    now: options.now,
     pool: { timeoutMs: 2_000, reconnectDelaysMs: [50] },
     publishIntervalMs: 200,
   })
   cleanups.push(() => mine.close(), () => theirs.close(), () => store.close(), () => device.close())
-  return { mine, theirs, store, device, logs, outcomes }
+  return { mine, theirs, store, device, identity: responder, logs, outcomes }
 }
 
 async function questionWrap(questionId: string, text = '¿Cuándo?'): Promise<NostrEvent> {
@@ -229,11 +240,12 @@ describe('Device', () => {
       },
     })
     const internals = device as unknown as { purge(): void }
-    // requests, inbox, outbox and cursors each wrap their own query in store.tx: a throwing log call
-    // on the first step's failure must not stop the loop before the remaining three ran, and purge()
-    // itself (called synchronously from a setInterval callback in real use) must never throw.
+    // requests, inbox, outbox, the three asker-question steps and cursors each wrap their own query
+    // in store.tx: a throwing log call on one step's failure must not stop the loop before the
+    // remaining ones ran, and purge() itself (called synchronously from a setInterval callback in
+    // real use) must never throw.
     expect(() => internals.purge()).not.toThrow()
-    expect(txCalls).toBe(4)
+    expect(txCalls).toBe(7)
   })
 
   it('keeps the publish loop running when publishDue fails and the log sink also throws', async () => {
@@ -286,5 +298,18 @@ describe('Device', () => {
     const report = await device.syncOnce({ maxMs: 5_000 })
     expect(report).toEqual({ history: [], published: { published: 0, failed: 0, postponed: 0, lost: 0 }, timedOut: false })
     expect(mine.frames.length).toBe(framesBefore)
+  })
+
+  it('ages the asker questions from its purge loop', async () => {
+    // `now` is read on every tick, so advancing this object is what moves the device's clock.
+    const { device, store, identity } = await setup({ now: () => askerClock.now })
+    const them = testIdentity(77)
+    createOutboundRequest(store, { pubkey: them.publicKey, requestId: askerUuid(1), relays: ['wss://relay.example.com'], now: ASKER_T0 })
+    applyApproval(store, { pubkey: them.publicKey, requestId: askerUuid(1), generation: 1, name: 'Ana', relays: ['wss://relay.example.com'], now: ASKER_T0 })
+    createOutboundQuestion(store, { identity, recipient: them.publicKey, text: 'hola', now: ASKER_T0, newQuestionId: () => askerUuid(2) })
+
+    askerClock.now = ASKER_T0 + NOSTR.retryWindowSeconds
+    device.start()
+    await until(() => getOutboundQuestion(store, them.publicKey, askerUuid(2))?.state === 'lost')
   })
 })

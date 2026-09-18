@@ -6,14 +6,23 @@ import {
   LIMITS,
   NOSTR,
   UserFacingError,
+  applyAnswer,
   applyApproval,
+  applyReceipt,
+  applyRejected,
   applyRevocation,
+  authorizeOutboxItem,
+  claimDue,
   createOutboundQuestion,
   createOutboundRequest,
+  expireOutboundQuestions,
   findOutboundQuestions,
   getOutboundQuestion,
   listOutboundQuestions,
+  markPublished,
+  markSentQuestions,
   openStore,
+  purgeOutboundQuestions,
   type Store,
 } from '@agentbridge/core'
 import { testIdentity } from './support/keys'
@@ -39,6 +48,20 @@ function approved(generation = 1, now = T0): void {
 }
 
 const outbox = () => store.db.prepare('SELECT * FROM outbox').all() as Array<Record<string, unknown>>
+
+// Publishes the one pending outbox row the way the real publisher does: claim it, then record
+// that a relay accepted it.
+function publishOne(now = T0): void {
+  const owner = 'test-owner'
+  const [item] = claimDue(store, { owner, now, limit: 1, authorize: () => true })
+  if (!item) throw new Error('expected a due outbox row')
+  markPublished(store, { recipient: item.recipient, rumorId: item.rumorId, owner, now })
+}
+
+function ask(id: number, now = T0): string {
+  const { question } = createOutboundQuestion(store, { identity: me, recipient: them.publicKey, text: `pregunta ${id}`, now, newQuestionId: () => uuid(id) })
+  return question.questionId
+}
 
 describe('createOutboundQuestion', () => {
   it('stores the question as sending and enqueues its wrap for retries', () => {
@@ -126,5 +149,157 @@ describe('reading questions back', () => {
     approved()
     createOutboundQuestion(store, { identity: me, recipient: them.publicKey, text: 'primera', now: T0, newQuestionId: () => uuid(11) })
     expect(findOutboundQuestions(store, '000')).toEqual([])
+  })
+})
+
+describe('markSentQuestions', () => {
+  it('promotes a question to sent once a relay accepted its wrap', () => {
+    approved()
+    const id = ask(21)
+    expect(getOutboundQuestion(store, them.publicKey, id)?.state).toBe('sending')
+    expect(markSentQuestions(store, T0 + 1)).toBe(0)
+
+    publishOne(T0 + 2)
+    expect(markSentQuestions(store, T0 + 3)).toBe(1)
+    expect(getOutboundQuestion(store, them.publicKey, id)?.state).toBe('sent')
+    // Idempotent: a second sync does not move it again.
+    expect(markSentQuestions(store, T0 + 4)).toBe(0)
+  })
+
+  it('leaves a question in sending while every publish is still failing', () => {
+    approved()
+    const id = ask(22)
+    claimDue(store, { owner: 'test-owner', now: T0, limit: 1, authorize: () => true })
+    expect(markSentQuestions(store, T0 + 1)).toBe(0)
+    expect(getOutboundQuestion(store, them.publicKey, id)?.state).toBe('sending')
+  })
+})
+
+describe('incoming decisions', () => {
+  it('moves through received and then answered, and stops the retries', () => {
+    approved()
+    const id = ask(23)
+    publishOne()
+    markSentQuestions(store, T0 + 1)
+
+    expect(applyReceipt(store, { recipient: them.publicKey, questionId: id, now: T0 + 10 })).toBe('applied')
+    expect(getOutboundQuestion(store, them.publicKey, id)).toMatchObject({ state: 'received', receivedAt: T0 + 10 })
+    // The receipt does not stop the retries: the row is still there.
+    expect(outbox()).toHaveLength(1)
+
+    const answer = { text: 'se despliega con npm run deploy', source: 'README.md', confidence: 'seguro' as const }
+    expect(applyAnswer(store, { recipient: them.publicKey, questionId: id, answer, now: T0 + 20 })).toBe('applied')
+    expect(getOutboundQuestion(store, them.publicKey, id)).toMatchObject({ state: 'answered', answer, decidedAt: T0 + 20 })
+    expect(outbox()).toHaveLength(0)
+  })
+
+  it('accepts an answer that arrives before the receipt ever does', () => {
+    approved()
+    const id = ask(24)
+    const answer = { text: 'sí', source: 'notas.md', confidence: 'creo' as const }
+    expect(applyAnswer(store, { recipient: them.publicKey, questionId: id, answer, now: T0 + 5 })).toBe('applied')
+    expect(getOutboundQuestion(store, them.publicKey, id)?.state).toBe('answered')
+  })
+
+  it('ignores a second decision for the same question', () => {
+    approved()
+    const id = ask(25)
+    applyRejected(store, { recipient: them.publicKey, questionId: id, reason: 'limit', now: T0 + 5 })
+    expect(getOutboundQuestion(store, them.publicKey, id)).toMatchObject({ state: 'rejected', rejectReason: 'limit' })
+
+    const answer = { text: 'tarde', source: 'x', confidence: 'seguro' as const }
+    expect(applyAnswer(store, { recipient: them.publicKey, questionId: id, answer, now: T0 + 6 })).toBe('ignored')
+    expect(getOutboundQuestion(store, them.publicKey, id)).toMatchObject({ state: 'rejected', answer: null })
+  })
+
+  it('ignores a decision for a question this person never sent', () => {
+    approved()
+    expect(applyReceipt(store, { recipient: them.publicKey, questionId: uuid(404), now: T0 })).toBe('ignored')
+    expect(applyRejected(store, { recipient: them.publicKey, questionId: uuid(404), reason: 'expired', now: T0 })).toBe('ignored')
+  })
+})
+
+describe('expireOutboundQuestions', () => {
+  it('gives up after the retry window and stops the retries', () => {
+    approved()
+    const id = ask(26)
+    publishOne()
+    markSentQuestions(store, T0 + 1)
+
+    expect(expireOutboundQuestions(store, T0 + NOSTR.retryWindowSeconds - 1)).toBe(0)
+    expect(expireOutboundQuestions(store, T0 + NOSTR.retryWindowSeconds)).toBe(1)
+    expect(getOutboundQuestion(store, them.publicKey, id)).toMatchObject({ state: 'lost', decidedAt: T0 + NOSTR.retryWindowSeconds })
+    expect(outbox()).toHaveLength(0)
+  })
+
+  it('never touches a question that already ended', () => {
+    approved()
+    const id = ask(27)
+    applyAnswer(store, { recipient: them.publicKey, questionId: id, answer: { text: 'ok', source: 'x', confidence: 'seguro' }, now: T0 + 1 })
+    expect(expireOutboundQuestions(store, T0 + NOSTR.retryWindowSeconds + 1)).toBe(0)
+    expect(getOutboundQuestion(store, them.publicKey, id)?.state).toBe('answered')
+  })
+})
+
+describe('the publisher promotes a question as it goes out', () => {
+  it('fires onPublished for the row it just published', async () => {
+    approved()
+    const id = ask(31)
+    const published: string[] = []
+    const { publishDue } = await import('@agentbridge/core')
+    // A pool that accepts everything, so the round records a publish.
+    const pool = { publish: async () => ({ accepted: ['wss://relay.example.com'], rejected: [] }) } as never
+    // The hook only notifies; promoting the row is the caller's job (a persistent process wires this
+    // straight to markSentQuestions, per P1), which is what this test stands in for.
+    await publishDue({
+      store,
+      identity: me,
+      pool,
+      now: () => T0,
+      onPublished: (item) => {
+        published.push(item.rumorId)
+        markSentQuestions(store, T0)
+      },
+    })
+    expect(published).toHaveLength(1)
+    expect(getOutboundQuestion(store, them.publicKey, id)?.state).toBe('sent')
+  })
+})
+
+describe('purgeOutboundQuestions', () => {
+  it('clears the text and the answer at 7 days and forgets the row at 9', () => {
+    approved()
+    const id = ask(28)
+    applyAnswer(store, { recipient: them.publicKey, questionId: id, answer: { text: 'respuesta', source: 'x', confidence: 'seguro' }, now: T0 + 1 })
+
+    expect(purgeOutboundQuestions(store, T0 + NOSTR.contentRetentionSeconds)).toEqual({ contentCleared: 1, forgotten: 0 })
+    expect(getOutboundQuestion(store, them.publicKey, id)).toMatchObject({ state: 'answered', text: null, answer: null })
+
+    expect(purgeOutboundQuestions(store, T0 + NOSTR.decisionRetentionSeconds)).toEqual({ contentCleared: 0, forgotten: 1 })
+    expect(getOutboundQuestion(store, them.publicKey, id)).toBeNull()
+  })
+})
+
+// P11 regression (Task 1's review): the retry of a question already open when the contact
+// revoked must keep working, but a *new* question to that same revoked contact is refused just
+// like one that never approved this person in the first place.
+describe('a question already open when the contact revokes', () => {
+  it('keeps authorizing its own retry while a brand-new question is refused', () => {
+    approved()
+    const id = ask(40)
+    const [item] = claimDue(store, { owner: 'test-owner', now: T0, limit: 1, authorize: () => true })
+    if (!item) throw new Error('expected the outbox row for the open question')
+
+    expect(applyRevocation(store, { pubkey: them.publicKey, generation: 2, now: T0 + 1 })).toBe('applied')
+
+    // A brand-new question to the now-revoked contact is refused exactly like a contact that
+    // never approved this person.
+    expect(() => createOutboundQuestion(store, { identity: me, recipient: them.publicKey, text: 'otra', now: T0 + 2 })).toThrow(UserFacingError)
+
+    // The already-open row is what fetches the rejected/stale_generation decision the other side
+    // stored when they revoked, so its retry must stay authorized despite the contact no longer
+    // being approved.
+    expect(authorizeOutboxItem(store, item)).toBe(true)
+    expect(getOutboundQuestion(store, them.publicKey, id)?.state).toBe('sending')
   })
 })

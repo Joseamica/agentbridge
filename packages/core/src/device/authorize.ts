@@ -3,6 +3,7 @@ import { getContact } from '../store/contacts'
 import type { Store } from '../store/db'
 import { getInboxQuestion } from '../store/inbox'
 import type { OutboxItem } from '../store/outbox'
+import { getOutboundQuestion } from '../store/outbox-questions'
 
 // Runs inside claimDue's transaction, on the same store connection. Decisions that close something
 // (a rejection, a revocation, a rejected question) may always go out, because they are exactly what
@@ -36,7 +37,13 @@ export function authorizeOutboxItem(store: Store, item: OutboxItem): boolean {
     }
     case 'question': {
       const contact = getContact(store, item.recipient, 'outbound')
-      return contact?.state === 'approved' && contact.generation === message.generation
+      if (contact?.state === 'approved' && contact.generation === message.generation) return true
+      // The other person may have revoked while this question was still open. The spec stores their
+      // final rejected/stale_generation decision and regenerates it only when a retry arrives, so
+      // the retry has to stay authorized: it is the one thing that fetches that decision. A NEW
+      // question to a revoked contact never gets this far — createOutboundQuestion refuses it.
+      const question = getOutboundQuestion(store, item.recipient, message.questionId)
+      return question !== null && question.generation === message.generation && question.state !== 'answered' && question.state !== 'rejected' && question.state !== 'lost'
     }
   }
 }

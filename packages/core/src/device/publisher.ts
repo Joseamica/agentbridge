@@ -31,6 +31,7 @@ export type PublishDueInput = {
   signal?: AbortSignal
   limit?: number
   log?: (line: string) => void
+  onPublished?: (item: OutboxItem) => void
 }
 
 const BUDGET_POSTPONE_SECONDS = 60
@@ -115,8 +116,16 @@ export async function publishDue(input: PublishDueInput): Promise<PublishReport>
     // this bookkeeping must count as lost, not as published or failed, or the row would stay
     // 'pending' under a new owner while being reported as done.
     if (outcome.accepted.length > 0) {
-      if (markPublished(input.store, { ...ref, now: now() }) === 'claim_lost') report.lost++
-      else report.published++
+      if (markPublished(input.store, { ...ref, now: now() }) === 'claim_lost') {
+        report.lost++
+      } else {
+        report.published++
+        try {
+          input.onPublished?.(item)
+        } catch {
+          // A caller's bookkeeping must never break the publishing round.
+        }
+      }
     } else if (guard.reservation === 'over_budget') {
       if (postpone(input.store, { ...ref, retryAt: now() + BUDGET_POSTPONE_SECONDS }) === 'claim_lost') report.lost++
       else report.postponed++

@@ -6,8 +6,11 @@ import {
   NOSTR,
   admitQuestion,
   applyApproval,
+  applyRejected,
+  applyRevocation,
   approveRequest,
   authorizeOutboxItem,
+  createOutboundQuestion,
   createOutboundRequest,
   openStore,
   recordIncomingRequest,
@@ -45,6 +48,20 @@ const item = (recipient: string, message: Message | { junk: true }): OutboxItem 
   firstEnqueuedAt: T0,
 })
 const allowed = (recipient: string, message: Message | { junk: true }) => authorizeOutboxItem(store, item(recipient, message))
+
+// A stored outbound question (approved contact, then a question this identity actually sent), built
+// the same way the other tests in this file build their items: a synthetic OutboxItem carrying the
+// real question's id and generation, so authorizeOutboxItem can look the row up.
+function seedQuestionItem(options: { generation: number }): OutboxItem {
+  createOutboundRequest(store, { pubkey: responder.publicKey, requestId: uuid(20), relays: RELAYS, now: T0 })
+  applyApproval(store, { pubkey: responder.publicKey, requestId: uuid(20), generation: options.generation, name: 'Ana', relays: RELAYS, now: T0 })
+  const { question } = createOutboundQuestion(store, { identity: me, recipient: responder.publicKey, text: 'hola', now: T0, newQuestionId: () => uuid(21) })
+  return item(responder.publicKey, { v: 1, type: 'question', questionId: question.questionId, generation: question.generation, text: 'hola' })
+}
+
+function questionIdOf(seeded: OutboxItem): string {
+  return (JSON.parse(seeded.rumor.content) as { questionId: string }).questionId
+}
 
 function approveAsker(): void {
   recordIncomingRequest(store, { pubkey: asker.publicKey, requestId: uuid(1), requestRumorId: hex(9000), declaredName: 'Beto', note: '', relays: RELAYS, now: T0 })
@@ -92,5 +109,22 @@ describe('authorizeOutboxItem', () => {
 
   it('refuses content that is not a protocol message', () => {
     expect(allowed(asker.publicKey, { junk: true })).toBe(false)
+  })
+
+  it('keeps authorizing a retry of a question that was sent before the contact revoked', () => {
+    // Seeded as approved, one question sent, then the contact revoked.
+    const item = seedQuestionItem({ generation: 1 })
+    applyRevocation(store, { pubkey: responder.publicKey, generation: 2, now: T0 + 5 })
+    expect(authorizeOutboxItem(store, item)).toBe(true)
+  })
+
+  it('refuses a question whose own row already ended, once the contact is no longer approved', () => {
+    // Both halves of the rule have to be false for the answer to be false: while the contact is
+    // still approved with that generation, the first check alone authorizes the row — which is the
+    // ordinary case and not what this test is about.
+    const item = seedQuestionItem({ generation: 1 })
+    applyRevocation(store, { pubkey: responder.publicKey, generation: 2, now: T0 + 5 })
+    applyRejected(store, { recipient: responder.publicKey, questionId: questionIdOf(item), reason: 'stale_generation', now: T0 + 6 })
+    expect(authorizeOutboxItem(store, item)).toBe(false)
   })
 })

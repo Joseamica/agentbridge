@@ -11,7 +11,8 @@ import { purgeRequests } from '../store/contacts'
 import { purgeCursors, type CursorRole } from '../store/cursors'
 import type { Store } from '../store/db'
 import { purgeInbox } from '../store/inbox'
-import { purgeOutbox } from '../store/outbox'
+import { purgeOutbox, type OutboxItem } from '../store/outbox'
+import { expireOutboundQuestions, markSentQuestions, purgeOutboundQuestions } from '../store/outbox-questions'
 import { getProfile } from '../store/settings'
 import { publishDue, type PublishReport } from './publisher'
 
@@ -23,6 +24,7 @@ export type DeviceOptions<T> = {
   role: CursorRole
   handleMessage: InboundHandler<T>
   onMessage?: (opened: OpenedMessage, outcome: T) => void
+  onPublished?: (item: OutboxItem) => void
   createSocket?: SocketFactory
   now?: () => number
   log?: (line: string) => void
@@ -121,7 +123,15 @@ export class Device<T> {
       do {
         this.publishAgain = false
         try {
-          await publishDue({ store: this.options.store, identity: this.options.identity, pool: this.pool, now: this.now, signal: this.shutdown.signal, log: this.log })
+          await publishDue({
+            store: this.options.store,
+            identity: this.options.identity,
+            pool: this.pool,
+            now: this.now,
+            signal: this.shutdown.signal,
+            log: this.log,
+            onPublished: this.options.onPublished,
+          })
         } catch (err) {
           // A throw here (including from the log call itself) must never escape: nothing awaits this
           // async IIFE's promise until close(), so it would otherwise become an unhandled rejection.
@@ -160,6 +170,7 @@ export class Device<T> {
         now: this.now,
         signal: deadline.signal,
         log: this.log,
+        onPublished: this.options.onPublished,
       })
       return { history, published, timedOut: deadline.signal.aborted }
     } finally {
@@ -284,6 +295,11 @@ export class Device<T> {
       ['requests', () => purgeRequests(this.options.store, now)],
       ['inbox', () => purgeInbox(this.options.store, { identity: this.options.identity, now })],
       ['outbox', () => purgeOutbox(this.options.store, now)],
+      // The sweep half of P1: a crash between a publish and its promotion, or a publish by a process
+      // that did not wire onPublished, is caught here.
+      ['promote sent questions', () => markSentQuestions(this.options.store, now)],
+      ['sent questions', () => expireOutboundQuestions(this.options.store, now)],
+      ['sent question content', () => purgeOutboundQuestions(this.options.store, now)],
       ['cursors', () => purgeCursors(this.options.store, now)],
     ]
     for (const [name, run] of steps) {

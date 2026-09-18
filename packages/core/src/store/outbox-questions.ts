@@ -7,7 +7,7 @@ import { UserFacingError } from '../errors'
 import { askPermission, getContact } from './contacts'
 import type { Store } from './db'
 import type { RejectReason } from './inbox'
-import { enqueue } from './outbox'
+import { enqueue, resolveOutboxMessage } from './outbox'
 
 export type OutboundQuestionState = 'sending' | 'sent' | 'received' | 'answered' | 'rejected' | 'lost'
 export type OutboundAnswer = { text: string; source: string; confidence: Confidence }
@@ -122,5 +122,114 @@ export function createOutboundQuestion(
       now: input.now,
     })
     return { question: toQuestion(selectRow(store, input.recipient, questionId)!), rumor }
+  })
+}
+
+const OPEN_STATES = "('sending', 'sent', 'received')"
+
+// The outbox is the only place that knows a relay accepted a wrap: `markPublished` stamps
+// last_published_at. Deriving the promotion from that column (instead of a callback in the
+// publisher) means it also happens when another process did the publishing, and that a crash
+// between the publish and this update loses nothing — the next sync promotes it.
+export function markSentQuestions(store: Store, now: number): number {
+  return store.tx(() => {
+    const result = store.db
+      .prepare(
+        `UPDATE outbox_questions SET state = 'sent', updated_at = ?
+           WHERE state = 'sending'
+             AND EXISTS (SELECT 1 FROM outbox WHERE outbox.recipient = outbox_questions.recipient
+                           AND outbox.rumor_id = outbox_questions.rumor_id AND outbox.last_published_at IS NOT NULL)`,
+      )
+      .run(now)
+    return Number(result.changes)
+  })
+}
+
+export function applyReceipt(store: Store, input: { recipient: string; questionId: string; now: number }): 'applied' | 'ignored' {
+  return store.tx(() => {
+    const row = selectRow(store, input.recipient, input.questionId)
+    if (!row || (row.state !== 'sending' && row.state !== 'sent')) return 'ignored'
+    store.db
+      .prepare("UPDATE outbox_questions SET state = 'received', received_at = ?, updated_at = ? WHERE recipient = ? AND question_id = ?")
+      .run(input.now, input.now, input.recipient, input.questionId)
+    // The receipt deliberately does not resolve the outbox row: the spec keeps retrying until the
+    // question has an answer or a rejection.
+    return 'applied'
+  })
+}
+
+function decide(
+  store: Store,
+  input: { recipient: string; questionId: string; now: number },
+  apply: (row: QuestionRow) => void,
+): 'applied' | 'ignored' {
+  return store.tx(() => {
+    const row = selectRow(store, input.recipient, input.questionId)
+    // A final state never changes: a second decision for the same question is the caller's to log.
+    if (!row || (row.state !== 'sending' && row.state !== 'sent' && row.state !== 'received')) return 'ignored'
+    apply(row)
+    // The question is settled, so its retries stop here.
+    resolveOutboxMessage(store, { recipient: row.recipient, rumorId: row.rumor_id })
+    return 'applied'
+  })
+}
+
+export function applyAnswer(
+  store: Store,
+  input: { recipient: string; questionId: string; answer: OutboundAnswer; now: number },
+): 'applied' | 'ignored' {
+  return decide(store, input, () => {
+    store.db
+      .prepare(
+        `UPDATE outbox_questions SET state = 'answered', answer_text = ?, answer_source = ?, answer_confidence = ?, decided_at = ?, updated_at = ?
+           WHERE recipient = ? AND question_id = ?`,
+      )
+      .run(input.answer.text, input.answer.source, input.answer.confidence, input.now, input.now, input.recipient, input.questionId)
+  })
+}
+
+export function applyRejected(
+  store: Store,
+  input: { recipient: string; questionId: string; reason: RejectReason; now: number },
+): 'applied' | 'ignored' {
+  return decide(store, input, () => {
+    store.db
+      .prepare(
+        `UPDATE outbox_questions SET state = 'rejected', reject_reason = ?, decided_at = ?, updated_at = ?
+           WHERE recipient = ? AND question_id = ?`,
+      )
+      .run(input.reason, input.now, input.now, input.recipient, input.questionId)
+  })
+}
+
+// A question that never reached a final state inside the retry window can no longer be answered:
+// the other side stopped hearing about it. Its outbox row goes too, so nothing keeps mining for it.
+export function expireOutboundQuestions(store: Store, now: number): number {
+  return store.tx(() => {
+    const horizon = now - NOSTR.retryWindowSeconds
+    const rows = store.db
+      .prepare(`SELECT recipient, rumor_id FROM outbox_questions WHERE state IN ${OPEN_STATES} AND asked_at <= ?`)
+      .all(horizon) as Array<{ recipient: string; rumor_id: string }>
+    if (rows.length === 0) return 0
+    store.db
+      .prepare(`UPDATE outbox_questions SET state = 'lost', decided_at = ?, updated_at = ? WHERE state IN ${OPEN_STATES} AND asked_at <= ?`)
+      .run(now, now, horizon)
+    for (const row of rows) resolveOutboxMessage(store, { recipient: row.recipient, rumorId: row.rumor_id })
+    return rows.length
+  })
+}
+
+// Content (the question text and the answer) follows the 7-day retention; the row itself, which is
+// what says the question ended and how, stays until 9 days.
+export function purgeOutboundQuestions(store: Store, now: number): { contentCleared: number; forgotten: number } {
+  return store.tx(() => {
+    const contentCleared = store.db
+      .prepare(
+        `UPDATE outbox_questions SET text = NULL, answer_text = NULL, answer_source = NULL, answer_confidence = NULL, updated_at = ?
+           WHERE asked_at <= ? AND (text IS NOT NULL OR answer_text IS NOT NULL)`,
+      )
+      .run(now, now - NOSTR.contentRetentionSeconds)
+    const forgotten = store.db.prepare('DELETE FROM outbox_questions WHERE asked_at <= ?').run(now - NOSTR.decisionRetentionSeconds)
+    return { contentCleared: Number(contentCleared.changes), forgotten: Number(forgotten.changes) }
   })
 }
