@@ -99,6 +99,7 @@ describe('responder scenarios', () => {
       clock.now += 601
       await beto.send(to, question(old, 'vieja'), { rumor: oldRumor })
       await until(() => beto.messages('rejected').some((m) => m.questionId === old), 20_000, 'the old question rejected')
+      expect(beto.messages('rejected').find((m) => m.questionId === old)).toMatchObject({ reason: 'stale_generation' })
       const fresh = randomUUID()
       await beto.send(to, question(fresh, 'nueva', 3))
       await until(() => ana.questions().length === 2, 20_000, 'the new question in Claude')
@@ -156,16 +157,29 @@ describe('responder scenarios', () => {
   it(
     'ignores a different rumor that reuses a question id',
     async () => {
-      const { ana, beto, to } = await approvedPair()
+      const clock: Clock = { now: nowSeconds() }
+      const { ana, beto, to } = await approvedPair({ clock })
       const questionId = randomUUID()
-      await beto.send(to, question(questionId, 'original'))
+      const originalRumor = await beto.send(to, question(questionId, 'original'))
       await until(() => ana.questions().length === 1, 20_000, 'the original in Claude')
       await ana.reply(answerArgs(ana.questions()[0]!.meta.code!))
+      await until(() => beto.messages('answer').some((m) => m.questionId === questionId), 20_000, 'the answer')
+
+      // Put the 10-minute regeneration guard out of the way first, so the conflict check on the
+      // differing rumor id is the only thing left that can still stop the impostor.
+      clock.now += 601
+      const receiptsForQuestion = () => beto.messages('receipt').filter((m) => m.questionId === questionId).length
+      const receiptsBefore = receiptsForQuestion()
       await beto.send(to, question(questionId, 'impostora'))
       const later = randomUUID()
       await beto.send(to, question(later, 'siguiente'))
       await until(() => ana.questions().length === 2, 20_000, 'the next question in Claude')
+
+      // Claude only ever saw the original text, and the impostor never earned itself a fresh receipt.
       expect(ana.questions().map((q) => q.content)).toEqual(['original', 'siguiente'])
+      expect(receiptsForQuestion()).toBe(receiptsBefore)
+      const stored = ana.store.db.prepare('SELECT rumor_id AS rumorId FROM inbox_questions WHERE question_id = ?').get(questionId) as { rumorId: string }
+      expect(stored.rumorId).toBe(originalRumor.id)
     },
     60_000,
   )
