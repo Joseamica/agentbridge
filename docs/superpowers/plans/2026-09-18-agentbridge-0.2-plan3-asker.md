@@ -166,6 +166,7 @@ import {
   NOSTR,
   UserFacingError,
   applyApproval,
+  applyRevocation,
   createOutboundQuestion,
   createOutboundRequest,
   findOutboundQuestions,
@@ -180,7 +181,9 @@ const me = testIdentity(31)
 const them = testIdentity(32)
 const T0 = 2_000_000_000
 const RELAYS = ['wss://relay.example.com']
-const uuid = (n: number) => `00000000-0000-4000-8000-${n.toString(16).padStart(12, '0')}`
+// Distinct in their *first* characters, because the prefix lookup below is about what a person
+// retypes: ids that differ only in their last digits would make every prefix ambiguous.
+const uuid = (n: number) => `${n.toString(16).padStart(8, '0')}-0000-4000-8000-000000000000`
 let store: Store
 
 beforeEach(async () => {
@@ -241,11 +244,16 @@ describe('createOutboundQuestion', () => {
   })
 
   it('carries the generation of the latest approval', () => {
+    // A second approval only applies to a *pending* request, so the real sequence is the one a
+    // person lives through: approved, revoked, asked again, approved again with a higher generation.
     approved(1)
-    applyApproval(store, { pubkey: them.publicKey, requestId: uuid(1), generation: 4, name: 'Ana', relays: RELAYS, now: T0 })
-    const { rumor } = createOutboundQuestion(store, { identity: me, recipient: them.publicKey, text: 'hola', now: T0, newQuestionId: () => uuid(8) })
-    expect(JSON.parse(rumor.content)).toMatchObject({ generation: 4 })
-    expect(getOutboundQuestion(store, them.publicKey, uuid(8))?.generation).toBe(4)
+    expect(applyRevocation(store, { pubkey: them.publicKey, generation: 2, now: T0 + 1 })).toBe('applied')
+    createOutboundRequest(store, { pubkey: them.publicKey, requestId: uuid(2), relays: RELAYS, now: T0 + 2 })
+    expect(applyApproval(store, { pubkey: them.publicKey, requestId: uuid(2), generation: 3, name: 'Ana', relays: RELAYS, now: T0 + 3 })).toBe('applied')
+
+    const { rumor } = createOutboundQuestion(store, { identity: me, recipient: them.publicKey, text: 'hola', now: T0 + 4, newQuestionId: () => uuid(8) })
+    expect(JSON.parse(rumor.content)).toMatchObject({ generation: 3 })
+    expect(getOutboundQuestion(store, them.publicKey, uuid(8))?.generation).toBe(3)
   })
 
   it('sends to the relays stored for that contact, capped at the protocol maximum', () => {
@@ -265,6 +273,9 @@ describe('reading questions back', () => {
     createOutboundQuestion(store, { identity: me, recipient: them.publicKey, text: 'segunda', now: T0 + 5, newQuestionId: () => uuid(12) })
     expect(listOutboundQuestions(store).map((q) => q.text)).toEqual(['segunda', 'primera'])
     expect(findOutboundQuestions(store, uuid(12).slice(0, 8)).map((q) => q.questionId)).toEqual([uuid(12)])
+    // Two ids that share a prefix are the ambiguous case the CLI must ask about.
+    createOutboundQuestion(store, { identity: me, recipient: them.publicKey, text: 'tercera', now: T0 + 6, newQuestionId: () => `${uuid(12).slice(0, 10)}00-4000-8000-000000000000` })
+    expect(findOutboundQuestions(store, uuid(12).slice(0, 8)).length).toBeGreaterThan(1)
     expect(getOutboundQuestion(store, them.publicKey, uuid(11))?.text).toBe('primera')
     expect(getOutboundQuestion(store, them.publicKey, uuid(99))).toBeNull()
   })
