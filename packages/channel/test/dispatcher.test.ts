@@ -9,6 +9,7 @@ import {
   getInboxQuestion,
   openStore,
   recordIncomingRequest,
+  reserveNextQuestion,
   revokeConnection,
   type Store,
 } from '@agentbridge/core'
@@ -198,5 +199,177 @@ describe('Dispatcher', () => {
     await until(() => fenced === 1)
     expect(delivered).toEqual([])
     expect(reply(d, 'AAAA').kind).toBe('fenced')
+  })
+
+  it('keeps ticking, and lets stop() resolve, when the log sink itself throws', async () => {
+    let failures = 1
+    const flaky: Store = {
+      ...store,
+      tx: <T>(fn: () => T): T => {
+        if (failures-- > 0) throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR' })
+        return store.tx(fn)
+      },
+    }
+    const d = new Dispatcher({
+      store: flaky,
+      identity: responder,
+      epoch,
+      deliver: async (q) => {
+        delivered.push(q)
+      },
+      cancel: async () => {},
+      pollMs: 10,
+      nowMs: () => clock.ms,
+      log: () => {
+        throw new Error('stderr write failed: EPIPE')
+      },
+    })
+    dispatchers.push(d)
+    d.start()
+    // The very first tick throws (the flaky store) and the error handler's own log call also throws
+    // (a closed stdio pipe). The chain must still advance to later ticks instead of wedging on the
+    // rejected promise: a question admitted well after this point must still get delivered.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    admit(1)
+    await until(() => delivered.length === 1)
+    await d.stop()
+  })
+
+  it('logs a tick failure through describeError without leaking the question code or its text', async () => {
+    admit(1)
+    let failures = 1
+    const flaky: Store = {
+      ...store,
+      tx: <T>(fn: () => T): T => {
+        if (failures-- > 0) throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR' })
+        return store.tx(fn)
+      },
+    }
+    const lines: string[] = []
+    const d = new Dispatcher({
+      store: flaky,
+      identity: responder,
+      epoch,
+      deliver: async (q) => {
+        delivered.push(q)
+      },
+      cancel: async () => {},
+      pollMs: 10,
+      nowMs: () => clock.ms,
+      log: (line) => lines.push(line),
+    })
+    dispatchers.push(d)
+    d.start()
+    await until(() => delivered.length === 1)
+    expect(lines).toEqual(['dispatch failed (Error (ERR_SQLITE_ERROR))'])
+    expect(lines[0]).not.toContain(delivered[0]!.code)
+    expect(lines[0]).not.toContain('pregunta 1')
+  })
+
+  it('answers fenced without touching the store once another channel has taken the lock', async () => {
+    let txCalls = 0
+    const counting: Store = {
+      ...store,
+      tx: <T>(fn: () => T): T => {
+        txCalls++
+        return store.tx(fn)
+      },
+    }
+    const d = new Dispatcher({
+      store: counting,
+      identity: responder,
+      epoch,
+      deliver: async (q) => {
+        delivered.push(q)
+      },
+      cancel: async () => {},
+      onFenced: () => fenced++,
+      pollMs: 10,
+      nowMs: () => clock.ms,
+    })
+    dispatchers.push(d)
+    d.start()
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    acquireChannelLock(store, { self: { pid: 2, start: 'other' }, isAlive: () => false, now: T0 + 1 })
+    admit(1)
+    await until(() => fenced === 1)
+    const callsAtFence = txCalls
+    expect(d.reply({ code: 'AAAA', answer: 'Listo.', source: 'notas.md', confidence: 'seguro' })).toEqual({ kind: 'fenced' })
+    expect(txCalls).toBe(callsAtFence)
+  })
+
+  it('still stores an answer after a graceful stop, since the epoch is still valid', async () => {
+    admit(1)
+    const d = dispatcher()
+    d.start()
+    await until(() => delivered.length === 1)
+    const code = delivered[0]!.code
+    await d.stop()
+    const outcome = reply(d, code)
+    expect(outcome.kind).toBe('answered')
+    expect(getInboxQuestion(store, asker.publicKey, uuid(1))).toMatchObject({ state: 'answered' })
+    const answerRow = store.db.prepare("SELECT 1 FROM outbox WHERE recipient = ? AND label = 'answer'").get(asker.publicKey)
+    expect(answerRow).toBeTruthy()
+  })
+
+  it('logs once when the store already holds an active attempt this instance is not tracking', async () => {
+    admit(1)
+    // Simulates a leftover active attempt from before a restart, which recovery normally clears; this
+    // dispatcher instance's own `tracked` field is null even though the store is not.
+    reserveNextQuestion(store, { epoch, nowMs: clock.ms, attemptTimeoutMs: 60_000, identity: responder })
+    const lines: string[] = []
+    const d = new Dispatcher({
+      store,
+      identity: responder,
+      epoch,
+      deliver: async (q) => {
+        delivered.push(q)
+      },
+      cancel: async () => {},
+      pollMs: 10,
+      nowMs: () => clock.ms,
+      log: (line) => lines.push(line),
+    })
+    dispatchers.push(d)
+    d.start()
+    await until(() => lines.length > 0)
+    expect(lines[0]).toMatch(/active attempt/)
+    expect(lines[0]).not.toContain('pregunta')
+    expect(delivered).toEqual([])
+  })
+
+  it('forgets a stale tracked attempt instead of spinning when expireAttempt reports it already moved on', async () => {
+    admit(1)
+    let txCalls = 0
+    const wrapped: Store = {
+      ...store,
+      tx: <T>(fn: () => T): T => {
+        txCalls++
+        // Simulates a concurrent process (or clock skew) making expireAttempt report the attempt is no
+        // longer active/due, forever, without ever really touching the underlying row.
+        if (txCalls >= 2) return { kind: 'not_active' } as unknown as T
+        return store.tx(fn)
+      },
+    }
+    const d = new Dispatcher({
+      store: wrapped,
+      identity: responder,
+      epoch,
+      deliver: async (q) => {
+        delivered.push(q)
+      },
+      cancel: async () => {},
+      attemptTimeoutMs: 1_000,
+      pollMs: 10,
+      nowMs: () => clock.ms,
+    })
+    dispatchers.push(d)
+    d.start()
+    await until(() => delivered.length === 1)
+    clock.ms += 1_000
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    // Without clearing `tracked` on a not_due/not_active outcome, the deadline stays in the past and
+    // the dispatcher reschedules itself at 0 ms forever, spinning far past a handful of polls.
+    expect(txCalls).toBeLessThan(30)
   })
 })

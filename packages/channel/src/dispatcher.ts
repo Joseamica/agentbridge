@@ -40,6 +40,9 @@ export class Dispatcher {
   private timer: NodeJS.Timeout | null = null
   private chain: Promise<void> = Promise.resolve()
   private stopped = false
+  // Set only by fence(): reply() short-circuits on this, never on `stopped` alone, so a graceful
+  // stop() (which also sets `stopped`, to halt the poll loop) still lets a person's answer land.
+  private fenced = false
   private readonly attemptTimeoutMs: number
   private readonly pollMs: number
   private readonly nowMs: () => number
@@ -61,7 +64,7 @@ export class Dispatcher {
   }
 
   reply(args: ReplyArgs): AnswerOutcome {
-    if (this.stopped) return { kind: 'fenced' }
+    if (this.fenced) return { kind: 'fenced' }
     const outcome = answerQuestion(this.options.store, {
       epoch: this.options.epoch,
       code: args.code,
@@ -97,11 +100,21 @@ export class Dispatcher {
       this.timer = null
       this.chain = this.chain
         .then(() => this.tick())
-        .catch((err: unknown) => this.log(`dispatch failed (${describeError(err)})`))
+        .catch((err: unknown) => {
+          // The log sink itself can throw (a stderr write on a closed pipe): that must never leave
+          // this promise rejected, or every later `.then(() => this.tick())` in the chain skips its
+          // tick forever instead of running it.
+          try {
+            this.log(`dispatch failed (${describeError(err)})`)
+          } catch {
+            // Nowhere left to report a broken logger; swallow it and keep the chain alive.
+          }
+        })
         .finally(() => {
           // A tick that threw never reached its own scheduling: the next poll must still happen.
           if (!this.stopped && this.timer === null) this.schedule(this.pollMs)
         })
+        .catch(() => {})
     }, Math.max(0, delayMs))
   }
 
@@ -116,6 +129,7 @@ export class Dispatcher {
   private fence(): void {
     if (this.stopped) return
     this.stopped = true
+    this.fenced = true
     if (this.timer) clearTimeout(this.timer)
     this.timer = null
     this.log('another channel took the lock for this identity; stopping')
@@ -139,6 +153,11 @@ export class Dispatcher {
           this.tracked = null
           this.notify('tell Claude a question timed out', () => this.options.cancel(tracked.code, 'timeout'))
           if (expired.kind === 'rejected_unanswered') this.options.onEnqueued?.()
+        } else {
+          // `not_due` or `not_active`: something else (a concurrent process, a clock skew) moved this
+          // attempt between our read above and this transaction. Forget it so the next tick re-reads
+          // fresh state instead of looping on a deadline we now know is stale.
+          this.tracked = null
         }
       } else if (attempt?.state !== 'active') {
         this.tracked = null
@@ -153,10 +172,14 @@ export class Dispatcher {
         this.tracked = { attemptId: attempt.attemptId, code: attempt.code, deadlineMs: attempt.deadlineMs }
         // If Claude never gets it, the attempt's deadline brings the question back.
         this.notify('hand a question to Claude', () => this.options.deliver({ code: attempt.code, fromName: attempt.fromName, text: attempt.text }))
+      } else if (reserved.kind === 'busy') {
+        this.log('store already has an active attempt; waiting for it to end before reserving another question')
       }
     }
 
     const untilDeadline = this.tracked ? Math.max(0, this.tracked.deadlineMs - this.nowMs()) : this.pollMs
-    this.schedule(Math.min(this.pollMs, untilDeadline))
+    // A deadline already in the past must never schedule at 0 ms: that would spin the poll loop as
+    // fast as the event loop allows instead of waiting out a normal poll interval.
+    this.schedule(Math.max(1, Math.min(this.pollMs, untilDeadline)))
   }
 }
