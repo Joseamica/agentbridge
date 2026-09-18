@@ -33,7 +33,7 @@ async function newStore(options: Parameters<typeof openStore>[1] = {}): Promise<
 describe('schema v2', () => {
   it('adds the responder tables and the request decision rumor column', async () => {
     const store = await newStore()
-    expect(MIGRATIONS.map((m) => m.version)).toEqual([1, 2])
+    expect(MIGRATIONS.map((m) => m.version)).toEqual([1, 2, 3])
     const tables = (store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((r) => r.name)
     expect(tables).toEqual(expect.arrayContaining(['settings', 'inbox_questions', 'attempts', 'channel_lock', 'question_codes']))
     const columns = (store.db.prepare('PRAGMA table_info(requests)').all() as Array<{ name: string }>).map((c) => c.name)

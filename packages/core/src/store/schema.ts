@@ -144,4 +144,32 @@ CREATE TABLE channel_lock (
 );
 `,
   },
+  {
+    version: 3,
+    name: 'questions this person sent',
+    sql: `
+CREATE TABLE outbox_questions (
+  recipient TEXT NOT NULL CHECK (length(recipient) = 64),
+  question_id TEXT NOT NULL,
+  rumor_id TEXT NOT NULL CHECK (length(rumor_id) = 64),
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  text TEXT,
+  state TEXT NOT NULL CHECK (state IN ('sending', 'sent', 'received', 'answered', 'rejected', 'lost')),
+  answer_text TEXT,
+  answer_source TEXT,
+  answer_confidence TEXT CHECK (answer_confidence IN ('seguro', 'creo', 'no_se')),
+  reject_reason TEXT CHECK (reject_reason IN ('expired', 'limit', 'unanswered', 'stale_generation')),
+  asked_at INTEGER NOT NULL,
+  received_at INTEGER,
+  decided_at INTEGER,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (recipient, question_id)
+);
+-- Open questions are read on every sync (promote to sent, expire to lost), and the list the person
+-- sees is ordered by when they asked.
+CREATE INDEX outbox_questions_open ON outbox_questions (state, asked_at);
+CREATE INDEX outbox_questions_recent ON outbox_questions (asked_at);
+CREATE INDEX outbox_questions_rumor ON outbox_questions (rumor_id);
+`,
+  },
 ]
