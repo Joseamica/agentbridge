@@ -1570,61 +1570,82 @@ calling them with a refusal — there is nothing to reject:
 
 > `authInFlight` resolves from one of those callbacks, so it settles with them; nothing else needs to change.
 
-- [ ] **Step 4: Give mining its own budget, independent of the sync deadline**
+- [ ] **Step 4: Give mining its own budget, and stop the deadline from discarding finished work**
 
-In `packages/core/src/device/publisher.ts`, add `miningMs?: number` to `PublishDueInput`, and give mining a signal that is **not** the sync's:
+`packages/core/src/device/publisher.ts` today mines with the caller's signal and refuses every write once that signal aborts (`beforeSend`'s first line). Two changes, both small and both against the code as it is written:
+
+**(a) The mining signal is not the sync's.** Replace the `wrapRumor` call and its catch with:
 
 ```ts
-      // Proof of work is CPU, not network. Charging it to the sync's ten seconds would make a
-      // connection request unsendable on a slow machine, so it gets its own timeout — the sync
-      // deadline is deliberately not part of this signal.
-      const mining = AbortSignal.timeout(input.miningMs ?? 60_000)
-      let wrap: NostrEvent
-      try {
-        wrap = await wrapRumor(item.rumor, input.identity, item.recipient, { now: now(), signal: mining })
-      } catch (err) {
-        // Whoever aborted, the row is untouched work for the next round: postponing is right and
-        // counting a failure would burn one of its attempts. (The previous code only recognized the
-        // caller's own signal here, so a mining timeout would have called markFailed.)
-        if (mining.aborted || input.signal?.aborted) {
-          if (postpone(input.store, { recipient: item.recipient, rumorId: item.rumorId, owner, until: now() + 60, now: now() }) === 'claim_lost') {
-            report.lost++
-          } else {
-            report.postponed++
-          }
-          continue
-        }
-        …the existing handling for a real sealing failure…
+    // Proof of work is CPU, not network. Charging it to the sync's ten seconds would make a 22-bit
+    // connection request unsendable on a slow machine, so it gets a budget of its own.
+    const mining = AbortSignal.timeout(input.miningMs ?? 60_000)
+    let wrap: NostrEvent
+    try {
+      wrap = await wrapRumor(item.rumor, input.identity, item.recipient, { now: now(), signal: mining })
+    } catch (err) {
+      // Either abort leaves untouched work for the next round, so both postpone instead of counting
+      // a failure — but only the caller's deadline ends the round.
+      if (mining.aborted || input.signal?.aborted) {
+        postpone(input.store, { ...ref, retryAt: now() })
+        report.postponed++
+        if (input.signal?.aborted) break
+        continue
       }
+      log(`could not seal an outgoing ${item.label} (${describeError(err)})`)
+      markFailed(input.store, { ...ref, now: now() })
+      report.failed++
+      continue
+    }
 ```
 
-> Keep the file's existing names (`postpone`'s exact signature, the report counters). The two things this step changes are: the mining signal no longer includes the sync deadline, and a mining timeout postpones instead of failing.
-
-Then make the deadline stop *starting* work rather than discard finished work. In the round loop:
+**(b) The deadline decides whether to start another row, not whether to throw away one already mined.** Delete the first line of `beforeSend`:
 
 ```ts
-      // Checked before claiming the next row: an expired deadline ends the round here…
-      if (input.signal?.aborted) break
+    const beforeSend = (): boolean => {
+      if (input.signal?.aborted) return false   // ← delete this line
 ```
 
-and in the write guard, ignore the sync deadline for a row that is already mined:
+and add the check at the top of the round loop instead, before `claimDue`:
 
 ```ts
-      // …but a row that has already paid for its proof of work is published anyway, bounded by the
-      // pool's own per-relay timeout. Discarding it would mean re-mining the same connection request
-      // on every command and never sending it.
-      const beforeSend = () => {
-        if (!claimHeld()) return false
-        return true
-      }
+  for (;;) {
+    // An expired deadline ends the round here. A row that already paid for its proof of work is
+    // still published below (bounded by the pool's own per-relay timeout): discarding it would mean
+    // re-mining the same connection request on every command and never sending it.
+    if (input.signal?.aborted) break
+    const [item] = claimDue(input.store, { … })
 ```
 
-The abort check that used to sit inside `beforeSend` moves to the loop condition above. Add a test: a row whose mining takes longer than the sync deadline is still published once, and the deadline stops the *next* row from being claimed.
+Everything else in the guard — the single `reservePublish`, the later `stillClaimed` re-checks, `lostMidSend`, the `catch` that refuses the write — stays exactly as it is: that is what enforces the per-minute publish budget and the claim.
 
-- [ ] **Step 5: Pass the sync's signal everywhere**
+**(c) The publish call does not carry the expired deadline.** In the same function, `input.pool.publish(item.relays, wrap, beforeSend)` keeps being called **without** the signal option, for the same reason: this row is already mined and reserved, and the pool's own per-relay timeout bounds it. The sync's signal goes to the history queries (Step 5), not to a publish already under way.
+
+Add two tests to `packages/core/test/device-publisher.test.ts`:
+
+```ts
+  it('leaves a row pending when mining runs past its own budget', async () => {
+    // A 22-bit row with a 1 ms budget cannot finish: it is postponed, not failed, and stays pending.
+    …
+    const report = await publishDue({ store, identity, pool, now: () => T0, miningMs: 1 })
+    expect(report.postponed).toBe(1)
+    expect(report.failed).toBe(0)
+    expect(store.db.prepare('SELECT state FROM outbox').get()).toMatchObject({ state: 'pending' })
+  })
+
+  it('publishes a row it already mined even if the caller’s deadline expired meanwhile', async () => {
+    // The signal aborts while mining is in flight; the row still goes out exactly once, and the
+    // round stops before claiming another.
+    …
+    expect(report.published).toBe(1)
+  })
+```
+
+- [ ] **Step 5: Pass the sync's signal where it belongs**
 
 In `packages/core/src/device/device.ts`:
-- thread the `syncOnce` deadline's `signal` into `recoverHistory`'s pool queries and into `publishDue` (it already receives `signal`; make sure the pool calls inside `publishDue` get it too, through the new `publish` option);
+- thread the `syncOnce` deadline's `signal` into `recoverHistory`'s pool queries (the fourth argument `query` gained in Step 3) — that is the part of a sync that can wait on a slow relay;
+- keep passing `signal` to `publishDue` as it does today: after Step 4 that signal stops the round from claiming another row, and no longer discards a row already mined;
 - add `miningMs?: number` to `DeviceOptions` and pass it to both `publishDue` calls, so a caller can give proof of work its own budget.
 
 - [ ] **Step 6: Run the tests to verify they pass**
@@ -4290,8 +4311,12 @@ describe('recovery through retries', () => {
     // retry is what makes her regenerate and resend it.
     const board = await startFakeBoard()
     cleanups.push(() => board.close())
+    // One clock for both people. The responder's own regeneration limit is ten minutes counted on
+    // *its* clock, so moving only the asker forward would never make Ana resend anything: a shared
+    // clock is what lets a single jump cross both the asker's retry schedule (5 min) and Ana's
+    // regeneration limit (10 min). The responder harness takes a clock exactly like the asker's.
     const clock = { now: nowSeconds() }
-    const responder = await startResponder({ identity: ana, relays: [board.url], cleanups })
+    const responder = await startResponder({ identity: ana, relays: [board.url], cleanups, clock })
     const asker = await startAsker({ identity: beto, relays: [board.url], cleanups, now: () => clock.now })
     seedApprovedContact(responder.store, { responder: ana, asker: beto, askerRelays: [board.url], now: clock.now })
     createOutboundRequest(asker.store, { pubkey: ana.publicKey, requestId: uuid(1), relays: [board.url], now: clock.now })
@@ -4303,16 +4328,16 @@ describe('recovery through retries', () => {
     // Ana receives it and revokes before answering: her side stores rejected/stale_generation
     // without sending it (the spec regenerates that decision only when a retry arrives).
     await until(() => responder.questions().length === 1, 30_000, 'the question to reach Ana')
-    revokeConnection(responder.store, { identity: ana, name: contactNameOf(responder.store, beto.publicKey), now: nowSeconds() })
+    revokeConnection(responder.store, { identity: ana, name: contactNameOf(responder.store, beto.publicKey), now: clock.now })
     await until(async () => {
       await asker.sync()
       return getContact(asker.store, ana.publicKey, 'outbound')?.state === 'revoked'
     }, 30_000, 'the revocation to reach Beto')
 
-    // Beto's question is still open, and P11 keeps its retry authorized. Five minutes later it goes
-    // out again…
+    // Beto's question is still open, and P11 keeps its retry authorized. Past both clocks' limits —
+    // the asker's five-minute retry and Ana's ten-minute regeneration — it goes out again…
     expect(getOutboundQuestion(asker.store, ana.publicKey, question.questionId)?.state).not.toBe('rejected')
-    clock.now += NOSTR.retryFirstHourIntervalSeconds
+    clock.now += NOSTR.regenerationIntervalSeconds + 1
     await asker.sync()
 
     // …and Ana's stored decision comes back with it.
@@ -4494,9 +4519,18 @@ beforeAll(() => {
 
 // `board` here is anything with a url: a real fake board for the in-process test, or
 // `wss://relay.invalid` for the ones that spawn a process (which cannot reach a local ws:// board).
+//
+// The policy matters: `setProfile` and `createOutboundRequest` both run the relays through it, and
+// the production one refuses `ws://`. A home seeded for the in-process board therefore has to be
+// opened with the permissive policy; a home seeded for a child process must NOT be, because the
+// child opens it with the production policy and has to find usable relays there.
+const allowAnyRelay = (inputs: readonly unknown[]): string[] =>
+  inputs.filter((value): value is string => typeof value === 'string' && value.startsWith('ws')).slice(0, 5)
+
 async function seedHome(board: { url: string }): Promise<string> {
   const home = join(await mkdtemp(join(tmpdir(), 'ab-multi-')), 'home')
-  const store = await openStore(home)
+  const local = board.url.startsWith('ws://')
+  const store = await openStore(home, local ? { relayPolicy: allowAnyRelay } : {})
   setProfile(store, { name: 'Beto', relays: [board.url], now: nowSeconds() })
   createOutboundRequest(store, { pubkey: ana.publicKey, requestId: uuid(1), relays: [board.url], now: nowSeconds() })
   applyApproval(store, { pubkey: ana.publicKey, requestId: uuid(1), generation: 1, name: 'Ana', relays: [board.url], now: nowSeconds() })
