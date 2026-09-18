@@ -83,6 +83,16 @@ export class Device<T> {
     this.pool = new BoardPool({ identity: options.identity, createSocket: options.createSocket, now: this.now, log: this.log, ...options.pool })
   }
 
+  // A throwing sink (a stderr write on a closed pipe) must never itself become the failure: every
+  // catch block in this class that logs goes through here instead of calling `this.log` directly.
+  private safeLog(line: string): void {
+    try {
+      this.log(line)
+    } catch {
+      // Nowhere left to report a broken logger.
+    }
+  }
+
   start(): void {
     if (this.closed || this.live) return
     this.started = true
@@ -113,7 +123,9 @@ export class Device<T> {
         try {
           await publishDue({ store: this.options.store, identity: this.options.identity, pool: this.pool, now: this.now, signal: this.shutdown.signal, log: this.log })
         } catch (err) {
-          this.log(`publishing failed (${describeError(err)})`)
+          // A throw here (including from the log call itself) must never escape: nothing awaits this
+          // async IIFE's promise until close(), so it would otherwise become an unhandled rejection.
+          this.safeLog(`publishing failed (${describeError(err)})`)
         }
       } while (this.publishAgain && !this.closed)
     })().finally(() => {
@@ -237,8 +249,10 @@ export class Device<T> {
       // Reading the profile is the first synchronous step of a history pass. Marking this method
       // async turns that throw into a rejection instead of one that could escape a setInterval
       // callback synchronously (an uncaughtException that would kill the process); catching it here
-      // keeps the promise resolved so callers never see a rejection either.
-      this.log(`history failed (${describeError(err)})`)
+      // keeps the promise resolved so callers never see a rejection either. `runHistory()` is called
+      // through `void` both at start() and on the history interval, so a throw from the log call
+      // itself must not leave this rejected either, or it becomes an unhandled rejection.
+      this.safeLog(`history failed (${describeError(err)})`)
       return []
     }
     return Promise.all(
@@ -257,7 +271,7 @@ export class Device<T> {
           })
           return { relay, completed: result.completed, incomplete: result.incomplete, events: result.events, failed: false }
         } catch (err) {
-          this.log(`${sanitizeRelayText(relay)}: history failed (${describeError(err)})`)
+          this.safeLog(`${sanitizeRelayText(relay)}: history failed (${describeError(err)})`)
           return { relay, completed: 0, incomplete: 0, events: 0, failed: true }
         }
       }),
@@ -276,7 +290,10 @@ export class Device<T> {
       try {
         run()
       } catch (err) {
-        this.log(`purge of ${name} failed (${describeError(err)})`)
+        // purge() runs synchronously inside a setInterval callback: a throw here (including from the
+        // log call itself) would otherwise be an uncaughtException, and would also stop this loop
+        // before the remaining steps ran.
+        this.safeLog(`purge of ${name} failed (${describeError(err)})`)
       }
     }
   }

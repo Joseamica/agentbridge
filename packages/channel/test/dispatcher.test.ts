@@ -235,6 +235,77 @@ describe('Dispatcher', () => {
     await d.stop()
   })
 
+  it('keeps delivering, and lets stop() resolve, when handing a question to Claude fails and the log sink also throws', async () => {
+    admit(1)
+    let deliverFailures = 1
+    const rejections: unknown[] = []
+    const onRejection = (err: unknown) => rejections.push(err)
+    process.on('unhandledRejection', onRejection)
+    try {
+      const d = new Dispatcher({
+        store,
+        identity: responder,
+        epoch,
+        deliver: async (q) => {
+          if (deliverFailures-- > 0) throw new Error('stdio write failed: EPIPE')
+          delivered.push(q)
+        },
+        cancel: async (code, reason) => {
+          cancelled.push({ code, reason })
+        },
+        attemptTimeoutMs: 1_000,
+        pollMs: 10,
+        nowMs: () => clock.ms,
+        log: () => {
+          throw new Error('stderr write failed: EPIPE')
+        },
+      })
+      dispatchers.push(d)
+      d.start()
+      // notify() fires the failing delivery and forgets about it (fire-and-forget, so tick() itself
+      // never sees the rejection); its own error handler's log call also throws. Neither may escape as
+      // an unhandled rejection, and the reserved question must not be lost: its deadline requeues it,
+      // and the next attempt to hand it to Claude succeeds.
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      clock.ms += 1_000
+      await until(() => delivered.length === 1)
+      expect(delivered[0]!.text).toBe('pregunta 1')
+      await d.stop()
+      // Give a late rejection a turn of the event loop to surface before asserting none did.
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(rejections).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onRejection)
+    }
+  })
+
+  it('still calls onFenced when another channel takes the lock and the log sink throws', async () => {
+    const d = new Dispatcher({
+      store,
+      identity: responder,
+      epoch,
+      deliver: async (q) => {
+        delivered.push(q)
+      },
+      cancel: async () => {},
+      onFenced: () => fenced++,
+      pollMs: 10,
+      nowMs: () => clock.ms,
+      log: () => {
+        throw new Error('stderr write failed: EPIPE')
+      },
+    })
+    dispatchers.push(d)
+    d.start()
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    acquireChannelLock(store, { self: { pid: 2, start: 'other' }, isAlive: () => false, now: T0 + 1 })
+    admit(1)
+    // fence()'s own log call throws too: onFenced (which main.ts wires to shutdown) must still run,
+    // and reply() must still report 'fenced' instead of hanging the channel open.
+    await until(() => fenced === 1)
+    expect(reply(d, 'AAAA').kind).toBe('fenced')
+  })
+
   it('logs a tick failure through describeError without leaking the question code or its text', async () => {
     admit(1)
     let failures = 1

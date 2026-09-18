@@ -55,6 +55,16 @@ export class Dispatcher {
     this.log = options.log ?? (() => {})
   }
 
+  // A throwing sink (a stderr write on a closed pipe) must never itself become the failure: every
+  // catch block in this class that logs goes through here instead of calling `this.log` directly.
+  private safeLog(line: string): void {
+    try {
+      this.log(line)
+    } catch {
+      // Nowhere left to report a broken logger.
+    }
+  }
+
   start(): void {
     this.schedule(0)
   }
@@ -101,14 +111,9 @@ export class Dispatcher {
       this.chain = this.chain
         .then(() => this.tick())
         .catch((err: unknown) => {
-          // The log sink itself can throw (a stderr write on a closed pipe): that must never leave
-          // this promise rejected, or every later `.then(() => this.tick())` in the chain skips its
-          // tick forever instead of running it.
-          try {
-            this.log(`dispatch failed (${describeError(err)})`)
-          } catch {
-            // Nowhere left to report a broken logger; swallow it and keep the chain alive.
-          }
+          // A throw here must never leave this promise rejected, or every later
+          // `.then(() => this.tick())` in the chain skips its tick forever instead of running it.
+          this.safeLog(`dispatch failed (${describeError(err)})`)
         })
         .finally(() => {
           // A tick that threw never reached its own scheduling: the next poll must still happen.
@@ -123,7 +128,7 @@ export class Dispatcher {
   private notify(what: string, send: () => Promise<void>): void {
     void Promise.resolve()
       .then(send)
-      .catch((err: unknown) => this.log(`could not ${what} (${describeError(err)})`))
+      .catch((err: unknown) => this.safeLog(`could not ${what} (${describeError(err)})`))
   }
 
   private fence(): void {
@@ -132,7 +137,9 @@ export class Dispatcher {
     this.fenced = true
     if (this.timer) clearTimeout(this.timer)
     this.timer = null
-    this.log('another channel took the lock for this identity; stopping')
+    // onFenced must run even if the log call itself throws: it is what actually shuts the channel
+    // down (main.ts wires it to shutdown(1)), so a broken sink must never suppress it.
+    this.safeLog('another channel took the lock for this identity; stopping')
     this.options.onFenced?.()
   }
 

@@ -40,7 +40,7 @@ const until = async (check: () => boolean, ms = 10_000) => {
   }
 }
 
-async function setup(options: { mine?: FakeBoardOptions; handle?: typeof handleResponderMessage } = {}) {
+async function setup(options: { mine?: FakeBoardOptions; handle?: typeof handleResponderMessage; log?: (line: string) => void } = {}) {
   const mine = await startFakeBoard(options.mine ?? {})
   const theirs = await startFakeBoard()
   const store = await openStore(join(await mkdtemp(join(tmpdir(), 'ab-device-')), 'home'), {
@@ -59,7 +59,7 @@ async function setup(options: { mine?: FakeBoardOptions; handle?: typeof handleR
     handleMessage: options.handle ?? handleResponderMessage,
     onMessage: (_opened, outcome) => outcomes.push(outcome),
     createSocket: plainSocketFactory,
-    log: (line) => logs.push(line),
+    log: options.log ?? ((line) => logs.push(line)),
     pool: { timeoutMs: 2_000, reconnectDelaysMs: [50] },
     publishIntervalMs: 200,
   })
@@ -206,6 +206,75 @@ describe('Device', () => {
     expect(runs).toEqual([])
     expect(logs.some((line) => line.includes('history failed'))).toBe(true)
     expect(logs.join('\n')).not.toContain('PRIVATE_DECRYPTED_CANARY')
+  })
+
+  it('runs every purge step, and does not throw, when the log sink always throws', async () => {
+    const store = await openStore(join(await mkdtemp(join(tmpdir(), 'ab-device-purge-')), 'home'))
+    cleanups.push(() => store.close())
+    let txCalls = 0
+    const broken: Store = {
+      ...store,
+      tx: <T>(fn: () => T): T => {
+        txCalls++
+        throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR' })
+      },
+    }
+    const device = new Device({
+      store: broken,
+      identity: responder,
+      role: 'responder',
+      handleMessage: handleResponderMessage,
+      log: () => {
+        throw new Error('stderr write failed: EPIPE')
+      },
+    })
+    const internals = device as unknown as { purge(): void }
+    // requests, inbox, outbox and cursors each wrap their own query in store.tx: a throwing log call
+    // on the first step's failure must not stop the loop before the remaining three ran, and purge()
+    // itself (called synchronously from a setInterval callback in real use) must never throw.
+    expect(() => internals.purge()).not.toThrow()
+    expect(txCalls).toBe(4)
+  })
+
+  it('keeps the publish loop running when publishDue fails and the log sink also throws', async () => {
+    let logCalls = 0
+    const { mine, theirs, store, device } = await setup({
+      log: () => {
+        logCalls++
+        throw new Error('stderr write failed: EPIPE')
+      },
+    })
+    const rejections: unknown[] = []
+    const onRejection = (err: unknown) => rejections.push(err)
+    process.on('unhandledRejection', onRejection)
+    try {
+      device.start()
+      await until(() => mine.frames.some((f) => f[0] === 'REQ'))
+      mine.inject(await questionWrap(uuid(20)))
+      const internals = device as unknown as { wakePublisher(): void; publishing: Promise<void> | null }
+      // Let the normal flow admit the question and publish its receipt first: a clean run never calls
+      // the (always throwing) log, so this only proves the fixture works before we break anything.
+      await until(() => openedByAsker(theirs).some((m) => m.type === 'receipt'))
+      await until(() => internals.publishing === null)
+      expect(logCalls).toBe(0)
+      const original = store.tx
+      ;(store as unknown as { tx: typeof store.tx }).tx = () => {
+        throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR' })
+      }
+      internals.wakePublisher()
+      await until(() => logCalls > 0)
+      // The failing claim attempt, and its own throwing log call inside the catch in wakePublisher(),
+      // must not escape as an unhandled rejection: the publishing slot always clears (the `finally` on
+      // the async IIFE runs regardless), so a later attempt can still run.
+      await until(() => internals.publishing === null)
+      ;(store as unknown as { tx: typeof store.tx }).tx = original
+      internals.wakePublisher()
+      await until(() => internals.publishing === null)
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(rejections).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onRejection)
+    }
   })
 
   it('returns a no-op report from syncOnce after close, without touching the store or the pool', async () => {
