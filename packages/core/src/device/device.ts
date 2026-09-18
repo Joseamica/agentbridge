@@ -122,6 +122,9 @@ export class Device<T> {
   }
 
   syncOnce(options: { maxMs?: number } = {}): Promise<SyncReport> {
+    // Mirrors the closed guard on start()/wakePublisher(): the caller closes the store right after
+    // close() returns, so a sync that started after that must not touch the store or the pool.
+    if (this.closed) return Promise.resolve({ history: [], published: { published: 0, failed: 0, postponed: 0, lost: 0 }, timedOut: false })
     const run = this.runSync(options.maxMs ?? 10_000)
     this.syncing = run
     return run.finally(() => {
@@ -226,8 +229,18 @@ export class Device<T> {
     return this.historyRunning
   }
 
-  private recoverAll(signal: AbortSignal, queryTimeoutMs?: number): Promise<HistoryRun[]> {
-    const relays = getProfile(this.options.store).relays
+  private async recoverAll(signal: AbortSignal, queryTimeoutMs?: number): Promise<HistoryRun[]> {
+    let relays: string[]
+    try {
+      relays = getProfile(this.options.store).relays
+    } catch (err) {
+      // Reading the profile is the first synchronous step of a history pass. Marking this method
+      // async turns that throw into a rejection instead of one that could escape a setInterval
+      // callback synchronously (an uncaughtException that would kill the process); catching it here
+      // keeps the promise resolved so callers never see a rejection either.
+      this.log(`history failed (${describeError(err)})`)
+      return []
+    }
     return Promise.all(
       relays.map(async (relay): Promise<HistoryRun> => {
         try {

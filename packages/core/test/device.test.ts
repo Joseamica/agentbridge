@@ -16,6 +16,7 @@ import {
   recordIncomingRequest,
   setProfile,
   wrapRumor,
+  type HistoryRun,
   type Message,
   type PrecheckedWrap,
   type Store,
@@ -184,5 +185,37 @@ describe('Device', () => {
     await until(() => mine.frames.some((f) => f[0] === 'REQ'))
     await device.close()
     await device.close()
+  })
+
+  it('reports a history run as failed when the profile read throws, instead of escaping synchronously', async () => {
+    const { store, device, logs } = await setup()
+    const boom = new Error('disk full near PRIVATE_DECRYPTED_CANARY')
+    ;(store as unknown as { relayPolicy: (inputs: readonly unknown[]) => string[] }).relayPolicy = () => {
+      throw boom
+    }
+    const internals = device as unknown as { runHistory(): Promise<HistoryRun[]> }
+    let escaped: unknown = null
+    let pending: Promise<HistoryRun[]> | undefined
+    try {
+      pending = internals.runHistory()
+    } catch (err) {
+      escaped = err
+    }
+    expect(escaped).toBeNull()
+    const runs = await pending!
+    expect(runs).toEqual([])
+    expect(logs.some((line) => line.includes('history failed'))).toBe(true)
+    expect(logs.join('\n')).not.toContain('PRIVATE_DECRYPTED_CANARY')
+  })
+
+  it('returns a no-op report from syncOnce after close, without touching the store or the pool', async () => {
+    const { mine, device } = await setup()
+    device.start()
+    await until(() => mine.frames.some((f) => f[0] === 'REQ'))
+    await device.close()
+    const framesBefore = mine.frames.length
+    const report = await device.syncOnce({ maxMs: 5_000 })
+    expect(report).toEqual({ history: [], published: { published: 0, failed: 0, postponed: 0, lost: 0 }, timedOut: false })
+    expect(mine.frames.length).toBe(framesBefore)
   })
 })

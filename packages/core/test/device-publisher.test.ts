@@ -14,6 +14,7 @@ import {
   openWrap,
   precheckWrap,
   publishDue,
+  type Identity,
   type Store,
 } from '@agentbridge/core'
 import { plainSocketFactory, startFakeBoard, type FakeBoard, type FakeBoardOptions } from './support/fake-board'
@@ -173,6 +174,23 @@ describe('publishDue', () => {
     } as unknown as BoardPool
     const report = await publishDue({ store, identity: me, pool: stolenMidSend, authorize: allowAll, now: () => now })
     expect(report).toEqual({ published: 0, failed: 0, postponed: 0, lost: 1 })
+  })
+
+  it('logs a seal failure with the error’s type and code, never its message', async () => {
+    const { store, pool } = await setup()
+    const boom = Object.assign(new Error('secret store failed near PRIVATE_CANARY'), { code: 'ERR_KEY_LOCKED' })
+    const trap: Identity = {
+      publicKey: me.publicKey,
+      get secretKey(): Uint8Array {
+        throw boom
+      },
+    }
+    const lines: string[] = []
+    const report = await publishDue({ store, identity: trap, pool, authorize: allowAll, log: (line) => lines.push(line) })
+    expect(report).toEqual({ published: 0, failed: 1, postponed: 0, lost: 0 })
+    const sealLine = lines.find((line) => line.includes('could not seal'))
+    expect(sealLine).toContain('Error (ERR_KEY_LOCKED)')
+    expect(lines.some((line) => line.includes('PRIVATE_CANARY'))).toBe(false)
   })
 
   it('logs an abandoned row without leaking the thrown error message', async () => {

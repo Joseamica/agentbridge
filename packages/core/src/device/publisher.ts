@@ -72,7 +72,7 @@ export async function publishDue(input: PublishDueInput): Promise<PublishReport>
         report.postponed++
         break
       }
-      log(`could not seal an outgoing ${item.label} (${err instanceof Error ? err.name : 'error'})`)
+      log(`could not seal an outgoing ${item.label} (${describeError(err)})`)
       markFailed(input.store, { ...ref, now: now() })
       report.failed++
       continue
