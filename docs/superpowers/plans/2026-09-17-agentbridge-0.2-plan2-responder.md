@@ -1371,13 +1371,13 @@ describe('purgeInbox', () => {
     admitQuestion(store, question(1))
     admitQuestion(store, question(2, { generation: 5 }))
     const sevenDays = T0 + NOSTR.contentRetentionSeconds
-    expect(purgeInbox(store, sevenDays - 1)).toEqual({ rejectedWaiting: 0, contentCleared: 0, forgotten: 0 })
-    expect(purgeInbox(store, sevenDays)).toEqual({ rejectedWaiting: 1, contentCleared: 1, forgotten: 0 })
+    expect(purgeInbox(store, { identity: responder, now: sevenDays - 1 })).toEqual({ rejectedWaiting: 0, contentCleared: 0, forgotten: 0 })
+    expect(purgeInbox(store, { identity: responder, now: sevenDays })).toEqual({ rejectedWaiting: 1, contentCleared: 1, forgotten: 0 })
     expect(getInboxQuestion(store, asker.publicKey, uuid(1))).toMatchObject({ state: 'rejected', rejectReason: 'unanswered', text: null })
     store.db.prepare('DELETE FROM outbox').run()
     expect(admitQuestion(store, question(2, { generation: 5, now: sevenDays + 1 }))).toEqual({ kind: 'regenerated' })
     expect(messages()).toEqual([{ v: 1, type: 'rejected', questionId: uuid(2), reason: 'stale_generation' }])
-    expect(purgeInbox(store, T0 + NOSTR.decisionRetentionSeconds)).toEqual({ rejectedWaiting: 0, contentCleared: 0, forgotten: 2 })
+    expect(purgeInbox(store, { identity: responder, now: T0 + NOSTR.decisionRetentionSeconds })).toEqual({ rejectedWaiting: 0, contentCleared: 0, forgotten: 2 })
     expect(getInboxQuestion(store, asker.publicKey, uuid(1))).toBeNull()
   })
 })
@@ -1437,7 +1437,7 @@ export type AdmissionOutcome =
   | { kind: 'rejected'; reason: RejectReason }
   | { kind: 'regenerated' }
   | { kind: 'regeneration_too_soon' }
-  | { kind: 'dropped'; reason: 'unrelated' | 'conflict' | 'answered_after_revocation' | 'no_relays' | 'purged' }
+  | { kind: 'dropped'; reason: 'unrelated' | 'conflict' | 'answered_after_revocation' | 'no_relays' | 'purged' | 'abandoned' }
 
 type InboxRow = {
   sender_pubkey: string
@@ -1617,25 +1617,24 @@ export function rejectUnansweredFor(store: Store, input: { identity: Identity; s
 }
 
 // Content (question text and answer rumors) follows the 7-day retention by the question's own date. A
-// question still waiting then can never be answered, so it is closed as unanswered without sending.
+// question still waiting then can never be answered, so it is closed as unanswered — through
+// rejectQuestion, so that decision keeps its own stored rumor and can still be resent later, the same
+// as any other rejection, right up to the 9-day forgetting below. rejectQuestion also cancels the
+// active attempt (as 'purged', since send is false), so there is nothing left to do for it here.
 // Receipts and rejections are decisions, not content: they stay, and can still be resent, until the
 // row is forgotten after 9 days.
-export function purgeInbox(store: Store, now: number): { rejectedWaiting: number; contentCleared: number; forgotten: number } {
+export function purgeInbox(store: Store, input: { identity: Identity; now: number }): { rejectedWaiting: number; contentCleared: number; forgotten: number } {
   return store.tx(() => {
+    const { identity, now } = input
     const contentHorizon = now - NOSTR.contentRetentionSeconds
-    store.db
-      .prepare(
-        `UPDATE attempts SET state = 'cancelled', cancel_reason = 'purged', ended_at = ?
-         WHERE state = 'active' AND (sender_pubkey, question_id) IN (
-           SELECT sender_pubkey, question_id FROM inbox_questions WHERE state = 'dispatched' AND rumor_created_at <= ?)`,
-      )
-      .run(now, contentHorizon)
-    const rejectedWaiting = store.db
-      .prepare(
-        `UPDATE inbox_questions SET state = 'rejected', decision = 'rejected', reject_reason = 'unanswered', decided_at = ?, updated_at = ?
-         WHERE state IN ('queued', 'dispatched') AND rumor_created_at <= ?`,
-      )
-      .run(now, now, contentHorizon)
+    const waiting = store.db
+      .prepare("SELECT sender_pubkey, question_id FROM inbox_questions WHERE state IN ('queued', 'dispatched') AND rumor_created_at <= ?")
+      .all(contentHorizon) as Array<{ sender_pubkey: string; question_id: string }>
+    let rejectedWaiting = 0
+    for (const { sender_pubkey, question_id } of waiting) {
+      const closed = rejectQuestion(store, { identity, senderPubkey: sender_pubkey, questionId: question_id, reason: 'unanswered', now, send: false })
+      if (closed) rejectedWaiting++
+    }
     const contentCleared = store.db
       .prepare(
         `UPDATE inbox_questions
@@ -1644,7 +1643,7 @@ export function purgeInbox(store: Store, now: number): { rejectedWaiting: number
       )
       .run(now, contentHorizon)
     const forgotten = store.db.prepare('DELETE FROM inbox_questions WHERE rumor_created_at <= ?').run(now - NOSTR.decisionRetentionSeconds)
-    return { rejectedWaiting: Number(rejectedWaiting.changes), contentCleared: Number(contentCleared.changes), forgotten: Number(forgotten.changes) }
+    return { rejectedWaiting, contentCleared: Number(contentCleared.changes), forgotten: Number(forgotten.changes) }
   })
 }
 ```

@@ -98,3 +98,27 @@ Todo esto es preexistente o cosmético, verificado y acotado. Ninguno bloquea el
   simbólicos y un `node_modules` que no se pudo revisar.
 - El candado avisa de cualquier enlace simbólico, incluso de los que el `doctor` considera
   inofensivos por no salir de la carpeta. Es a propósito: prefiere errar del lado seguro.
+
+## 0.2 — respondedor: brechas verificadas y deliberadas
+
+Plan 2 (el lado que responde preguntas). Verificadas y acotadas; ninguna bloquea el uso.
+
+1. **Linux y el reloj del sistema.** El candado del canal compara la hora de arranque del proceso
+   (`ps -o lstart=`). En Linux esa hora se deriva del arranque del sistema, así que un salto del
+   reloj (NTP, reanudar una VM) puede hacer que un canal vivo se vea como muerto: si en ese momento
+   se abre un segundo canal, se queda con el candado y el primero se cierra solo (su pregunta
+   vuelve a la cola, no se pierde nada). Candidato de arreglo en el plan 4: en Linux leer los ticks
+   de arranque de `/proc/<pid>/stat`, que no se mueven.
+2. **Un mensaje que siempre falla al guardarse bloquea la recuperación histórica de ese tablero.**
+   Si procesar un mensaje lanza siempre el mismo error, su identificador no se marca como visto y
+   la pasada histórica de ese tablero falla cada vez, así que su cursor deja de avanzar. Es
+   deliberado (nunca descartar un mensaje en silencio) y se ve en el reporte de sincronización y en
+   el log, pero no hay reintento acotado ni cuarentena.
+3. **La copia de una respuesta en la cola de salida vive hasta 7 días después de la respuesta**,
+   mientras que la copia en la bandeja se borra a los 7 días de la pregunta: el contenido de una
+   respuesta puede quedar en la cola de salida hasta unos 14 días después de la pregunta.
+4. **Los tableros de un contacto ya aprobado no se pueden actualizar.** El spec solo permite
+   cambiarlos con un mensaje autenticado de generación mayor o con la solicitud mientras está
+   pendiente; si alguien cambia de tableros después de ser aprobado, sus acuses y respuestas siguen
+   yendo a los viejos hasta que se revoque y vuelva a solicitar. Es como está especificado, pero no
+   hay salida por protocolo; el plan 3 o 4 debe decidir si añade una.
