@@ -274,7 +274,8 @@ describe('reading questions back', () => {
     expect(listOutboundQuestions(store).map((q) => q.text)).toEqual(['segunda', 'primera'])
     expect(findOutboundQuestions(store, uuid(12).slice(0, 8)).map((q) => q.questionId)).toEqual([uuid(12)])
     // Two ids that share a prefix are the ambiguous case the CLI must ask about.
-    createOutboundQuestion(store, { identity: me, recipient: them.publicKey, text: 'tercera', now: T0 + 6, newQuestionId: () => `${uuid(12).slice(0, 10)}00-4000-8000-000000000000` })
+    // Same first eight characters as uuid(12), still a well-formed UUID (createRumor validates it).
+    createOutboundQuestion(store, { identity: me, recipient: them.publicKey, text: 'tercera', now: T0 + 6, newQuestionId: () => `${uuid(12).slice(0, 8)}-1111-4000-8000-000000000000` })
     expect(findOutboundQuestions(store, uuid(12).slice(0, 8)).length).toBeGreaterThan(1)
     expect(getOutboundQuestion(store, them.publicKey, uuid(11))?.text).toBe('primera')
     expect(getOutboundQuestion(store, them.publicKey, uuid(99))).toBeNull()
@@ -645,23 +646,31 @@ describe('purgeOutboundQuestions', () => {
 })
 ```
 
-Append to `packages/core/test/device.test.ts` (inside the existing top-level `describe`, and add `createOutboundQuestion`, `createOutboundRequest`, `applyApproval`, `getOutboundQuestion` and `NOSTR` to its imports as needed):
+Append to `packages/core/test/device.test.ts`. The file's `setup()` today builds its own store, identity and clock internally; this test needs all three, so first make `setup()` return what it already has (`store`, `identity`) and accept an injected clock if it does not already:
+
+```ts
+// At the top of the file, next to its existing helpers:
+const ASKER_T0 = 2_000_000_000
+const askerClock = { now: ASKER_T0 }
+const askerUuid = (n: number) => `${n.toString(16).padStart(8, '0')}-0000-4000-8000-000000000000`
+```
 
 ```ts
   it('ages the asker questions from its purge loop', async () => {
-    const { device, store, identity } = await setup()
+    // `now` is read on every tick, so advancing this object is what moves the device's clock.
+    const { device, store, identity } = await setup({ now: () => askerClock.now })
     const them = testIdentity(77)
-    createOutboundRequest(store, { pubkey: them.publicKey, requestId: uuid(1), relays: ['wss://relay.example.com'], now: T0 })
-    applyApproval(store, { pubkey: them.publicKey, requestId: uuid(1), generation: 1, name: 'Ana', relays: ['wss://relay.example.com'], now: T0 })
-    createOutboundQuestion(store, { identity, recipient: them.publicKey, text: 'hola', now: T0, newQuestionId: () => uuid(2) })
+    createOutboundRequest(store, { pubkey: them.publicKey, requestId: askerUuid(1), relays: ['wss://relay.example.com'], now: ASKER_T0 })
+    applyApproval(store, { pubkey: them.publicKey, requestId: askerUuid(1), generation: 1, name: 'Ana', relays: ['wss://relay.example.com'], now: ASKER_T0 })
+    createOutboundQuestion(store, { identity, recipient: them.publicKey, text: 'hola', now: ASKER_T0, newQuestionId: () => askerUuid(2) })
 
-    clock.now = T0 + NOSTR.retryWindowSeconds
+    askerClock.now = ASKER_T0 + NOSTR.retryWindowSeconds
     device.start()
-    await until(() => getOutboundQuestion(store, them.publicKey, uuid(2))?.state === 'lost')
+    await until(() => getOutboundQuestion(store, them.publicKey, askerUuid(2))?.state === 'lost')
   })
 ```
 
-> If `device.test.ts`'s existing `setup()` does not already return `store` and `identity`, extend it to return them rather than opening a second store: two `Store` objects over one file would see different transactions.
+> Add `applyApproval`, `createOutboundQuestion`, `createOutboundRequest`, `getOutboundQuestion` and `NOSTR` to that file's imports from `@agentbridge/core`. If `setup()` does not take a `now` yet, thread one through to the `Device` it builds — do not open a second `Store` over the same file, because two `Store` objects would not see each other's transactions.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -835,8 +844,12 @@ Add to `packages/core/test/device-authorize.test.ts`:
     expect(authorizeOutboxItem(store, item)).toBe(true)
   })
 
-  it('refuses a question whose own row already ended', () => {
+  it('refuses a question whose own row already ended, once the contact is no longer approved', () => {
+    // Both halves of the rule have to be false for the answer to be false: while the contact is
+    // still approved with that generation, the first check alone authorizes the row — which is the
+    // ordinary case and not what this test is about.
     const item = seedQuestionItem({ generation: 1 })
+    applyRevocation(store, { pubkey: them.publicKey, generation: 2, now: T0 + 5 })
     applyRejected(store, { recipient: them.publicKey, questionId: questionIdOf(item), reason: 'stale_generation', now: T0 + 6 })
     expect(authorizeOutboxItem(store, item)).toBe(false)
   })
@@ -849,12 +862,15 @@ Add to `packages/core/test/device-authorize.test.ts`:
 In `packages/core/src/device/device.ts`, import them:
 
 ```ts
-import { expireOutboundQuestions, purgeOutboundQuestions } from '../store/outbox-questions'
+import { expireOutboundQuestions, markSentQuestions, purgeOutboundQuestions } from '../store/outbox-questions'
 ```
 
 and add two steps to the `steps` array inside `purge()`, after `['outbox', …]`:
 
 ```ts
+      // The sweep half of P1: a crash between a publish and its promotion, or a publish by a process
+      // that did not wire onPublished, is caught here.
+      ['promote sent questions', () => markSentQuestions(this.options.store, now)],
       ['sent questions', () => expireOutboundQuestions(this.options.store, now)],
       ['sent question content', () => purgeOutboundQuestions(this.options.store, now)],
 ```
@@ -1408,8 +1424,9 @@ git commit -m "perf(core): mine a connection request across several workers"
 **Interfaces:**
 - Consumes: plan 1's `BoardPool`, `BoardConnection`; plan 2's `Device.syncOnce`, `publishDue`.
 - Produces:
-  - `BoardPool.query(relay, filter, options?: { timeoutMs?: number; signal?: AbortSignal })` — an aborted signal ends the query at once with `complete: false` and a fixed English reason; a query that has not connected yet stops waiting for the connection too.
-  - `BoardPool.publish(relays, event, beforeSend?, options?: { signal?: AbortSignal })` — the same: an aborted signal stops waiting on relays that have not answered, and the relays that already accepted still count.
+  - `BoardPool.query(relay, filter, timeoutMs?, options?: { signal?: AbortSignal })` — **the third argument keeps being the number it is today** (`history.ts` and plan 1's tests pass it positionally); the signal arrives as a fourth, optional argument. An aborted signal ends the query at once with `complete: false` and a fixed English reason, and a query that has not connected yet stops waiting for the connection too.
+  - `BoardPool.publish(relays, event, beforeSend?, options?: { signal?: AbortSignal })` — the same shape: an aborted signal stops waiting on relays that have not answered, and the relays that already accepted still count.
+  - `BoardConnection` gains `abort(reason)`, which settles every pending `OK` wait and the AUTH handshake with a rejection instead of leaving them to their own timeouts. The pool calls it for the connections a cancelled operation was waiting on, so "stop waiting" also means "stop the socket work".
   - `publishDue` takes `miningMs?: number` (default 60 000), and `Device` takes the same option and forwards it: the proof-of-work budget for one row, enforced with its own `AbortSignal`, separate from the sync's network deadline. A mining timeout leaves the row pending for the next round, exactly like a postponement.
   - `Device.syncOnce({ maxMs })` passes its deadline signal into every history query and into publishing, so a sync returns within `maxMs` plus the time the store needs, not plus a pool timeout.
 - Why this task exists: the spec bounds a short-lived client's sync at ten seconds, and the only thing that made that true before was each pool call's own timeout. A slow relay could push a "10-second" sync past twenty. Mining is CPU, not network, so it gets its own budget instead of being charged to that ten seconds.
@@ -1485,26 +1502,97 @@ Append to `packages/core/test/device-publisher.test.ts`:
 Run: `npx vitest run packages/core/test/boards-pool.test.ts packages/core/test/device.test.ts packages/core/test/device-publisher.test.ts`
 Expected: FAIL — `query` and `publish` take no signal, and `publishDue` has no mining budget.
 
-- [ ] **Step 3: Carry the signal through the pool**
+- [ ] **Step 3: Carry the signal through the pool, without changing what callers already pass**
 
 In `packages/core/src/boards/pool.ts`:
 
-- `connection(relay, signal?)` rejects immediately when `signal?.aborted`, and races its connect promise against the signal's `abort` event so a caller stops waiting even though the connection attempt continues in the background (the pool still owns and closes it).
-- `query(relay, filter, options: { timeoutMs?: number; signal?: AbortSignal } = {})` — keep the current `timeoutMs` behavior and add: an already-aborted signal returns `{ events: [], complete: false, closedReason: 'error: sync deadline reached' }` without connecting; an abort during the query settles it the same way and unsubscribes.
-- `publish(relays, event, beforeSend = () => true, options: { signal?: AbortSignal } = {})` — an abort settles the per-relay promise as rejected-with-reason `'error: sync deadline reached'` for the relays that had not answered, and the ones that already accepted stay in `accepted`.
-
-Keep both signatures backwards compatible (the extra argument is optional), so plan 2's callers keep compiling unchanged.
-
-- [ ] **Step 4: Give mining its own budget**
-
-In `packages/core/src/device/publisher.ts`, add `miningMs?: number` to `PublishDueInput` and, around the `wrapRumor` call, combine the caller's `signal` with a per-row timeout:
-
 ```ts
-      const mining = AbortSignal.any([...(input.signal ? [input.signal] : []), AbortSignal.timeout(input.miningMs ?? 60_000)])
-      wrap = await wrapRumor(item.rumor, input.identity, item.recipient, { now: now(), signal: mining })
+  // A helper used by both operations below: the caller's wait ends when the signal aborts, even
+  // though the underlying socket work is also stopped through `abort()` on the connection.
+  private async raceSignal<T>(work: Promise<T>, onAbort: () => T, signal?: AbortSignal): Promise<T> {
+    if (!signal) return work
+    if (signal.aborted) return onAbort()
+    return new Promise<T>((resolve) => {
+      const finish = (value: T) => {
+        signal.removeEventListener('abort', aborted)
+        resolve(value)
+      }
+      const aborted = () => finish(onAbort())
+      signal.addEventListener('abort', aborted, { once: true })
+      void work.then(finish, () => finish(onAbort()))
+    })
+  }
+
+  async query(
+    relay: string,
+    filter: Filter,
+    timeoutMs = this.options.timeoutMs ?? 10_000,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<QueryResult> {
+    // The third argument stays the number every current caller passes positionally (history.ts and
+    // plan 1's tests); the signal is a fourth, optional one.
+    …
+  }
+
+  async publish(
+    relays: readonly string[],
+    event: NostrEvent,
+    beforeSend: () => boolean = () => true,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<PublishOutcome> {
+    …
+  }
 ```
 
-A mining abort is already handled by the existing catch, which postpones the row instead of counting a failure — that is the behavior this budget wants.
+Inside each of them:
+- an already-aborted signal returns without connecting — `query` with `{ events: [], complete: false, closedReason: 'error: sync deadline reached' }`, `publish` with every relay in `rejected` and the same reason;
+- otherwise the per-relay work is wrapped in `raceSignal`, and on abort the pool also calls `connection.abort('sync deadline reached')` for the connections that operation was waiting on, so a pending `OK` or an unfinished AUTH stops there instead of running to its own timeout;
+- `connection(relay)` keeps its signature; the abort path does not tear the connection down (the pool owns it and `close()` still terminates it), it only settles the waits.
+
+In `packages/core/src/boards/connection.ts`, add:
+
+```ts
+  // Settles everything a caller could be waiting on, without closing the socket: a cancelled sync
+  // must not leave a publish waiting for an OK that will never come, and must not kill a connection
+  // the next command will reuse.
+  abort(reason: string): void {
+    for (const [, pending] of this.pendingOk) pending.reject(new Error(`aborted: ${reason}`))
+    this.pendingOk.clear()
+    this.authWaiters.splice(0).forEach((waiter) => waiter.reject(new Error(`aborted: ${reason}`)))
+  }
+```
+
+> Use the file's own names for the pending-OK map and the AUTH waiters; the point is that both sets are settled.
+
+- [ ] **Step 4: Give mining its own budget, independent of the sync deadline**
+
+In `packages/core/src/device/publisher.ts`, add `miningMs?: number` to `PublishDueInput`, and give mining a signal that is **not** the sync's:
+
+```ts
+      // Proof of work is CPU, not network. Charging it to the sync's ten seconds would make a
+      // connection request unsendable on a slow machine, so it gets its own timeout — the sync
+      // deadline is deliberately not part of this signal.
+      const mining = AbortSignal.timeout(input.miningMs ?? 60_000)
+      let wrap: NostrEvent
+      try {
+        wrap = await wrapRumor(item.rumor, input.identity, item.recipient, { now: now(), signal: mining })
+      } catch (err) {
+        // Whoever aborted, the row is untouched work for the next round: postponing is right and
+        // counting a failure would burn one of its attempts. (The previous code only recognized the
+        // caller's own signal here, so a mining timeout would have called markFailed.)
+        if (mining.aborted || input.signal?.aborted) {
+          if (postpone(input.store, { recipient: item.recipient, rumorId: item.rumorId, owner, until: now() + 60, now: now() }) === 'claim_lost') {
+            report.lost++
+          } else {
+            report.postponed++
+          }
+          continue
+        }
+        …the existing handling for a real sealing failure…
+      }
+```
+
+> Keep the file's existing names (`postpone`'s exact signature, the report counters). The two things this step changes are: the mining signal no longer includes the sync deadline, and a mining timeout postpones instead of failing.
 
 - [ ] **Step 5: Pass the sync's signal everywhere**
 
@@ -1552,7 +1640,9 @@ git commit -m "feat(core): let a caller's deadline reach the relays, and give mi
   - `openAskerSession(options: { home: string; now?; createSocket?; log?; relayPolicy? }): Promise<{ service: AskerService; close(): Promise<void> }>` (in `session.ts`)
   - `withAsker<T>(ctx: CliContext, fn: (service: AskerService) => Promise<T>, options?: { firstSyncMs?: number; lastSyncMs?: number }): Promise<T>` — start → sync → operate → sync → close, always closing.
   - `withResponderSession<T>(ctx: CliContext, fn: (input: { store: Store; identity: Identity; sync: () => Promise<void> }) => Promise<T>): Promise<T>` — the same cycle for the four commands about messages addressed to this person as a responder (`requests`, `approve`, `reject`, `revoke`). It runs a `Device` with `role: 'responder'` and `handleResponderMessage`, and it never takes the channel lock and never starts a dispatcher: only the channel hands questions to Claude (P10).
-  - `CliContext` gains an optional `relayPolicy?: RelayPolicy`, used the way the existing optional `fetchImpl` is: production leaves it undefined, and a test passes a policy that accepts the fake board's `ws://127.0.0.1` URLs.
+  - `CliContext` gains two optional fields, used the way the existing optional `fetchImpl` is — production leaves both undefined:
+    - `relayPolicy?: RelayPolicy`, so a test can accept the fake board's `ws://127.0.0.1` URLs;
+    - `createSocket?: SocketFactory`, because the default factory pins TLS and refuses a plain `ws://` board, so without it a command test could never reach one.
 - Waiting for an answer is Task 7.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1774,6 +1864,9 @@ export class AskerService {
   private readonly now: () => number
   private readonly log: (line: string) => void
   private closed = false
+  // Aborted by close(), so a wait that is sitting in its poll loop ends *before* anyone closes the
+  // store underneath it — a wait that survived would read SQLite after it was closed.
+  private readonly closing = new AbortController()
   private syncing: Promise<SyncReport> = Promise.resolve({ history: [], published: { published: 0, failed: 0, postponed: 0, lost: 0 }, timedOut: false })
 
   constructor(options: AskerServiceOptions) {
@@ -1792,6 +1885,12 @@ export class AskerService {
       // Proof of work is CPU, not network: a 22-bit connection request gets a minute of its own and
       // never eats the ten seconds a sync is allowed to spend on relays (P5b, P5c).
       miningMs: CONNECT_MINING_MS,
+      // The push half of P1: the moment a relay accepts a wrap, the question that wrap carries stops
+      // being `sending`. Without this, a persistent process (the MCP server) would leave its own
+      // questions in `sending` until somebody happened to sync.
+      onPublished: () => {
+        markSentQuestions(options.store, (options.now ?? nowSeconds)())
+      },
       onMessage: (opened, outcome) => {
         // A second decision for a question that already ended is the one outcome worth a line: it
         // means the other side sent two. Identifiers only — never the answer's text.
@@ -1909,6 +2008,7 @@ export class AskerService {
   // caller closes the store underneath it.
   async close(): Promise<void> {
     this.closed = true
+    this.closing.abort()
     try {
       await this.syncing
     } catch {
@@ -1990,7 +2090,7 @@ export async function withAsker<T>(
   fn: (service: AskerService) => Promise<T>,
   options: { firstSyncMs?: number; lastSyncMs?: number } = {},
 ): Promise<T> {
-  const session = await openAskerSession({ home: ctx.home, relayPolicy: ctx.relayPolicy })
+  const session = await openAskerSession({ home: ctx.home, relayPolicy: ctx.relayPolicy, createSocket: ctx.createSocket })
   try {
     await session.service.sync(options.firstSyncMs)
     const result = await fn(session.service)
@@ -2015,7 +2115,7 @@ export async function withResponderSession<T>(
     throw new CliError(`Todavía no hay una identidad de AgentBridge en esta computadora. Créala con: ${CLI_COMMAND} setup`)
   }
   const store = await openStore(home, ctx.relayPolicy ? { relayPolicy: ctx.relayPolicy } : {})
-  const device = new Device({ store, identity, role: 'responder', handleMessage: handleResponderMessage })
+  const device = new Device({ store, identity, role: 'responder', handleMessage: handleResponderMessage, createSocket: ctx.createSocket })
   const sync = async () => {
     await device.syncOnce({ maxMs: 10_000 })
   }
@@ -2200,6 +2300,15 @@ describe('waitForAnswer', () => {
     expect(settled).toMatchObject({ state: 'answered', answer: { text: 'con npm run deploy', source: 'README.md', confidence: 'seguro' } })
   })
 
+  it('ends the wait when the service closes, instead of reading a closed store', async () => {
+    approvedContact()
+    const asked = await service.ask('ana', '¿alguien ahí?')
+    await service.sync()
+    const waiting = service.waitForAnswer({ recipient: them.publicKey, questionId: asked.questionId }, 30)
+    await service.close()
+    await expect(waiting).resolves.toMatchObject({ questionId: asked.questionId })
+  })
+
   it('gives back the state it reached when the wait runs out, without throwing', async () => {
     approvedContact()
     const asked = await service.ask('ana', '¿cómo se despliega?')
@@ -2246,21 +2355,23 @@ and this method to `AskerService`, after `question(...)`:
       // A closing service, an aborted caller (an MCP request cancelled by Claude) and a spent
       // budget all end the wait with whatever state the question has right now.
       if (this.closed || options.signal?.aborted || Date.now() >= deadline) return question
-      await this.pause(Math.min(WAIT_POLL_MS, Math.max(0, deadline - Date.now())), options.signal)
+      // Both signals end the sleep at once: the caller's own, and the one close() aborts.
+      await this.pause(Math.min(WAIT_POLL_MS, Math.max(0, deadline - Date.now())), options.signal, this.closing.signal)
     }
   }
 
-  // A sleep that always clears its timer, so a wait can never hold the process open.
-  private pause(ms: number, signal?: AbortSignal): Promise<void> {
+  // A sleep that always clears its timer and detaches its listeners, so a wait can never hold the
+  // process open and never outlives the service.
+  private pause(ms: number, ...signals: Array<AbortSignal | undefined>): Promise<void> {
+    const attached = signals.filter((signal): signal is AbortSignal => signal !== undefined)
     return new Promise<void>((resolve) => {
       const timer = setTimeout(done, ms)
-      const onAbort = () => done()
       function done(): void {
         clearTimeout(timer)
-        signal?.removeEventListener('abort', onAbort)
+        for (const signal of attached) signal.removeEventListener('abort', done)
         resolve()
       }
-      signal?.addEventListener('abort', onAbort, { once: true })
+      for (const signal of attached) signal.addEventListener('abort', done, { once: true })
     })
   }
 ```
@@ -2392,7 +2503,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { encodeLink, getContact, openStore, setProfile } from '@agentbridge/core'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { startFakeBoard, type FakeBoard } from '../../core/test/support/fake-board'
+import { plainSocketFactory, startFakeBoard, type FakeBoard } from '../../core/test/support/fake-board'
 import { testIdentity } from '../../core/test/support/keys'
 import { connect, link } from '../src/commands/connect'
 import { memoryOutput, type CliContext } from '../src/context'
@@ -2422,7 +2533,7 @@ async function seedHome(): Promise<void> {
 beforeEach(async () => {
   board = await startFakeBoard()
   await seedHome()
-  ctx = { home, out: memoryOutput(), env: {}, relayPolicy: allowAnyRelay } as CliContext & { out: ReturnType<typeof memoryOutput> }
+  ctx = { home, out: memoryOutput(), env: {}, relayPolicy: allowAnyRelay, createSocket: plainSocketFactory } as CliContext & { out: ReturnType<typeof memoryOutput> }
 })
 
 afterEach(async () => {
@@ -2604,7 +2715,7 @@ import {
   type Store,
 } from '@agentbridge/core'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { startFakeBoard, type FakeBoard } from '../../core/test/support/fake-board'
+import { plainSocketFactory, startFakeBoard, type FakeBoard } from '../../core/test/support/fake-board'
 import { testIdentity } from '../../core/test/support/keys'
 import { approve, contacts, reject, requests, revoke, whoami } from '../src/commands/contacts'
 import { memoryOutput, type CliContext } from '../src/context'
@@ -2636,7 +2747,7 @@ beforeEach(async () => {
   home = join(await mkdtemp(join(tmpdir(), 'ab-contacts-')), 'home')
   await withStore((store) => setProfile(store, { name: 'Yo', relays: [board.url], now: T0 }))
   await writeFile(join(home, 'identity.json'), JSON.stringify({ version: 1, secretKey: Buffer.from(me.secretKey).toString('hex') }), { mode: 0o600 })
-  ctx = { home, out: memoryOutput(), env: {}, relayPolicy: allowAnyRelay } as CliContext & { out: ReturnType<typeof memoryOutput> }
+  ctx = { home, out: memoryOutput(), env: {}, relayPolicy: allowAnyRelay, createSocket: plainSocketFactory } as CliContext & { out: ReturnType<typeof memoryOutput> }
 })
 
 afterEach(async () => {
@@ -2953,7 +3064,7 @@ import {
   type Store,
 } from '@agentbridge/core'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { startFakeBoard, type FakeBoard } from '../../core/test/support/fake-board'
+import { plainSocketFactory, startFakeBoard, type FakeBoard } from '../../core/test/support/fake-board'
 import { testIdentity } from '../../core/test/support/keys'
 import { ask, ticket } from '../src/commands/ask'
 import { memoryOutput, type CliContext } from '../src/context'
@@ -2988,7 +3099,7 @@ beforeEach(async () => {
     applyApproval(store, { pubkey: ana.publicKey, requestId: uuid(1), generation: 1, name: 'Ana', relays: [board.url], now: T0 })
   })
   await writeFile(join(home, 'identity.json'), JSON.stringify({ version: 1, secretKey: Buffer.from(me.secretKey).toString('hex') }), { mode: 0o600 })
-  ctx = { home, out: memoryOutput(), env: {}, relayPolicy: allowAnyRelay } as CliContext & { out: ReturnType<typeof memoryOutput> }
+  ctx = { home, out: memoryOutput(), env: {}, relayPolicy: allowAnyRelay, createSocket: plainSocketFactory } as CliContext & { out: ReturnType<typeof memoryOutput> }
 })
 
 afterEach(async () => {
@@ -3230,6 +3341,14 @@ describe('the asker MCP server', () => {
     const asked = listOutboundQuestions(store)[0]!
     expect(text).toContain(asked.questionId)
     expect(asked.text).toBe('¿cómo se despliega?')
+    expect(text).toMatch(/enviada|pendiente de envío/)
+  })
+
+  it('says a question is only saved when no relay took it', async () => {
+    approved()
+    await board.close() // every relay is gone before the tool runs
+    const { text } = await call('ask_contact', { contact: 'ana', question: '¿hay alguien?' })
+    expect(text).toMatch(/pendiente de envío/)
   })
 
   it('refuses a blank question without sending anything', async () => {
@@ -3369,8 +3488,14 @@ export function createAskerServer(service: AskerService, options: { version?: st
           const args = AskArgs.parse(req.params.arguments ?? {})
           const question = await service.ask(args.contact, args.question)
           await service.sync()
+          // Same honesty as the CLI: `sending` means no relay has taken it yet.
+          const stored = service.question(question.questionId)
+          const headline =
+            stored.state === 'sending'
+              ? `Pregunta guardada para ${args.contact}, pendiente de envío: ningún tablero la aceptó todavía.`
+              : `Pregunta enviada a ${args.contact}.`
           return ok(
-            `Pregunta enviada a ${args.contact}. question_id: ${question.questionId}\n` +
+            `${headline} question_id: ${question.questionId}\n` +
               'Llama check_answer con ese question_id. Si esa persona tiene su computadora apagada, la pregunta la espera hasta una semana.',
           )
         }
@@ -3923,9 +4048,19 @@ afterEach(async () => {
 })
 
 // Ana's side, without running her channel: seal a message to Beto and drop it on the board.
-async function anaSends(board: { inject(event: unknown): void }, message: Message, sender = ana): Promise<void> {
-  const rumor = createRumor(message, sender, nowSeconds())
-  board.inject(await wrapRumor(rumor, sender, beto.publicKey, { now: nowSeconds() }) as never)
+//
+// `createdAt` matters. Tests that move a fake clock forward (the retry ones below) must date what
+// Ana sends with that same clock: a rumor stamped with real wall-clock time would look ancient — or
+// impossibly future — to a receiver whose clock is 2_000_000_000, and the receive pipeline would
+// drop it. The wrap itself is always dated with the real clock, because that is what a relay sees.
+async function anaSends(
+  board: { inject(event: unknown): void },
+  message: Message,
+  sender = ana,
+  createdAt = nowSeconds(),
+): Promise<void> {
+  const rumor = createRumor(message, sender, createdAt)
+  board.inject((await wrapRumor(rumor, sender, beto.publicKey, { now: nowSeconds() })) as never)
 }
 
 async function askerWithApproval(clock?: { now: number }) {
@@ -4068,6 +4203,35 @@ describe('permission changes', () => {
   }, 60_000)
 })
 
+describe('recovery through retries', () => {
+  it('recovers a decision that was lost on its way, because the question keeps retrying', async () => {
+    const clock = { now: 2_000_000_000 }
+    const { board, asker } = await askerWithApproval(clock)
+    const question = await asker.service.ask('ana', '¿me contestas?')
+    await asker.sync()
+
+    // Ana acknowledges, and then her answer is lost on every relay: nothing of it reaches Beto.
+    await anaSends(board, { v: 1, type: 'receipt', questionId: question.questionId }, ana, clock.now)
+    await until(async () => {
+      await asker.sync()
+      return getOutboundQuestion(asker.store, ana.publicKey, question.questionId)?.state === 'received'
+    })
+
+    // The receipt did not stop the retries, so the question goes out again five minutes later…
+    const before = board.events.filter((event) => event.kind === 1059).length
+    clock.now += NOSTR.retryFirstHourIntervalSeconds
+    await asker.sync()
+    expect(board.events.filter((event) => event.kind === 1059).length).toBeGreaterThan(before)
+
+    // …and this time Ana's regenerated answer gets through.
+    await anaSends(board, { v: 1, type: 'answer', questionId: question.questionId, text: 'aquí está', source: 'chat', confidence: 'seguro' }, ana, clock.now)
+    await until(async () => {
+      await asker.sync()
+      return getOutboundQuestion(asker.store, ana.publicKey, question.questionId)?.state === 'answered'
+    })
+  }, 90_000)
+})
+
 describe('time', () => {
   it('gives up on a question after the retry window and says so', async () => {
     const clock = { now: 2_000_000_000 }
@@ -4113,7 +4277,7 @@ describe('time', () => {
     const { board, asker } = await askerWithApproval(clock)
     const question = await asker.service.ask('ana', '¿ya?')
     await asker.sync()
-    await anaSends(board, { v: 1, type: 'answer', questionId: question.questionId, text: 'ya', source: 'chat', confidence: 'seguro' })
+    await anaSends(board, { v: 1, type: 'answer', questionId: question.questionId, text: 'ya', source: 'chat', confidence: 'seguro' }, ana, clock.now)
     await until(async () => {
       await asker.sync()
       return getOutboundQuestion(asker.store, ana.publicKey, question.questionId)?.state === 'answered'
@@ -4187,9 +4351,9 @@ git commit -m "test: asker scenarios for losses, rejections, revocation and expi
 **Interfaces:**
 - Consumes: the CLI's built bundle (`packages/cli/dist/main.js`, built by `node scripts/build.mjs`), `openStore`, `loadOrCreateIdentity`, the asker harness.
 - Produces: nothing new. This task proves the spec's multi-process requirements that belong to the asker:
-  - the MCP server and a CLI command update the same question and claim the same outbox row without either losing work;
-  - two `setup`-style identity creations at the same time produce one identity, never two;
-  - a CLI command always ends, even when a relay is slow or dead;
+  - a real `agentbridge mcp` process and a real CLI command update the same question and claim the same outbox row without either losing work, and the question goes out exactly once;
+  - two `setup`-style identity creations **in two processes** produce one identity, never two;
+  - a CLI command always ends against a board that connects and then answers nothing;
   - the MCP server exits when Claude Code closes its stdin, even with relay sockets open.
 
 - [ ] **Step 1: Write the tests**
@@ -4211,7 +4375,6 @@ import {
   getOutboundQuestion,
   listOutboundQuestions,
   loadOrCreateIdentity,
-  markSentQuestions,
   nowSeconds,
   openStore,
   setProfile,
@@ -4248,48 +4411,101 @@ async function seedHome(board: { url: string }): Promise<string> {
   return home
 }
 
-describe('a CLI command and a running MCP server share one home', () => {
-  it('both see the same question, and only one of them publishes it', async () => {
+// Runs a command as a real child process *without* blocking this one. `execFileSync` would freeze
+// the event loop of the process that hosts the fake board, so nothing could answer the child — the
+// test would prove the opposite of concurrency.
+function runCli(args: string[], home: string): Promise<{ code: number | null; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [cli, ...args], {
+      cwd: root,
+      env: { ...process.env, AGENTBRIDGE_HOME: home },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stderr = ''
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk)
+    })
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL')
+      reject(new Error(`the CLI did not finish: ${args.join(' ')}`))
+    }, 60_000)
+    child.once('error', reject)
+    child.once('exit', (code) => {
+      clearTimeout(timer)
+      resolve({ code, stderr })
+    })
+  })
+}
+
+describe('a real MCP server and a real CLI command on one home', () => {
+  it('publish the question exactly once between them, with no claim left behind', async () => {
     const board = await startFakeBoard()
     cleanups.push(() => board.close())
     const home = await seedHome(board)
 
-    // The persistent side: a live asker service, like the MCP server.
-    const persistent = await startAsker({ identity: beto, relays: [board.url], cleanups, home })
-    persistent.service.start()
-
-    // The other side: a real CLI process, asking a question against the same home.
-    execFileSync(process.execPath, [cli, 'ask', 'ana', '¿quién publica esto?', '--no-wait'], {
+    // The persistent side is the real thing: `agentbridge mcp` in its own process, holding the live
+    // subscription and running the retries.
+    const server = spawn(process.execPath, [cli, 'mcp'], {
       cwd: root,
       env: { ...process.env, AGENTBRIDGE_HOME: home },
-      stdio: 'pipe',
-      timeout: 60_000,
+      stdio: ['pipe', 'pipe', 'pipe'],
     })
+    cleanups.push(async () => {
+      if (server.exitCode === null) server.kill('SIGKILL')
+    })
+    await until(() => board.frames.some((frame) => frame[0] === 'REQ'), 30_000, 'the MCP server to subscribe')
+
+    // …while a CLI process asks a question against the same home.
+    const { code } = await runCli(['ask', 'ana', '¿quién publica esto?', '--no-wait'], home)
+    expect(code).toBe(0)
 
     const store = await openStore(home)
     cleanups.push(async () => store.close())
     const asked = listOutboundQuestions(store)[0]!
     expect(asked.text).toBe('¿quién publica esto?')
 
-    // Exactly one wrap for that question reaches the board, no matter which process sent it.
-    await until(() => board.events.length >= 1, 30_000, 'the question to reach the board')
-    markSentQuestions(store, nowSeconds())
+    const wrapsForQuestion = () => board.events.filter((event) => event.kind === 1059).length
+    await until(() => wrapsForQuestion() >= 1, 30_000, 'the question to reach the board')
+    // Exactly one: the claim is what stops both processes from publishing it, and the first retry is
+    // five minutes away, so a second wrap here would mean the claim failed.
+    await new Promise((resolve) => setTimeout(resolve, 2_000))
+    expect(wrapsForQuestion()).toBe(1)
+
+    // Nobody had to be told: the state moves to `sent` on its own (the publisher's hook, P1), and no
+    // claim is left behind by either process.
     await until(() => getOutboundQuestion(store, ana.publicKey, asked.questionId)?.state === 'sent', 30_000, 'the question to be marked sent')
-    const wraps = board.events.filter((event) => event.kind === 1059)
-    expect(wraps.length).toBeGreaterThanOrEqual(1)
-    // The outbox row is claimed by one owner at a time, so no row is left claimed by a dead owner.
-    const claimed = store.db.prepare('SELECT count(*) AS n FROM outbox WHERE claimed_by IS NOT NULL').get() as { n: number }
-    expect(claimed.n).toBeLessThanOrEqual(1)
+    expect(store.db.prepare('SELECT count(*) AS n FROM outbox WHERE claimed_by IS NOT NULL').get()).toMatchObject({ n: 0 })
   }, 180_000)
 })
 
 describe('two identity creations at once', () => {
-  it('ends with exactly one identity, and both callers see the same key', async () => {
+  it('ends with exactly one identity, from two separate processes', async () => {
     const home = join(await mkdtemp(join(tmpdir(), 'ab-identity-race-')), 'home')
-    const both = await Promise.all([loadOrCreateIdentity(home), loadOrCreateIdentity(home)])
-    expect(both[0]!.identity.publicKey).toBe(both[1]!.identity.publicKey)
-    expect([both[0]!.created, both[1]!.created].filter(Boolean)).toHaveLength(1)
-  })
+    // Two real processes, started together: one wins the link(2) that creates identity.json and the
+    // other finds it. Doing this in one process would prove nothing about the file-level race.
+    const script = [
+      `const { loadOrCreateIdentity } = await import(${JSON.stringify(join(root, 'packages/core/src/identity.ts'))})`,
+      'const { identity, created } = await loadOrCreateIdentity(process.argv[2])',
+      'process.stdout.write(JSON.stringify({ publicKey: identity.publicKey, created }))',
+    ].join('\n')
+    const run = () =>
+      new Promise<{ publicKey: string; created: boolean }>((resolve, reject) => {
+        const child = spawn('npx', ['tsx', '--eval', script, home], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] })
+        let out = ''
+        let err = ''
+        child.stdout.on('data', (chunk) => {
+          out += String(chunk)
+        })
+        child.stderr.on('data', (chunk) => {
+          err += String(chunk)
+        })
+        child.once('error', reject)
+        child.once('exit', (code) => (code === 0 ? resolve(JSON.parse(out) as { publicKey: string; created: boolean }) : reject(new Error(err))))
+      })
+    const both = await Promise.all([run(), run()])
+    expect(both[0]!.publicKey).toBe(both[1]!.publicKey)
+    expect(both.filter((one) => one.created)).toHaveLength(1)
+  }, 120_000)
 })
 
 describe('the MCP server', () => {
@@ -4320,28 +4536,28 @@ describe('the MCP server', () => {
 })
 
 describe('a command always ends', () => {
-  it('finishes even when the relay never answers', async () => {
-    const board = await startFakeBoard({ slow: true })
+  it('finishes even against a board that connects and then says nothing', async () => {
+    // `goSilent()` only affects sessions that are already open, so it cannot silence a process that
+    // has not started yet. `silentToNewSessions` (added to the fake board in Task 5) is the control
+    // this needs: every session opened from now on accepts the connection and answers nothing.
+    const board = await startFakeBoard({ silentToNewSessions: true })
     cleanups.push(() => board.close())
     const home = await seedHome(board)
-    board.goSilent()
 
     const started = Date.now()
-    execFileSync(process.execPath, [cli, 'contacts'], {
-      cwd: root,
-      env: { ...process.env, AGENTBRIDGE_HOME: home },
-      stdio: 'pipe',
-      timeout: 90_000,
-    })
-    // Two syncs of at most 10 s each, plus process start-up. The margin is the contractual budget
-    // (20 s of network) plus 20 s for a cold Node start on a loaded machine — well under the 90 s
-    // timeout above, and tight enough to fail if a sync ever waits for a pool timeout instead.
+    const { code } = await runCli(['contacts'], home)
+    expect(code).toBe(0)
+    // Two syncs of at most 10 s each, plus a cold Node start: 40 s is the contractual budget plus a
+    // generous margin, and tight enough to fail if a sync ever waits for a pool timeout instead of
+    // its own deadline.
     expect(Date.now() - started).toBeLessThan(40_000)
+    // …and it really did reach that board, instead of failing early for some unrelated reason.
+    expect(board.frames.length).toBeGreaterThan(0)
   }, 120_000)
 })
 ```
 
-> `startFakeBoard({ slow: true })` uses whatever option plan 1's fake board exposes for a relay that answers slowly; if the option has another name, use that one and say so in the report. `goSilent()` already exists.
+> `silentToNewSessions` is the fake-board control Task 5 adds. If it landed there under another name, use that one and say so in the report.
 
 - [ ] **Step 2: Run them**
 
@@ -4425,6 +4641,6 @@ Write the evidence into the task report: both suite runs, the bundle output, the
   - the persistence-failure tests (read-only database, simulated full disk) and the 24-hour acceptance run before Render is switched off (plan 4);
   - the paid-switch decision the user asked to make before releasing 0.2 (plan 4, see the project's memory note).
 - **Carried notes:**
-  - `docs/known-gaps.md` now holds the four verified 0.2 gaps: Linux clock steps versus the channel lock, a message that always fails to store blocking a relay's history cursor, an answer's outbox copy outliving the question's inbox copy by up to ~14 days, and an approved contact's relays not being updatable by protocol. The fourth one bites the asker hardest: plan 4 should decide whether `connect` to an already-approved contact refreshes the relays, or whether the person is told to revoke and re-request.
+  - `docs/known-gaps.md` now holds the four verified 0.2 gaps: Linux clock steps versus the channel lock, a message that always fails to store blocking a relay's history cursor, an answer's outbox copy outliving the question's inbox copy by up to ~14 days, and an approved contact's relays not being updatable by protocol. On that fourth one, plan 4 has one job: **say so in the documentation**. An `agentbridge:` link is unsigned data, so it can never replace the relays of an already-approved contact — the spec only accepts an authenticated message whose generation exceeds the maximum observed. Until a future version defines such a message, the honest instruction is: revoke and ask again.
   - `AskerService.question()` scans each outbound contact for an exact id before falling back to a prefix search. With hundreds of contacts that is a linear scan per lookup; it is fine for the pilot and worth an index if plan 4's `doctor` ever lists questions.
   - The MCP server's `check_answer` holds one wait at a time per call, up to `LIMITS.longPollMaxSeconds`. Two Claude sessions against one home are two processes: the multi-process test covers the store, not the MCP transport.
