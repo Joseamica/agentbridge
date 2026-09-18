@@ -4252,9 +4252,22 @@ describe('permission changes', () => {
   }, 60_000)
 
   it('ignores a revocation older than the approval it already has', async () => {
-    const { board, asker } = await askerWithApproval()
-    // Ana approved again with a newer generation, and only then an old revocation arrives.
-    applyApproval(asker.store, { pubkey: ana.publicKey, requestId: uuid(1), generation: 5, name: 'Ana', relays: [board.url], now: nowSeconds() })
+    const { board, asker, clock } = await askerWithApproval()
+    // A second approval only applies to a *pending* request, so reaching a higher generation means
+    // living the real sequence: revoke, ask again, approve again.
+    await anaSends(board, { v: 1, type: 'connect_revoked', generation: 2 }, ana, clock.now)
+    await until(async () => {
+      await asker.sync()
+      return getContact(asker.store, ana.publicKey, 'outbound')?.state === 'revoked'
+    })
+    createOutboundRequest(asker.store, { pubkey: ana.publicKey, requestId: uuid(3), relays: [board.url], now: clock.now })
+    await anaSends(board, { v: 1, type: 'connect_approved', requestId: uuid(3), generation: 5, name: 'Ana', relays: [board.url] }, ana, clock.now)
+    await until(async () => {
+      await asker.sync()
+      return getContact(asker.store, ana.publicKey, 'outbound')?.generation === 5
+    })
+
+    // Now the late revocation of an older generation arrives and changes nothing.
     await anaSends(board, { v: 1, type: 'connect_revoked', generation: 3 }, ana, clock.now)
     await asker.sync()
     await asker.sync()
