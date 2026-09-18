@@ -14,8 +14,15 @@ export function responderMessageHandler(actions: ResponderMessageActions): (open
     const sender = opened.senderPubkey.slice(0, 8)
     if (outcome.kind === 'question') {
       if (outcome.outcome.kind === 'queued') actions.wakeDispatcher()
-      if (outcome.outcome.kind === 'dropped' && outcome.outcome.reason === 'conflict' && opened.message.type === 'question') {
-        actions.log(`dropped a question that reuses question id ${opened.message.questionId} with different content (sender ${sender})`)
+      if (outcome.outcome.kind === 'dropped' && opened.message.type === 'question') {
+        const { reason } = outcome.outcome
+        if (reason === 'conflict') {
+          actions.log(`dropped a question that reuses question id ${opened.message.questionId} with different content (sender ${sender})`)
+        } else if (reason === 'abandoned') {
+          actions.log(`dropped question ${opened.message.questionId} (sender ${sender}): a stored decision could no longer be sent`)
+        } else if (reason === 'no_relays') {
+          actions.log(`dropped question ${opened.message.questionId} (sender ${sender}): the contact has no usable relays`)
+        }
       }
       return
     }

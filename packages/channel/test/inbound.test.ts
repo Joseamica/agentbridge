@@ -39,6 +39,17 @@ describe('responderMessageHandler', () => {
     expect(calls.join(' ')).not.toMatch(/privad/i)
   })
 
+  it('logs a dropped question with identifiers only when a decision could not be resent or a contact has no relays', () => {
+    const { calls, handle } = recorder()
+    handle(question, { kind: 'question', outcome: { kind: 'dropped', reason: 'abandoned' } })
+    handle(question, { kind: 'question', outcome: { kind: 'dropped', reason: 'no_relays' } })
+    expect(calls).toEqual([
+      'dropped question 00000000-0000-4000-8000-000000000001 (sender abababab): a stored decision could no longer be sent',
+      'dropped question 00000000-0000-4000-8000-000000000001 (sender abababab): the contact has no usable relays',
+    ])
+    expect(calls.join(' ')).not.toMatch(/privad/i)
+  })
+
   it('does nothing for every other outcome', () => {
     const { calls, handle } = recorder()
     handle(question, { kind: 'question', outcome: { kind: 'regenerated' } })
