@@ -1,4 +1,4 @@
-import { writeConfig } from '@agentbridge/core'
+import { loadOrCreateIdentity, nowSeconds, openStore, setProfile } from '@agentbridge/core'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { execFileSync } from 'node:child_process'
@@ -17,7 +17,11 @@ beforeAll(() => {
 describe('plugin bundle', () => {
   it('starts over stdio with no repository dependencies and lists the reply tool', async () => {
     const home = await mkdtemp(join(tmpdir(), 'ab-bundle-'))
-    await writeConfig({ relayUrl: 'http://127.0.0.1:9', deviceToken: 't'.repeat(43), handle: 'dev', displayName: 'Dev' }, home)
+    await loadOrCreateIdentity(home)
+    const store = await openStore(home)
+    // A valid relay address that can never resolve (RFC 6761), so this smoke test stays offline.
+    setProfile(store, { name: 'Prueba', relays: ['wss://relay.invalid'], now: nowSeconds() })
+    store.close()
     const transport = new StdioClientTransport({
       command: 'node',
       args: [bundle],
@@ -33,7 +37,7 @@ describe('plugin bundle', () => {
     await client.close()
   })
 
-  it('exits with a clear message when the device is not enrolled', async () => {
+  it('exits with a clear message when this computer has no identity yet', async () => {
     const home = await mkdtemp(join(tmpdir(), 'ab-empty-'))
     let stderr = ''
     try {
@@ -41,6 +45,6 @@ describe('plugin bundle', () => {
     } catch (err) {
       stderr = String((err as { stderr?: Buffer }).stderr)
     }
-    expect(stderr).toContain('agentbridge enroll')
+    expect(stderr).toContain('setup')
   })
 })

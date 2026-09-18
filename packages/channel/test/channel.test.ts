@@ -1,76 +1,58 @@
+import type { AnswerOutcome } from '@agentbridge/core'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { beforeEach, describe, expect, it } from 'vitest'
-import { createChannelServer } from '../src/channel'
-import type { AnswerPayload, CancelMessage, QuestionMessage, RelayConnection } from '../src/relay-client'
-
-class FakeRelay implements RelayConnection {
-  answers: AnswerPayload[] = []
-  result: 'accepted' | 'rejected' = 'accepted'
-  private q: ((m: QuestionMessage) => void)[] = []
-  private c: ((m: CancelMessage) => void)[] = []
-  private d: (() => void)[] = []
-  onQuestion(fn: (m: QuestionMessage) => void) {
-    this.q.push(fn)
-  }
-  onCancel(fn: (m: CancelMessage) => void) {
-    this.c.push(fn)
-  }
-  onDisconnect(fn: () => void) {
-    this.d.push(fn)
-  }
-  async sendAnswer(a: AnswerPayload) {
-    this.answers.push(a)
-    return this.result
-  }
-  question(code: string, attemptId = `3b241101-e2bb-4255-8caf-4136c566a9${code === 'BBBB' ? '63' : '62'}`) {
-    const m: QuestionMessage = { type: 'question', attemptId, code, from: { handle: 'amieva', displayName: 'Amieva' }, question: '¿Ya quedó el fix?' }
-    this.q.forEach((fn) => fn(m))
-    return m
-  }
-  cancel(attemptId: string) {
-    this.c.forEach((fn) => fn({ type: 'cancel', attemptId, reason: 'timeout' }))
-  }
-  disconnect() {
-    this.d.forEach((fn) => fn())
-  }
-}
+import { CHANNEL_INSTRUCTIONS, createChannelServer, replyResult } from '../src/channel'
+import type { ReplyArgs } from '../src/dispatcher'
 
 type Note = { method: string; params?: { content?: string; meta?: Record<string, string> } }
 
-async function until(check: () => boolean, ms = 2000) {
-  const start = Date.now()
-  while (!check()) {
-    if (Date.now() - start > ms) throw new Error('timeout waiting for condition')
-    await new Promise((r) => setTimeout(r, 10))
-  }
-}
-
-let relay: FakeRelay
+let calls: ReplyArgs[]
+let nextOutcome: AnswerOutcome
+let failWith: Error | null
+let logs: string[]
 let client: Client
 let notes: Note[]
-
-const reply = (args: Record<string, unknown>) => client.callTool({ name: 'reply', arguments: args })
-const textOf = (r: Awaited<ReturnType<typeof reply>>) => (r.content as { text: string }[])[0]!.text
+let channel: ReturnType<typeof createChannelServer>
 
 beforeEach(async () => {
-  relay = new FakeRelay()
-  const { server } = createChannelServer(relay)
+  calls = []
+  nextOutcome = { kind: 'answered', fromName: 'beto', code: 'ABCD' }
+  failWith = null
+  logs = []
+  channel = createChannelServer(
+    {
+      reply: (args) => {
+        calls.push(args)
+        if (failWith) throw failWith
+        return nextOutcome
+      },
+    },
+    { log: (line) => logs.push(line) },
+  )
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
   client = new Client({ name: 'fake-claude', version: '0.0.0' })
   notes = []
   client.fallbackNotificationHandler = async (n) => {
     notes.push(n as Note)
   }
-  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)])
+  await Promise.all([channel.server.connect(serverTransport), client.connect(clientTransport)])
 })
 
+const reply = (args: Record<string, unknown>) => client.callTool({ name: 'reply', arguments: args })
+const textOf = (r: Awaited<ReturnType<typeof reply>>) => (r.content as { text: string }[])[0]!.text
+const until = async (check: () => boolean) => {
+  for (let i = 0; i < 200 && !check(); i++) await new Promise((resolve) => setTimeout(resolve, 10))
+  expect(check()).toBe(true)
+}
+
 describe('channel MCP server', () => {
-  it('declares the channel capability without permission relay and explains the reply tool', () => {
-    const caps = client.getServerCapabilities()
-    expect(caps?.experimental?.['claude/channel']).toEqual({})
-    expect(caps?.experimental?.['claude/channel/permission']).toBeUndefined()
-    expect(client.getInstructions()).toContain('reply')
+  it('declares the channel capability and explains the reply tool and the tag format', () => {
+    expect(client.getServerCapabilities()?.experimental?.['claude/channel']).toEqual({})
+    expect(client.getServerCapabilities()?.experimental?.['claude/channel/permission']).toBeUndefined()
+    expect(client.getInstructions()).toBe(CHANNEL_INSTRUCTIONS)
+    expect(CHANNEL_INSTRUCTIONS).toContain('from_name')
+    expect(CHANNEL_INSTRUCTIONS).toContain('reply')
   })
 
   it('exposes only the reply tool', async () => {
@@ -78,69 +60,66 @@ describe('channel MCP server', () => {
     expect(tools.map((t) => t.name)).toEqual(['reply'])
   })
 
-  it('pushes a question into the session with identifier-only meta keys', async () => {
-    relay.question('Q7K2')
-    await until(() => notes.length === 1)
-    // Note: SDK 1.30.0 delivers the raw JSON-RPC envelope (adds `jsonrpc: "2.0"`) to
-    // fallbackNotificationHandler, so we assert on method/params rather than the whole object.
-    expect(notes[0]!.method).toBe('notifications/claude/channel')
-    expect(notes[0]!.params).toEqual({ content: '¿Ya quedó el fix?', meta: { code: 'Q7K2', from_handle: 'amieva', from_name: 'Amieva' } })
-    for (const key of Object.keys(notes[0]!.params!.meta!)) expect(key).toMatch(/^[A-Za-z0-9_]+$/)
-  })
-
-  it('rejects a mistyped code, names the active code and sends nothing', async () => {
-    relay.question('Q7K2')
-    const r = await reply({ code: 'Q7KK', answer: 'sí', source: 'CHANGELOG.md', confidence: 'seguro' })
-    expect(r.isError).toBe(true)
-    expect(textOf(r)).toContain('Q7K2')
-    expect(relay.answers).toHaveLength(0)
-  })
-
-  it('delivers the answer with the real attempt and code when the code matches', async () => {
-    const q = relay.question('Q7K2')
-    const r = await reply({ code: ' q7k2', answer: 'Sí, v3.4.2', source: 'CHANGELOG.md', confidence: 'seguro' })
-    expect(r.isError).toBeFalsy()
-    expect(textOf(r)).toBe('Respuesta entregada a Amieva.')
-    expect(relay.answers).toEqual([{ attemptId: q.attemptId, code: 'Q7K2', text: 'Sí, v3.4.2', source: 'CHANGELOG.md', confidence: 'seguro' }])
-  })
-
-  it('announces a cancellation and refuses a late answer to it', async () => {
-    const q = relay.question('AAAA')
-    relay.cancel(q.attemptId)
+  it('pushes a question with its code and sender name, and a cancellation', async () => {
+    await channel.deliverQuestion({ code: 'ABCD', fromName: 'beto', text: '¿Ya quedó el fix?' })
+    await channel.cancelQuestion('ABCD', 'revoked')
     await until(() => notes.length === 2)
-    expect(notes[1]!.params!.meta).toEqual({ code: 'AAAA', event: 'cancelled' })
-    relay.question('BBBB')
-    const r = await reply({ code: 'AAAA', answer: 'tarde', source: 'x', confidence: 'creo' })
-    expect(r.isError).toBe(true)
-    expect(textOf(r)).toContain('cancelada')
-    expect(relay.answers).toHaveLength(0)
+    expect(notes[0]).toMatchObject({ method: 'notifications/claude/channel', params: { content: '¿Ya quedó el fix?', meta: { code: 'ABCD', from_name: 'beto' } } })
+    expect(notes[1]!.params?.meta).toEqual({ code: 'ABCD', event: 'cancelled' })
+    expect(notes[1]!.params?.content).toMatch(/ABCD.*No la contestes/)
   })
 
-  it('treats the active question as cancelled when the relay connection drops', async () => {
-    relay.question('AAAA')
-    relay.disconnect()
-    await until(() => notes.length === 2)
-    const r = await reply({ code: 'AAAA', answer: 'x', source: 'y', confidence: 'creo' })
-    expect(textOf(r)).toContain('cancelada')
+  it('passes valid arguments to the backend and says the answer is saved and on its way', async () => {
+    const result = await reply({ code: 'abcd', answer: ' Sí, el viernes. ', source: 'plan.md', confidence: 'creo' })
+    expect(calls).toEqual([{ code: 'abcd', answer: 'Sí, el viernes.', source: 'plan.md', confidence: 'creo' }])
+    expect(result.isError).toBeFalsy()
+    expect(textOf(result)).toMatch(/guardada/)
+    expect(textOf(result)).toMatch(/beto/)
   })
 
-  it('reports a relay rejection as an error and frees the question', async () => {
-    relay.result = 'rejected'
-    relay.question('AAAA')
-    const r = await reply({ code: 'AAAA', answer: 'x', source: 'y', confidence: 'creo' })
-    expect(r.isError).toBe(true)
-    const again = await reply({ code: 'AAAA', answer: 'x', source: 'y', confidence: 'creo' })
-    expect(textOf(again)).toContain('cancelada')
+  it('rejects invalid arguments without calling the backend', async () => {
+    const result = await reply({ code: 'ABCD', answer: '', source: 'plan.md', confidence: 'tal vez' })
+    expect(result.isError).toBe(true)
+    expect(textOf(result)).toMatch(/answer/)
+    expect(textOf(result)).toMatch(/confidence/)
+    expect(calls).toEqual([])
   })
 
-  it('rejects invalid arguments and replies with no active question', async () => {
-    relay.question('AAAA')
-    const bad = await reply({ code: 'AAAA', answer: 'x', source: 'y', confidence: 'quizá' })
-    expect(bad.isError).toBe(true)
-    expect(textOf(bad)).toBe('Argumentos inválidos en: confidence')
-    await reply({ code: 'AAAA', answer: 'x', source: 'y', confidence: 'creo' })
-    const none = await reply({ code: 'CCCC', answer: 'x', source: 'y', confidence: 'creo' })
-    expect(none.isError).toBe(true)
-    expect(textOf(none)).toContain('No hay ninguna pregunta activa')
+  it('turns an unexpected backend error into a generic tool error that does not repeat the error text', async () => {
+    failWith = new Error('disk I/O error near PRIVATE_DECRYPTED_CANARY')
+    const result = await reply({ code: 'ABCD', answer: 'x', source: 'y', confidence: 'seguro' })
+    expect(result.isError).toBe(true)
+    expect(textOf(result)).toMatch(/error interno/)
+    expect(textOf(result)).not.toContain('PRIVATE_DECRYPTED_CANARY')
+    expect(logs).toEqual(['reply failed (Error)'])
+  })
+
+  it('turns every refusal into a Spanish tool error', async () => {
+    nextOutcome = { kind: 'wrong_code', activeCode: 'WXYZ' }
+    const wrong = await reply({ code: 'ABCD', answer: 'x', source: 'y', confidence: 'seguro' })
+    expect(wrong.isError).toBe(true)
+    expect(textOf(wrong)).toMatch(/WXYZ/)
+  })
+})
+
+describe('replyResult', () => {
+  it('has a message for every outcome, and only an answer is not an error', () => {
+    const outcomes: AnswerOutcome[] = [
+      { kind: 'answered', fromName: 'beto', code: 'ABCD' },
+      { kind: 'no_active' },
+      { kind: 'wrong_code', activeCode: 'WXYZ' },
+      { kind: 'cancelled', activeCode: null },
+      { kind: 'cancelled', activeCode: 'WXYZ' },
+      { kind: 'late' },
+      { kind: 'revoked' },
+      { kind: 'too_large' },
+      { kind: 'fenced' },
+    ]
+    for (const outcome of outcomes) {
+      const result = replyResult(outcome, 'ABCD')
+      expect(result.text.length).toBeGreaterThan(10)
+      expect(result.isError).toBe(outcome.kind !== 'answered')
+    }
+    expect(replyResult({ kind: 'cancelled', activeCode: 'WXYZ' }, 'abcd').text).toMatch(/ABCD[\s\S]*WXYZ/)
   })
 })
