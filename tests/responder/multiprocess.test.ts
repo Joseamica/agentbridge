@@ -74,8 +74,10 @@ async function startBundledChannel(home: string): Promise<Client> {
   })
   const client = new Client({ name: 'fake-claude', version: '0.0.0' })
   await client.connect(transport)
-  await client.listTools()
+  // Registered for cleanup as soon as the transport is live: a listTools() rejection below must
+  // still leave the bundled child reachable by afterEach, not orphaned.
   clients.push(client)
+  await client.listTools()
   return client
 }
 
@@ -111,7 +113,9 @@ describe('responder processes', () => {
       // handler releases the lock: the row is never deleted, so it keeps its epoch and its pid drops
       // to 0.
       process.kill(held.pid, 'SIGTERM')
-      await until(() => !isProcessAlive(held), 15_000, 'the first channel to end')
+      // A slower poll: isProcessAlive shells out to `ps`, and the default 25 ms interval would spawn
+      // hundreds of them over a 15 s wait for no benefit here.
+      await until(() => !isProcessAlive(held), 15_000, 'the first channel to end', 200)
       expect(store.db.prepare('SELECT pid, process_start, epoch FROM channel_lock WHERE id = 1').get()).toEqual({
         pid: 0,
         process_start: '',
@@ -129,7 +133,12 @@ describe('responder processes', () => {
     await seedHome(home)
 
     const channel = await startBundledChannel(home)
-    void channel
+    // Captured from connect: the dispatcher only ever logs this exact line from its own fence()
+    // path, so finding it on stderr (rather than merely finding the process dead) rules out an
+    // unrelated startup crash satisfying the same liveness check.
+    let stderr = ''
+    const transport = channel.transport as StdioClientTransport | undefined
+    transport?.stderr?.on('data', (chunk) => (stderr += String(chunk)))
     const store = await openStore(home)
     try {
       const held = getChannelLock(store)
@@ -142,8 +151,10 @@ describe('responder processes', () => {
       if (takeover.kind !== 'acquired') throw new Error('expected the test process to take the lock over')
       expect(takeover).toEqual({ kind: 'acquired', epoch: held.epoch + 1, requeued: 0 })
 
-      await until(() => !isProcessAlive(held), 15_000, 'the fenced channel to exit')
+      // Same reasoning as above: a slower poll avoids hundreds of `ps` spawns over the wait.
+      await until(() => !isProcessAlive(held), 15_000, 'the fenced channel to exit', 200)
 
+      expect(stderr).toContain('another channel took the lock for this identity; stopping')
       expect(store.db.prepare('SELECT pid, process_start, epoch FROM channel_lock WHERE id = 1').get()).toEqual({
         pid: self.pid,
         process_start: self.start,

@@ -40,11 +40,11 @@ export type ChannelNote = { content: string; meta: Record<string, string> }
 
 export const allowAnyRelay = (inputs: readonly unknown[]): string[] => inputs.filter((x): x is string => typeof x === 'string').slice(0, 5)
 
-export async function until(check: () => boolean, ms = 20_000, label = 'a condition'): Promise<void> {
+export async function until(check: () => boolean, ms = 20_000, label = 'a condition', intervalMs = 25): Promise<void> {
   const started = Date.now()
   while (!check()) {
     if (Date.now() - started > ms) throw new Error(`timed out waiting for ${label}`)
-    await new Promise((resolve) => setTimeout(resolve, 25))
+    await new Promise((resolve) => setTimeout(resolve, intervalMs))
   }
 }
 
