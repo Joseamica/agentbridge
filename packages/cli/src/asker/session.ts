@@ -7,6 +7,7 @@ import {
   openStore,
   type Identity,
   type RelayPolicy,
+  type ResponderInboundOutcome,
   type SocketFactory,
   type Store,
 } from '@agentbridge/core'
@@ -35,12 +36,26 @@ export async function openAskerSession(options: {
   } catch (err) {
     throw new CliError(`No se pudo abrir la base de datos en ${home}. Revisa los permisos de esa carpeta.`, { cause: err })
   }
-  const service = new AskerService({ store, identity, now: options.now, createSocket: options.createSocket, log: options.log })
+  let service: AskerService
+  try {
+    service = new AskerService({ store, identity, now: options.now, createSocket: options.createSocket, log: options.log })
+  } catch (err) {
+    // Nothing opened the identity's own store just to leak it because the service's own
+    // construction failed.
+    store.close()
+    throw err
+  }
   return {
     service,
     close: async () => {
-      await service.close()
-      store.close()
+      // The store must close even if closing the service throws — service.close() is written not
+      // to (it swallows the device's own close failures), but the store's own handle must not
+      // depend on that staying true forever.
+      try {
+        await service.close()
+      } finally {
+        store.close()
+      }
     },
   }
 }
@@ -78,7 +93,13 @@ export async function withResponderSession<T>(
     throw new CliError(`Todavía no hay una identidad de AgentBridge en esta computadora. Créala con: ${CLI_COMMAND} setup`)
   }
   const store = await openStore(home, ctx.relayPolicy ? { relayPolicy: ctx.relayPolicy } : {})
-  const device = new Device({ store, identity, role: 'responder', handleMessage: handleResponderMessage, createSocket: ctx.createSocket })
+  let device: Device<ResponderInboundOutcome>
+  try {
+    device = new Device({ store, identity, role: 'responder', handleMessage: handleResponderMessage, createSocket: ctx.createSocket })
+  } catch (err) {
+    store.close()
+    throw err
+  }
   const sync = async () => {
     await device.syncOnce({ maxMs: 10_000 })
   }
@@ -88,7 +109,11 @@ export async function withResponderSession<T>(
     await sync()
     return result
   } finally {
-    await device.close()
-    store.close()
+    // The store must close even if closing the device throws.
+    try {
+      await device.close()
+    } finally {
+      store.close()
+    }
   }
 }

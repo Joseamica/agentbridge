@@ -1,7 +1,9 @@
 import { mkdtemp } from 'node:fs/promises'
+import { createServer, type AddressInfo, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  NOSTR,
   UserFacingError,
   applyApproval,
   createOutboundRequest,
@@ -17,7 +19,7 @@ import {
   type Message,
   type Store,
 } from '@agentbridge/core'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { plainSocketFactory, startFakeBoard, type FakeBoard } from '../../core/test/support/fake-board'
 import { testIdentity } from '../../core/test/support/keys'
 import { AskerService } from '../src/asker/service'
@@ -62,6 +64,42 @@ function received(): Message[] {
     if (opened.ok) messages.push(opened.message)
   }
   return messages
+}
+
+// A relay that accepts a TCP connection and never speaks: the WebSocket handshake never completes,
+// so `BoardConnection.connect()` (registered in the pool's connection map before it is awaited) hangs
+// until something else — the sync's own deadline, or pool.close()'s terminate() loop — ends it. Used
+// to prove that history spending the whole sync deadline does not also starve publishing (I3).
+async function startBlackHole(): Promise<{ url: string; close(): Promise<void> }> {
+  const sockets = new Set<Socket>()
+  const server = createServer((socket) => {
+    sockets.add(socket)
+    socket.on('close', () => sockets.delete(socket))
+    socket.on('error', () => {})
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+  const port = (server.address() as AddressInfo).port
+  return {
+    url: `ws://127.0.0.1:${port}`,
+    close: () =>
+      new Promise<void>((resolve) => {
+        // net.Server#close() waits for every accepted connection to end on its own before its
+        // callback fires — and this test's whole point is a connection that never does. Destroying
+        // each accepted socket first is what lets close() actually resolve.
+        for (const socket of sockets) socket.destroy()
+        server.close(() => resolve())
+      }),
+  }
+}
+
+async function waitFor(predicate: () => boolean, options: { timeoutMs?: number; intervalMs?: number } = {}): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? 5_000
+  const intervalMs = options.intervalMs ?? 20
+  const deadline = Date.now() + timeoutMs
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error('waitFor: condition never became true')
+    await new Promise((resolve) => setTimeout(resolve, intervalMs))
+  }
 }
 
 describe('connect', () => {
@@ -140,5 +178,102 @@ describe('question lookup', () => {
     expect(service.question(asked.questionId.slice(0, 8)).questionId).toBe(asked.questionId)
     expect(() => service.question('00000000-0000-4000-8000-ffffffffffff')).toThrow(UserFacingError)
     expect(() => service.question('abc')).toThrow(UserFacingError)
+  })
+})
+
+describe('sync', () => {
+  function approved(id = uuid(1)): void {
+    createOutboundRequest(store, { pubkey: them.publicKey, requestId: id, relays: [board.url], now: 2_000_000_000 })
+    applyApproval(store, { pubkey: them.publicKey, requestId: id, generation: 1, name: 'Ana', relays: [board.url], now: 2_000_000_000 })
+  }
+
+  // Fix round 1, Critical C1. `this.syncing = this.syncing.then(...)` never runs its callback once
+  // `this.syncing` is rejected — `Promise.prototype.then(onFulfilled)` on a rejected promise just
+  // returns that same rejection — so one failed sync used to leave device.syncOnce, and with it
+  // markSentQuestions/expireOutboundQuestions, permanently unreachable for the rest of the process's
+  // life (P1 and P8 dead until a restart). This proves the chain self-heals: syncOnce is spied to
+  // reject exactly once, and the very next sync() must still call the real implementation.
+  it('recovers after one sync rejects, instead of leaving every later sync stuck on the same failure', async () => {
+    const syncOnceSpy = vi.spyOn(service.device, 'syncOnce').mockRejectedValueOnce(new Error('simulated SQLITE_BUSY'))
+    await expect(service.sync()).rejects.toThrow('simulated SQLITE_BUSY')
+    // If the chain were still poisoned, this would reject with the exact same stale error instead of
+    // actually calling the (now un-mocked) real syncOnce again.
+    await expect(service.sync()).resolves.toMatchObject({ timedOut: false })
+    expect(syncOnceSpy).toHaveBeenCalledTimes(2)
+    syncOnceSpy.mockRestore()
+  })
+
+  // Fix round 1, Important I2 (P1's push half). asker-service.test.ts's original "promotes it to sent
+  // on the next sync" test only proves the state ends up 'sent' after AskerService.sync() returns —
+  // which sync() would still show even with the onPublished hook deleted, because sync()'s own
+  // trailing markSentQuestions() call (and Device.purge()) run regardless. Calling device.syncOnce()
+  // directly bypasses that trailing sweep, isolating whatever the Device's own onPublished wiring
+  // does on its own: the only other place inside a single syncOnce() call that could promote the row
+  // is Device.purge(), which runs at the *start* of that call, before this row has even been
+  // published yet, so it cannot be what promotes it here.
+  it('promotes a question to sent through the onPublished hook, not through the trailing sweep', async () => {
+    approved()
+    const question = await service.ask('ana', 'hola')
+    await service.device.syncOnce({ maxMs: 10_000 })
+    expect(getOutboundQuestion(store, them.publicKey, question.questionId)?.state).toBe('sent')
+  })
+
+  // Fix round 1, Important I2 (P8's `lost`). Drives expireOutboundQuestions through sync() itself,
+  // with a controllable clock, instead of only unit-testing the store function directly.
+  it('expires an unanswered question to lost once its retry window has passed, inside sync()', async () => {
+    let clock = 2_000_000_000
+    const svc = new AskerService({ store, identity: me, createSocket: plainSocketFactory, now: () => clock })
+    try {
+      approved(uuid(2))
+      const question = await svc.ask('ana', 'hola')
+      await svc.sync()
+      expect(getOutboundQuestion(store, them.publicKey, question.questionId)?.state).toBe('sent')
+
+      clock += NOSTR.retryWindowSeconds + 10
+      await svc.sync()
+      expect(getOutboundQuestion(store, them.publicKey, question.questionId)?.state).toBe('lost')
+    } finally {
+      await svc.close()
+    }
+  })
+
+  // Fix round 1, Important I3. Device.runSync spends the sync's whole deadline on history first, so
+  // when this person's own relay never answers, publishDue's shared signal is already spent before
+  // its very first round starts and nothing gets even one attempt — a person who just ran `ask` and
+  // saw it succeed would in fact have sent nothing. The profile's own relay (read for history) and a
+  // contact's relay (where a question is actually published) are independent in the protocol, which
+  // is what lets this test starve one without starving the other: history goes to a black hole,
+  // publishing still goes to the real board.
+  it('still publishes what a command enqueued even when history never answers and spends the whole deadline', async () => {
+    const blackHole = await startBlackHole()
+    try {
+      setProfile(store, { relays: [blackHole.url], now: 2_000_000_000 })
+      approved(uuid(3))
+      const question = await service.ask('ana', 'hola')
+
+      // Short on purpose: long enough for the reserved publish pass (a fast, working relay) to
+      // finish, short enough that history against the black hole visibly spends the whole budget.
+      await service.sync(800)
+
+      expect(received().map((m) => m.type)).toContain('question')
+      expect(getOutboundQuestion(store, them.publicKey, question.questionId)?.state).toBe('sent')
+    } finally {
+      await blackHole.close()
+    }
+  })
+})
+
+describe('start', () => {
+  // Fix round 1, Important I2 (start()'s persistent mode). ask() calls device.wakePublisher(), which
+  // is a no-op unless the device was start()ed — every other test in this file relies entirely on an
+  // explicit sync() to publish. This proves start()'s background publisher actually runs: after
+  // start(), the question this test asks reaches 'sent' with no sync() call at all.
+  it('publishes what was just asked in the background, once started, with no explicit sync', async () => {
+    createOutboundRequest(store, { pubkey: them.publicKey, requestId: uuid(1), relays: [board.url], now: 2_000_000_000 })
+    applyApproval(store, { pubkey: them.publicKey, requestId: uuid(1), generation: 1, name: 'Ana', relays: [board.url], now: 2_000_000_000 })
+    service.start()
+    const question = await service.ask('ana', 'hola')
+    await waitFor(() => getOutboundQuestion(store, them.publicKey, question.questionId)?.state === 'sent')
+    expect(received().map((m) => m.type)).toContain('question')
   })
 })
