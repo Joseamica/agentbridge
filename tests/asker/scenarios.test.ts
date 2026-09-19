@@ -198,11 +198,24 @@ describe('permission changes', () => {
   }, 60_000)
 
   it('ignores an approval that answers a request this person never made', async () => {
-    const { board, asker, clock } = await askerWithApproval()
-    await anaSends(board, { v: 1, type: 'connect_approved', requestId: uuid(999), generation: 9, name: 'Ana', relays: [board.url] }, ana, clock.now)
+    // A contact that is genuinely *pending* — not already approved, the way `askerWithApproval`
+    // leaves it — so the requestId comparison is the only thing this message has to get past: its
+    // generation (9) is higher than anything seen (0), so the generation guard alone would let it
+    // through.
+    const board = await startFakeBoard()
+    cleanups.push(() => board.close())
+    const asker = await startAsker({ identity: beto, relays: [board.url], cleanups })
+    const now = nowSeconds()
+    createOutboundRequest(asker.store, { pubkey: ana.publicKey, requestId: uuid(1), relays: [board.url], now })
+    const before = getContact(asker.store, ana.publicKey, 'outbound')!
+
+    await anaSends(board, { v: 1, type: 'connect_approved', requestId: uuid(999), generation: 9, name: 'Ana', relays: [board.url] }, ana, now)
     await asker.sync()
     await asker.sync()
-    expect(getContact(asker.store, ana.publicKey, 'outbound')?.generation).toBe(1)
+
+    // Still pending, on the original request id — and nothing else moved either.
+    expect(getContact(asker.store, ana.publicKey, 'outbound')).toEqual(before)
+    expect(getContact(asker.store, ana.publicKey, 'outbound')?.state).toBe('pending')
   }, 60_000)
 })
 
