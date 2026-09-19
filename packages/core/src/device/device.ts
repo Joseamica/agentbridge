@@ -32,6 +32,9 @@ export type DeviceOptions<T> = {
   historyIntervalMs?: number
   publishIntervalMs?: number
   purgeIntervalMs?: number
+  // Proof of work is CPU, not network: forwarded to every publishDue call, separate from the sync's
+  // own network deadline.
+  miningMs?: number
 }
 
 export type HistoryRun = { relay: string; completed: number; incomplete: number; events: number; failed: boolean }
@@ -129,6 +132,7 @@ export class Device<T> {
             pool: this.pool,
             now: this.now,
             signal: this.shutdown.signal,
+            miningMs: this.options.miningMs,
             log: this.log,
             onPublished: this.options.onPublished,
           })
@@ -169,6 +173,7 @@ export class Device<T> {
         pool: this.pool,
         now: this.now,
         signal: deadline.signal,
+        miningMs: this.options.miningMs,
         log: this.log,
         onPublished: this.options.onPublished,
       })

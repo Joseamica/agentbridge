@@ -15,6 +15,10 @@ export type FakeBoardOptions = {
   maxLimit?: number
   dropIncoming?: (event: NostrEvent) => boolean
   beforeEose?: (subscriptionId: string, filters: Filter[]) => unknown[]
+  // A relay that accepts an EVENT frame (it is recorded in `frames`) but never sends an OK back —
+  // like a relay stuck mid-write. Used to test a caller's own deadline against a publish that never
+  // gets an answer.
+  swallowPublishes?: boolean
   // Answer WebSocket pings (default true). The server is built with autoPong off, so this is the
   // only thing that answers them.
   respondToPings?: boolean
@@ -115,6 +119,7 @@ export async function startFakeBoard(initial: FakeBoardOptions = {}): Promise<Fa
       const [type] = frame
       if (type === 'EVENT') {
         const event = frame[1] as NostrEvent
+        if (o().swallowPublishes) return
         if (Buffer.byteLength(text) > (o().maxFrameBytes ?? 65_536)) {
           send(session, ['OK', event?.id ?? '', false, 'invalid: event too large'])
           return

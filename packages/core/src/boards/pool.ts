@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto'
 import type { NostrEvent } from 'nostr-tools/pure'
 import type { Identity } from '../identity'
 import { NOSTR, nowSeconds } from '../nostr-constants'
-import { BoardConnection, type Filter } from './connection'
+import { BoardConnection, type Filter, type PublishResult } from './connection'
 import { ReceiveQueue } from './receive-queue'
 import { sanitizeRelayText } from './relay-text'
 import type { SocketFactory } from './socket'
@@ -71,30 +71,94 @@ export class BoardPool {
     return conn
   }
 
-  async publish(relays: readonly string[], event: NostrEvent, beforeSend: () => boolean = () => true): Promise<PublishOutcome> {
-    const outcome: PublishOutcome = { accepted: [], rejected: [] }
+  // A helper used by both operations below: the caller's wait ends when the signal aborts, even
+  // though the underlying socket work is also stopped through `abort()` on the connection.
+  private async raceSignal<T>(work: Promise<T>, onAbort: () => T, signal?: AbortSignal): Promise<T> {
+    if (!signal) return work
+    if (signal.aborted) return onAbort()
+    return new Promise<T>((resolve) => {
+      const finish = (value: T) => {
+        signal.removeEventListener('abort', aborted)
+        resolve(value)
+      }
+      const aborted = () => finish(onAbort())
+      signal.addEventListener('abort', aborted, { once: true })
+      void work.then(finish, () => finish(onAbort()))
+    })
+  }
+
+  async publish(
+    relays: readonly string[],
+    event: NostrEvent,
+    beforeSend: () => boolean = () => true,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<PublishOutcome> {
+    const signal = options.signal
     const targets = [...new Set(relays)].slice(0, NOSTR.maxRelaysPerContact)
+    // An already-aborted signal never opens a connection: every target is refused up front.
+    if (signal?.aborted) {
+      return { accepted: [], rejected: targets.map((relay) => ({ relay, reason: 'error: sync deadline reached' })) }
+    }
+    const outcome: PublishOutcome = { accepted: [], rejected: [] }
     await Promise.all(
       targets.map(async (relay) => {
-        try {
-          const result = await (await this.connection(relay)).publish(event, beforeSend)
-          if (result.ok) outcome.accepted.push(relay)
-          else outcome.rejected.push({ relay, reason: result.message })
-        } catch (err) {
-          outcome.rejected.push({ relay, reason: `error: ${messageOf(err)}` })
-        }
+        let conn: BoardConnection | undefined
+        const attempt = (async (): Promise<PublishResult> => {
+          try {
+            conn = await this.connection(relay)
+            return await conn.publish(event, beforeSend)
+          } catch (err) {
+            return { ok: false, message: `error: ${messageOf(err)}` }
+          }
+        })()
+        // On abort, settle whatever this relay's connection is still waiting on (a pending OK, or an
+        // AUTH round trip) instead of leaving it to its own timeout. A relay that already accepted
+        // still counts: `attempt` has already resolved by the time raceSignal would race it.
+        const result = await this.raceSignal(
+          attempt,
+          () => {
+            conn?.abort('sync deadline reached')
+            return { ok: false, message: 'error: sync deadline reached' }
+          },
+          signal,
+        )
+        if (result.ok) outcome.accepted.push(relay)
+        else outcome.rejected.push({ relay, reason: result.message })
       }),
     )
     return outcome
   }
 
-  async query(relay: string, filter: Filter, timeoutMs = this.options.timeoutMs ?? 10_000): Promise<QueryResult> {
-    let conn: BoardConnection
-    try {
-      conn = await this.connection(relay)
-    } catch (err) {
-      return { events: [], complete: false, closedReason: `error: ${messageOf(err)}` }
-    }
+  async query(
+    relay: string,
+    filter: Filter,
+    timeoutMs = this.options.timeoutMs ?? 10_000,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<QueryResult> {
+    // The third argument stays the number every current caller passes positionally (history.ts and
+    // plan 1's tests); the signal is a fourth, optional one.
+    const signal = options.signal
+    if (signal?.aborted) return { events: [], complete: false, closedReason: 'error: sync deadline reached' }
+    let conn: BoardConnection | undefined
+    const attempt = (async (): Promise<QueryResult> => {
+      try {
+        conn = await this.connection(relay)
+        return await this.runQuery(conn, filter, timeoutMs)
+      } catch (err) {
+        return { events: [], complete: false, closedReason: `error: ${messageOf(err)}` }
+      }
+    })()
+    return this.raceSignal(
+      attempt,
+      () => {
+        conn?.abort('sync deadline reached')
+        return { events: [], complete: false, closedReason: 'error: sync deadline reached' }
+      },
+      signal,
+    )
+  }
+
+  private runQuery(conn: BoardConnection, filter: Filter, timeoutMs: number): Promise<QueryResult> {
     const id = newSubscriptionId()
     const events: unknown[] = []
     // Ruling 27: bound what one query holds in memory. A relay may add a few events before EOSE (a

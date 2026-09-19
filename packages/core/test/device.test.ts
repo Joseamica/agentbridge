@@ -190,6 +190,16 @@ describe('Device', () => {
     expect(Date.now() - started).toBeLessThan(4_000)
   })
 
+  it('returns from syncOnce inside its deadline even when a relay never answers', async () => {
+    // The budget plus a small margin for the store, not plus a pool timeout: history.ts now carries
+    // the sync's own deadline into every pool.query call it makes.
+    const { device } = await setup({ mine: { ignoreReads: true } })
+    const started = Date.now()
+    const report = await device.syncOnce({ maxMs: 1_000 })
+    expect(report.timedOut).toBe(true)
+    expect(Date.now() - started).toBeLessThan(3_000)
+  })
+
   it('closes cleanly while running', async () => {
     const { mine, device } = await setup()
     device.start()

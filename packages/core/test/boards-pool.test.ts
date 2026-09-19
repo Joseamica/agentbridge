@@ -370,6 +370,37 @@ describe('BoardPool.close', () => {
   })
 })
 
+// Task 5: a caller's own deadline (the sync's AbortSignal) must end a query or a publish at once,
+// instead of running to the pool's own per-relay timeout.
+describe('BoardPool honors a caller signal', () => {
+  it('ends a query at once when the caller aborts', async () => {
+    // A relay that never answers a REQ at all (plan 1's "answers nothing" mode): nothing but the
+    // signal can end this query.
+    const b = await board({ ignoreReads: true })
+    const p = pool({ timeoutMs: 30_000 })
+    const controller = new AbortController()
+    const started = Date.now()
+    // The third argument is still the timeout; the signal is the fourth.
+    const querying = p.query(b.url, { kinds: [1059], limit: 10 }, 30_000, { signal: controller.signal })
+    setTimeout(() => controller.abort(), 50)
+    const result = await querying
+    expect(result.complete).toBe(false)
+    expect(Date.now() - started).toBeLessThan(5_000)
+  })
+
+  it('stops waiting for a relay that never answers a publish', async () => {
+    const b = await board({ swallowPublishes: true })
+    const p = pool({ timeoutMs: 30_000 })
+    const controller = new AbortController()
+    const started = Date.now()
+    const publishing = p.publish([b.url], signed('quieta'), () => true, { signal: controller.signal })
+    setTimeout(() => controller.abort(), 50)
+    const outcome = await publishing
+    expect(outcome.accepted).toEqual([])
+    expect(Date.now() - started).toBeLessThan(5_000)
+  })
+})
+
 describe('sanitizeRelayText', () => {
   it('is internal: the package does not export it', () => {
     expect(core).not.toHaveProperty('sanitizeRelayText')

@@ -147,6 +147,16 @@ export class BoardConnection extends EventEmitter {
     this.socket?.terminate()
   }
 
+  // Settles everything a caller could be waiting on, without closing the socket: a cancelled sync
+  // must not leave a publish waiting for an OK that will never come, and must not kill a connection
+  // the next command would reuse. The AUTH round trip settles through the same map, so a handshake
+  // in flight ends as "not authenticated" instead of running to its own timeout.
+  abort(reason: string): void {
+    const waiting = [...this.pendingOk.values()]
+    this.pendingOk.clear()
+    for (const settle of waiting) settle({ ok: false, message: `error: ${reason}` })
+  }
+
   private async readFrames(stream: AsyncIterable<unknown>, liveness: Liveness): Promise<void> {
     try {
       for await (const chunk of stream) {

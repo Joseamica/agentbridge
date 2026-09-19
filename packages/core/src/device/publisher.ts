@@ -29,6 +29,9 @@ export type PublishDueInput = {
   authorize?: (store: Store, item: OutboxItem) => boolean
   now?: () => number
   signal?: AbortSignal
+  // Proof of work is CPU, not network: mining one row is bounded by its own budget (default 60 s),
+  // separate from `signal`, which is the sync's network deadline.
+  miningMs?: number
   limit?: number
   log?: (line: string) => void
   onPublished?: (item: OutboxItem) => void
@@ -46,7 +49,11 @@ export async function publishDue(input: PublishDueInput): Promise<PublishReport>
   const report: PublishReport = { published: 0, failed: 0, postponed: 0, lost: 0 }
   const limit = input.limit ?? 20
 
-  for (let round = 0; round < limit && !input.signal?.aborted; round++) {
+  for (let round = 0; round < limit; round++) {
+    // An expired deadline ends the round here. A row that already paid for its proof of work is
+    // still published below (bounded by the pool's own per-relay timeout): discarding it would mean
+    // re-mining the same connection request on every command and never sending it.
+    if (input.signal?.aborted) break
     const owner = randomUUID()
     const [item] = claimDue(input.store, {
       owner,
@@ -64,14 +71,20 @@ export async function publishDue(input: PublishDueInput): Promise<PublishReport>
     }
     const ref = { recipient: item.recipient, rumorId: item.rumorId, owner }
 
+    // Proof of work is CPU, not network. Charging it to the sync's ten seconds would make a 22-bit
+    // connection request unsendable on a slow machine, so it gets a budget of its own.
+    const mining = AbortSignal.timeout(input.miningMs ?? 60_000)
     let wrap: NostrEvent
     try {
-      wrap = await wrapRumor(item.rumor, input.identity, item.recipient, { now: now(), signal: input.signal })
+      wrap = await wrapRumor(item.rumor, input.identity, item.recipient, { now: now(), signal: mining })
     } catch (err) {
-      if (input.signal?.aborted) {
+      // Either abort leaves untouched work for the next round, so both postpone instead of counting
+      // a failure — but only the caller's deadline ends the round.
+      if (mining.aborted || input.signal?.aborted) {
         postpone(input.store, { ...ref, retryAt: now() })
         report.postponed++
-        break
+        if (input.signal?.aborted) break
+        continue
       }
       log(`could not seal an outgoing ${item.label} (${describeError(err)})`)
       markFailed(input.store, { ...ref, now: now() })
@@ -94,7 +107,6 @@ export async function publishDue(input: PublishDueInput): Promise<PublishReport>
       lostMidSend: false,
     }
     const beforeSend = (): boolean => {
-      if (input.signal?.aborted) return false
       try {
         const at = now()
         if (guard.reservation === null) {

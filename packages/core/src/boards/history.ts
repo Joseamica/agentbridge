@@ -65,6 +65,7 @@ async function readWindow(
       input.relay,
       { kinds: [NOSTR.wrapKind], '#p': [input.recipientPubkey], since: window.since, until, limit },
       input.queryTimeoutMs,
+      { signal: input.signal },
     )
     if (!page.complete) return false
     const valid = page.events.filter(isDated).filter((e) => e.created_at >= window.since && e.created_at <= until)

@@ -119,7 +119,12 @@ describe('publishDue', () => {
     ])
   })
 
-  it('writes nothing once the deadline passed while it was connecting', async () => {
+  // Task 5: the deadline decides whether to *start* another row, not whether to throw away one
+  // already claimed and mined. This row is already mined and claimed by the time the deadline
+  // passes (simulated here as the pool reaching the write only after `controller.abort()`), so the
+  // write still goes through — otherwise a connection request that costs seconds of mining would be
+  // discarded and re-mined on every command.
+  it('still writes a row it already mined even though the deadline passed while it was connecting', async () => {
     const { store, now } = await setup()
     const controller = new AbortController()
     // A pool that reaches the write only after the deadline has passed.
@@ -130,9 +135,9 @@ describe('publishDue', () => {
       },
     } as unknown as BoardPool
     const report = await publishDue({ store, identity: me, pool: lateWriter, authorize: allowAll, signal: controller.signal, now: () => now })
-    expect(report).toEqual({ published: 0, failed: 0, postponed: 1, lost: 0 })
-    expect(store.db.prepare('SELECT count(*) AS n FROM publish_log').get()?.n).toBe(0)
-    expect(row(store)).toMatchObject({ state: 'pending', next_attempt_at: now, claimed_by: null })
+    expect(report).toEqual({ published: 1, failed: 0, postponed: 0, lost: 0 })
+    expect(store.db.prepare('SELECT count(*) AS n FROM publish_log').get()?.n).toBe(1)
+    expect(row(store)).toMatchObject({ state: 'published', claimed_by: null })
   })
 
   it('does nothing once aborted', async () => {
@@ -191,6 +196,30 @@ describe('publishDue', () => {
     const sealLine = lines.find((line) => line.includes('could not seal'))
     expect(sealLine).toContain('Error (ERR_KEY_LOCKED)')
     expect(lines.some((line) => line.includes('PRIVATE_CANARY'))).toBe(false)
+  })
+
+  // Task 5: proof of work is CPU, not network, so it gets its own budget (`miningMs`) separate from
+  // the sync's own deadline (`signal`). `setup()`'s default receipt row is cleared first so this test
+  // controls exactly the one row it seeds. (The complementary rule — a row already mined and claimed
+  // is still published even after the sync's own deadline expires — is covered above by "still writes
+  // a row it already mined even though the deadline passed while it was connecting"; a second version
+  // of it here would only add the cost of another real 22-bit mine without proving anything new.)
+  describe('mining budget', () => {
+    it('leaves a row pending when mining runs past its own budget', async () => {
+      // A 1 ms budget cannot finish (spinning up even one mining worker already costs more than
+      // that): the row is postponed, not failed, and stays pending for the next round.
+      const { store, pool, now } = await setup([{}])
+      store.db.exec('DELETE FROM outbox')
+      const rumor = createRumor({ v: 1, type: 'connect_request', requestId: uuid(70), name: 'Ana', note: '', relays: ['wss://relay.example.com'] }, me, now)
+      enqueue(store, { recipient: asker.publicKey, rumor, label: 'connect_request', powBits: 22, relays: ['wss://relay.example.com'], policy: 'once', now })
+      // limit: 1 bounds this to a single round — with a fixed `now`, a postponed row's retryAt
+      // equals `now` too, so it would otherwise be reclaimed and postponed again on every round.
+      const report = await publishDue({ store, identity: me, pool, authorize: allowAll, now: () => now, miningMs: 1, limit: 1 })
+      expect(report.published).toBe(0)
+      expect(report.postponed).toBe(1)
+      expect(report.failed).toBe(0)
+      expect(row(store)).toMatchObject({ state: 'pending' })
+    })
   })
 
   it('logs an abandoned row without leaking the thrown error message', async () => {
