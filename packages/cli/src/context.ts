@@ -1,4 +1,4 @@
-import { CLI_COMMAND, RelayHttpClient, readConfig, type ClientConfig } from '@agentbridge/core'
+import { CLI_COMMAND, RelayHttpClient, readConfig, type ClientConfig, type RelayPolicy, type SocketFactory } from '@agentbridge/core'
 import { createInterface } from 'node:readline/promises'
 
 export type Output = { log(message: string): void; error(message: string): void }
@@ -134,11 +134,21 @@ export function closePrompt(): void {
   sharedPromptInterface = null
 }
 
-export type CliContext = { home: string; out: Output; env: NodeJS.ProcessEnv; fetchImpl?: typeof fetch; prompt?: Prompt }
+export type CliContext = {
+  home: string
+  out: Output
+  env: NodeJS.ProcessEnv
+  fetchImpl?: typeof fetch
+  prompt?: Prompt
+  // Both left undefined in production. A test passes them so a command can reach a local fake
+  // board instead of the pinned, wss://-only defaults every real relay connection uses.
+  relayPolicy?: RelayPolicy
+  createSocket?: SocketFactory
+}
 
 export class CliError extends Error {
-  constructor(message: string) {
-    super(message)
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options)
     this.name = 'CliError'
   }
 }
