@@ -2,6 +2,7 @@ import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  admitQuestion,
   applyApproval,
   createOutboundRequest,
   getContact,
@@ -191,6 +192,45 @@ describe('requests, approve and reject', () => {
     expect(printed).not.toContain(ESC)
     expect(printed).not.toContain('\r')
   })
+
+  // I2: a prefix that matches a contact whose decision already went the other way must say so, not
+  // read like the generic "not found" a truly unknown id gets.
+  it('tells the truth in Spanish when approving something already rejected', async () => {
+    const id = await incoming()
+    await reject([id], ctx)
+    await expect(approve([id], ctx)).rejects.toThrow(/ya le dijiste que no/i)
+  })
+
+  it('tells the truth in Spanish when rejecting something already approved', async () => {
+    const id = await incoming()
+    await approve([id], ctx)
+    await expect(reject([id], ctx)).rejects.toThrow(/ya le diste permiso/i)
+  })
+
+  // M1: a repeated decision must say nothing changed, not repeat the fresh-decision message as if it
+  // had acted again.
+  it('says nothing changed on a repeated approve of the same contact', async () => {
+    const id = await incoming()
+    await approve([id], ctx)
+    ctx.out.lines.length = 0
+    await approve([id], ctx)
+    expect(ctx.out.lines.join('\n')).toMatch(/ya habías aprobado/i)
+  })
+
+  it('says nothing changed on a repeated reject of the same contact', async () => {
+    const id = await incoming()
+    await reject([id], ctx)
+    ctx.out.lines.length = 0
+    await reject([id], ctx)
+    expect(ctx.out.lines.join('\n')).toMatch(/ya habías rechazado/i)
+  })
+
+  // M2: requireId enforced a minimum length but no maximum, so a pasted paragraph reached the store
+  // as a query instead of being refused up front as the clean, cheap Spanish error it should be.
+  it('refuses an identifier longer than a pubkey can ever be, before it reaches the store', async () => {
+    await incoming()
+    await expect(approve(['a'.repeat(65)], ctx)).rejects.toThrow(/demasiado largo/i)
+  })
 })
 
 describe('revoke', () => {
@@ -207,12 +247,29 @@ describe('revoke', () => {
       })
     })
     await approve([beto.publicKey.slice(0, 8)], ctx)
+    // Give Beto a received, unanswered question before revoking, so the "Cerré N pregunta(s)..."
+    // branch this test's own name promises is actually exercised (fix round 1, I1 — the brief's own
+    // test never gave the contact a question to close, so `rejectedQuestions` was always 0).
+    await withStore((store) =>
+      admitQuestion(store, {
+        identity: me,
+        senderPubkey: beto.publicKey,
+        questionId: uuid(20),
+        rumorId: '1'.repeat(64),
+        rumorCreatedAt: T0,
+        generation: 1,
+        text: '¿me ayudas?',
+        now: T0,
+      }),
+    )
     ctx.out.lines.length = 0
 
     const name = await withStore((store) => getContact(store, beto.publicKey, 'inbound')!.localName!)
     await revoke([name], ctx)
     expect(await withStore((store) => getContact(store, beto.publicKey, 'inbound')?.state)).toBe('revoked')
-    expect(ctx.out.lines.join('\n')).toMatch(/ya no puede preguntarte/i)
+    const printed = ctx.out.lines.join('\n')
+    expect(printed).toMatch(/ya no puede preguntarte/i)
+    expect(printed).toMatch(/Cerré 1 pregunta/i)
   })
 
   it('says which names exist when the one given does not', async () => {

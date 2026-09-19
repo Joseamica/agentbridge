@@ -44,11 +44,34 @@ export function listRequests(store: Store, now: number): PendingRequestView[] {
   }))
 }
 
-function findInbound(store: Store, idPrefix: string, states: readonly Contact['state'][]): Contact {
-  const rows = findRequestsByPrefix(store, idPrefix, states)
-  if (rows.length === 0) throw new UserFacingError('No hay ninguna solicitud con ese identificador. Revisa la lista de solicitudes.')
+const ALL_INBOUND_STATES: readonly Contact['state'][] = ['requested', 'approved', 'rejected', 'revoked']
+
+// I2: a prefix that matches a real contact whose decision already went the other way (or who was
+// later revoked) must not read the same as one that never existed — this plan tells the truth about
+// every other kind of "already ...", and "no encontrada" for something that does in fact exist is the
+// one kind of lie a person cannot debug.
+function opposingStateMessage(state: Contact['state']): string {
+  switch (state) {
+    case 'approved':
+      return 'Ya le diste permiso a esa persona; no puedes rechazar una solicitud que ya aceptaste.'
+    case 'rejected':
+      return 'Ya le dijiste que no a esa persona; no puedes aprobar la misma solicitud.'
+    case 'revoked':
+      return 'Le retiraste el permiso a esa persona anteriormente. Debe enviarte una solicitud nueva.'
+    default:
+      return 'No hay ninguna solicitud con ese identificador. Revisa la lista de solicitudes.'
+  }
+}
+
+function findInbound(store: Store, idPrefix: string, wanted: readonly Contact['state'][]): Contact {
+  const rows = findRequestsByPrefix(store, idPrefix, wanted)
+  if (rows.length === 1) return getContact(store, rows[0]!.pubkey, 'inbound')!
   if (rows.length > 1) throw new UserFacingError('Ese identificador coincide con varias solicitudes. Escribe más caracteres del identificador.')
-  return getContact(store, rows[0]!.pubkey, 'inbound')!
+  // Nothing in the wanted states matched. Before reporting "no encontrada", check whether the prefix
+  // actually belongs to a contact whose state just isn't one of the ones this call wanted.
+  const any = findRequestsByPrefix(store, idPrefix, ALL_INBOUND_STATES)
+  if (any.length > 1) throw new UserFacingError('Ese identificador coincide con varias solicitudes. Escribe más caracteres del identificador.')
+  throw new UserFacingError(any.length === 1 ? opposingStateMessage(any[0]!.state) : 'No hay ninguna solicitud con ese identificador. Revisa la lista de solicitudes.')
 }
 
 // 'no_relays' stands in for the enqueue outcomes that never happen: there is nowhere to send.
@@ -114,6 +137,14 @@ export function rejectConnection(store: Store, input: { identity: Identity; idPr
   })
 }
 
+// C1: everything this person, as a responder, might already have queued toward the pubkey being
+// revoked — decisions on the connection itself, and the responses to its questions. 'rejected:' is a
+// prefix because rejectQuestion's own label carries the reject reason (e.g. 'rejected:expired', see
+// decisionLabel in store/inbox.ts). Deliberately excludes 'connect_request' and 'question' — this
+// person's own traffic to the same pubkey as an ASKER, which a responder-side revocation must never
+// touch: an outbound question already sent survives the other direction's contact being revoked (P11).
+const RESPONDER_OUTBOUND_LABELS: readonly string[] = ['connect_approved', 'connect_rejected', 'connect_revoked', 'receipt', 'answer', 'rejected:']
+
 export function revokeConnection(
   store: Store,
   input: { identity: Identity; name: string; now: number },
@@ -124,7 +155,7 @@ export function revokeConnection(
     if (target.state === 'revoked') return { contact: target, changed: false, rejectedQuestions: 0 }
     const { contact } = revokeInbound(store, { pubkey: target.pubkey, now: input.now })
     const rejectedQuestions = rejectUnansweredFor(store, { identity: input.identity, senderPubkey: contact.pubkey, now: input.now })
-    deleteUnclaimedFor(store, { recipient: contact.pubkey, now: input.now })
+    deleteUnclaimedFor(store, { recipient: contact.pubkey, labels: RESPONDER_OUTBOUND_LABELS, now: input.now })
     const rumor = createRumor({ v: 1, type: 'connect_revoked', generation: contact.generation }, input.identity, input.now)
     send(store, { recipient: contact.pubkey, relays: contact.relays, rumor, label: 'connect_revoked', now: input.now })
     return { contact, changed: true, rejectedQuestions }

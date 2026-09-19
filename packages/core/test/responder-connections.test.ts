@@ -6,11 +6,15 @@ import {
   NOSTR,
   UserFacingError,
   admitQuestion,
+  applyApproval,
   approveConnection,
   claimDue,
   claimRequestNoticeSlot,
+  createOutboundQuestion,
+  createOutboundRequest,
   getContact,
   getInboxQuestion,
+  getOutboundQuestion,
   listRequests,
   markRequestNoticePending,
   openStore,
@@ -121,6 +125,26 @@ describe('approveConnection', () => {
     const [row] = outbox()
     expect(JSON.parse(row!.content)).toMatchObject({ type: 'connect_approved', generation: 3 })
   })
+
+  // I2: a prefix that matches a real contact whose decision already went the other way must not
+  // collapse into the same "no encontrada" a genuinely unknown id gets — that would be the one kind
+  // of lie a person can't debug (there IS a decision on file, just not the one being asked for).
+  it('tells the truth when the contact already went the other way, instead of "no encontrada"', () => {
+    setProfile(store, { name: 'Ana', relays: MY_RELAYS, now: T0 })
+    requestFrom()
+    rejectConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 })
+    expect(() => approveConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 + 1 })).toThrow(/ya le dijiste que no/i)
+  })
+
+  it('tells the truth when the contact was already revoked, instead of "no encontrada"', () => {
+    setProfile(store, { name: 'Ana', relays: MY_RELAYS, now: T0 })
+    requestFrom()
+    approveConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 })
+    revokeConnection(store, { identity: responder, name: 'beto', now: T0 + 1 })
+    // revokeInbound leaves request_id untouched, so the same prefix still matches this contact —
+    // findInbound must recognize the 'revoked' state and say so, not report it as never having existed.
+    expect(() => approveConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 + 2 })).toThrow(/retiraste el permiso/i)
+  })
 })
 
 describe('rejectConnection', () => {
@@ -130,6 +154,51 @@ describe('rejectConnection', () => {
     expect(result).toMatchObject({ changed: true, contact: { state: 'rejected' } })
     expect(outbox().map((r) => JSON.parse(r.content))).toEqual([{ v: 1, type: 'connect_rejected', requestId: REQUEST_ID }])
     expect(rejectConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 + 2 }).changed).toBe(false)
+  })
+
+  // I2's other direction: rejecting a prefix that belongs to a contact already approved must say so,
+  // not claim no such solicitud ever existed.
+  it('tells the truth when the contact was already approved, instead of "no encontrada"', () => {
+    setProfile(store, { name: 'Ana', relays: MY_RELAYS, now: T0 })
+    requestFrom()
+    approveConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 })
+    expect(() => rejectConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 + 1 })).toThrow(/ya le diste permiso/i)
+  })
+
+  it('tells the truth when the contact was already revoked, instead of "no encontrada"', () => {
+    setProfile(store, { name: 'Ana', relays: MY_RELAYS, now: T0 })
+    requestFrom()
+    approveConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 })
+    revokeConnection(store, { identity: responder, name: 'beto', now: T0 + 1 })
+    expect(() => rejectConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 + 2 })).toThrow(/retiraste el permiso/i)
+  })
+})
+
+// C1: revokeConnection revokes the INBOUND relationship (whether that same pubkey may ask this
+// person), but the outbox is a single shared table keyed only by recipient. Before the fix,
+// deleteUnclaimedFor deleted every unclaimed row for that pubkey regardless of label, including this
+// person's own OUTBOUND question to the same pubkey — the exact P11 violation, from the other
+// direction, that this plan's tests otherwise guard against.
+describe('revokeConnection — outbound survival across the same pubkey (P11 / C1)', () => {
+  it('never deletes this person’s own in-flight outbound question to the pubkey whose inbound permission is revoked', () => {
+    setProfile(store, { name: 'Ana', relays: MY_RELAYS, now: T0 })
+    // Beto may ask me (inbound, about to be revoked) AND I may ask Beto (outbound, untouched) — an
+    // ordinary bidirectional relationship, the kind `contacts` is built to display.
+    createOutboundRequest(store, { pubkey: asker.publicKey, requestId: uuid(60), relays: ASKER_RELAYS, now: T0 })
+    applyApproval(store, { pubkey: asker.publicKey, requestId: uuid(60), generation: 1, name: 'Beto', relays: ASKER_RELAYS, now: T0 })
+    const { question } = createOutboundQuestion(store, { identity: responder, recipient: asker.publicKey, text: '¿sigues ahí?', now: T0 })
+
+    requestFrom()
+    approveConnection(store, { identity: responder, idPrefix: asker.publicKey.slice(0, 8), now: T0 + 1 })
+    const result = revokeConnection(store, { identity: responder, name: 'beto', now: T0 + 2 })
+    expect(result.changed).toBe(true)
+
+    const rows = outbox()
+    expect(rows.map((r) => r.label)).toContain('question')
+    expect(rows.find((r) => r.label === 'question')?.recipient).toBe(asker.publicKey)
+    // The outbox row is the only retry mechanism a 'sending' question has (P11) — if it survived,
+    // the question row itself must still say so too.
+    expect(getOutboundQuestion(store, asker.publicKey, question.questionId)).toMatchObject({ state: 'sending' })
   })
 })
 

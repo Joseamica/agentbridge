@@ -220,13 +220,38 @@ describe('schedules', () => {
 })
 
 describe('cleanup', () => {
-  it('deletes everything for a recipient except rows currently claimed', () => {
+  it('deletes every unclaimed row for a recipient whose label is in scope, keeping claimed rows', () => {
     enqueue(store, input(1))
     enqueue(store, input(2))
     enqueue(store, input(3))
     claimDue(store, { owner: 'a', now: T0, limit: 1, authorize: allow })
-    expect(deleteUnclaimedFor(store, { recipient: RECIPIENT, now: T0 + 1 })).toBe(2)
+    expect(deleteUnclaimedFor(store, { recipient: RECIPIENT, labels: ['answer'], now: T0 + 1 })).toBe(2)
     expect((store.db.prepare('SELECT rumor_id FROM outbox').all() as Array<{ rumor_id: string }>).map((r) => r.rumor_id)).toEqual([hex(1)])
+  })
+
+  // The scoping is the whole point of C1's fix: a caller revoking one relationship must never sweep
+  // away outbox rows that belong to a different one between the same two pubkeys.
+  it('leaves an unclaimed row alone when its label is not in the given scope', () => {
+    enqueue(store, input(1, { label: 'answer' }))
+    enqueue(store, input(2, { label: 'question', policy: 'retry_until_resolved' }))
+    expect(deleteUnclaimedFor(store, { recipient: RECIPIENT, labels: ['answer'], now: T0 })).toBe(1)
+    expect((store.db.prepare('SELECT rumor_id FROM outbox').all() as Array<{ rumor_id: string }>).map((r) => r.rumor_id)).toEqual([hex(2)])
+  })
+
+  // 'rejected:' labels carry a dynamic reason suffix (e.g. 'rejected:expired'), so a caller scoping
+  // to "every rejection" needs a prefix, not an exact-match list of every reason there is.
+  it('matches every label under a prefix when the scope entry ends with a colon', () => {
+    enqueue(store, input(1, { label: 'rejected:expired' }))
+    enqueue(store, input(2, { label: 'rejected:limit' }))
+    enqueue(store, input(3, { label: 'answer' }))
+    expect(deleteUnclaimedFor(store, { recipient: RECIPIENT, labels: ['rejected:'], now: T0 })).toBe(2)
+    expect((store.db.prepare('SELECT rumor_id FROM outbox').all() as Array<{ rumor_id: string }>).map((r) => r.rumor_id)).toEqual([hex(3)])
+  })
+
+  it('deletes nothing when given no labels, rather than defaulting to "everything"', () => {
+    enqueue(store, input(1))
+    expect(deleteUnclaimedFor(store, { recipient: RECIPIENT, labels: [], now: T0 })).toBe(0)
+    expect(store.db.prepare('SELECT count(*) AS n FROM outbox').get()?.n).toBe(1)
   })
 
   it('purges message content 7 days after the rumor was created, whatever the row state', () => {

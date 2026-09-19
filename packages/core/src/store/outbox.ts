@@ -301,11 +301,37 @@ export function resolveOutboxMessage(store: Store, input: { recipient: string; r
   return Number(result.changes) > 0
 }
 
-export function deleteUnclaimedFor(store: Store, input: { recipient: string; now: number }): number {
+// Deletes every currently-unclaimed row for a recipient whose label is in scope; a row that is
+// claimed right now is left alone regardless of its label — a claim already in flight is never
+// abandoned by a caller elsewhere in the process. `labels` has no "everything" default and must be
+// given explicitly by every caller (an empty array deletes nothing): the outbox is one shared table
+// per recipient across every kind of message this identity ever sends them, so a caller that means
+// only its own side of a relationship (e.g. a responder-side revocation cleaning up its own
+// decisions/receipts/answers to that pubkey) must say exactly that, rather than risk sweeping away
+// outbox rows that belong to a different relationship direction between the same two identities
+// (see revokeConnection, and P11 in the 0.2 plan). An entry ending in ':' matches every label that
+// starts with it — 'rejected:' matches 'rejected:expired', 'rejected:limit', ... — because that one
+// label family carries a dynamic reason suffix (see decisionLabel in store/inbox.ts).
+export function deleteUnclaimedFor(store: Store, input: { recipient: string; labels: readonly string[]; now: number }): number {
+  if (input.labels.length === 0) return 0
+  const exact = input.labels.filter((label) => !label.endsWith(':'))
+  const prefixes = input.labels.filter((label) => label.endsWith(':'))
+  const clauses: string[] = []
+  const labelParams: string[] = []
+  if (exact.length > 0) {
+    clauses.push(`label IN (${exact.map(() => '?').join(', ')})`)
+    labelParams.push(...exact)
+  }
+  for (const prefix of prefixes) {
+    clauses.push('label LIKE ?')
+    labelParams.push(`${prefix}%`)
+  }
   const result = store.tx(() =>
     store.db
-      .prepare("DELETE FROM outbox WHERE recipient = ? AND NOT (state = 'pending' AND claimed_until IS NOT NULL AND claimed_until > ?)")
-      .run(input.recipient, input.now),
+      .prepare(
+        `DELETE FROM outbox WHERE recipient = ? AND (${clauses.join(' OR ')}) AND NOT (state = 'pending' AND claimed_until IS NOT NULL AND claimed_until > ?)`,
+      )
+      .run(input.recipient, ...labelParams, input.now),
   )
   return Number(result.changes)
 }
