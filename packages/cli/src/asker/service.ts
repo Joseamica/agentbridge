@@ -248,6 +248,12 @@ export class AskerService {
     return listContacts(this.store, 'outbound')
   }
 
+  // Read by `contacts` (Task 9): who may ask this person. Read-only — the four decisions that
+  // change this direction run in the responder session instead (P10), not here.
+  inboundContacts(): Contact[] {
+    return listContacts(this.store, 'inbound')
+  }
+
   // Read by `link` (Task 10 reuses it too): what to hand someone so they can add this person. No
   // network involved — the profile is local settings, not a relay round trip.
   profile(): { name: string | null; relays: string[] } {
