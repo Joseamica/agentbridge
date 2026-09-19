@@ -13,6 +13,7 @@ import {
   findContactByLocalName,
   findOutboundQuestions,
   getContact,
+  getOutboundQuestion,
   getProfile,
   handleAskerMessage,
   listContacts,
@@ -47,6 +48,7 @@ const CLI_SYNC_MS = 10_000
 // Proof of work is CPU, not network: it gets its own budget so it never eats the ten seconds the
 // spec gives a short-lived client's sync (see P5b and P5c).
 const CONNECT_MINING_MS = 60_000
+const WAIT_POLL_MS = 250
 
 const EMPTY_PUBLISH: PublishReport = { published: 0, failed: 0, postponed: 0, lost: 0 }
 const EMPTY_REPORT: SyncReport = { history: [], published: EMPTY_PUBLISH, timedOut: false }
@@ -261,6 +263,46 @@ export class AskerService {
     throw new UserFacingError(
       `No encuentro ninguna pregunta con ese identificador. Escribe al menos ${MIN_QUESTION_PREFIX} caracteres del que te dio al preguntar.`,
     )
+  }
+
+  // Waits for a question to reach a final state. The live subscription is what brings the answer in,
+  // so it is started here if the caller did not start it; polling the store (rather than hooking the
+  // device's callback) is deliberate — the answer may just as well be written by another process
+  // that shares this home, and a poll sees that too.
+  async waitForAnswer(
+    ref: { recipient: string; questionId: string },
+    seconds: number,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<OutboundQuestion> {
+    this.device.start()
+    const deadline = Date.now() + Math.max(0, seconds) * 1000
+    for (;;) {
+      const question = getOutboundQuestion(this.store, ref.recipient, ref.questionId)
+      if (!question) {
+        throw new UserFacingError('Esa pregunta ya no está guardada en esta computadora.')
+      }
+      if (question.state === 'answered' || question.state === 'rejected' || question.state === 'lost') return question
+      // A closing service, an aborted caller (an MCP request cancelled by Claude) and a spent
+      // budget all end the wait with whatever state the question has right now.
+      if (this.closed || options.signal?.aborted || Date.now() >= deadline) return question
+      // Both signals end the sleep at once: the caller's own, and the one close() aborts.
+      await this.pause(Math.min(WAIT_POLL_MS, Math.max(0, deadline - Date.now())), options.signal, this.closing.signal)
+    }
+  }
+
+  // A sleep that always clears its timer and detaches its listeners, so a wait can never hold the
+  // process open and never outlives the service.
+  private pause(ms: number, ...signals: Array<AbortSignal | undefined>): Promise<void> {
+    const attached = signals.filter((signal): signal is AbortSignal => signal !== undefined)
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(done, ms)
+      function done(): void {
+        clearTimeout(timer)
+        for (const signal of attached) signal.removeEventListener('abort', done)
+        resolve()
+      }
+      for (const signal of attached) signal.addEventListener('abort', done, { once: true })
+    })
   }
 
   // Nothing new starts once this is called, and everything already running is waited for before the

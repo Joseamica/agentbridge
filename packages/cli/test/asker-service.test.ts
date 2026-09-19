@@ -7,6 +7,7 @@ import {
   UserFacingError,
   applyApproval,
   createOutboundRequest,
+  createRumor,
   encodeLink,
   getContact,
   getOutboundQuestion,
@@ -16,6 +17,7 @@ import {
   openWrap,
   precheckWrap,
   setProfile,
+  wrapRumor,
   type Message,
   type Store,
 } from '@agentbridge/core'
@@ -347,5 +349,50 @@ describe('start', () => {
     const question = await service.ask('ana', 'hola')
     await waitFor(() => getOutboundQuestion(store, them.publicKey, question.questionId)?.state === 'sent')
     expect(received().map((m) => m.type)).toContain('question')
+  })
+})
+
+describe('waitForAnswer', () => {
+  function approvedContact(): void {
+    createOutboundRequest(store, { pubkey: them.publicKey, requestId: uuid(1), relays: [board.url], now: 2_000_000_000 })
+    applyApproval(store, { pubkey: them.publicKey, requestId: uuid(1), generation: 1, name: 'Ana', relays: [board.url], now: 2_000_000_000 })
+  }
+
+  // The other person's side: seal an answer to this person and drop it on the board.
+  async function injectAnswer(questionId: string): Promise<void> {
+    const rumor = createRumor(
+      { v: 1, type: 'answer', questionId, text: 'con npm run deploy', source: 'README.md', confidence: 'seguro' },
+      them,
+      nowSeconds(),
+    )
+    board.inject(await wrapRumor(rumor, them, me.publicKey, { now: nowSeconds() }))
+  }
+
+  it('returns as soon as the answer lands', async () => {
+    approvedContact()
+    const asked = await service.ask('ana', '¿cómo se despliega?')
+    await service.sync()
+
+    const waiting = service.waitForAnswer({ recipient: them.publicKey, questionId: asked.questionId }, 20)
+    await injectAnswer(asked.questionId)
+    const settled = await waiting
+    expect(settled).toMatchObject({ state: 'answered', answer: { text: 'con npm run deploy', source: 'README.md', confidence: 'seguro' } })
+  })
+
+  it('ends the wait when the service closes, instead of reading a closed store', async () => {
+    approvedContact()
+    const asked = await service.ask('ana', '¿alguien ahí?')
+    await service.sync()
+    const waiting = service.waitForAnswer({ recipient: them.publicKey, questionId: asked.questionId }, 30)
+    await service.close()
+    await expect(waiting).resolves.toMatchObject({ questionId: asked.questionId })
+  })
+
+  it('gives back the state it reached when the wait runs out, without throwing', async () => {
+    approvedContact()
+    const asked = await service.ask('ana', '¿cómo se despliega?')
+    await service.sync()
+    const settled = await service.waitForAnswer({ recipient: them.publicKey, questionId: asked.questionId }, 0)
+    expect(settled.state).toBe('sent')
   })
 })
