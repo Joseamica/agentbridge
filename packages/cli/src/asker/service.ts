@@ -238,6 +238,24 @@ export class AskerService {
     return listContacts(this.store, 'outbound')
   }
 
+  // Read by `link` (Task 10 reuses it too): what to hand someone so they can add this person. No
+  // network involved — the profile is local settings, not a relay round trip.
+  profile(): { name: string | null; relays: string[] } {
+    return getProfile(this.store)
+  }
+
+  // Whether anything addressed to that person has actually gone out: the outbox row for their
+  // pending connect request records the first relay that accepted it. Filtered to that request's own
+  // label — a recipient can carry other outbox rows once approved (their questions), and rowid order
+  // alone would silently answer about the wrong one once that happens. Used to tell "enviada" from
+  // "guardada, pendiente de envío" instead of announcing a send the relays never confirmed.
+  wasPublished(recipient: string): boolean {
+    const row = this.store.db
+      .prepare("SELECT last_published_at FROM outbox WHERE recipient = ? AND label = 'connect_request' ORDER BY rowid DESC LIMIT 1")
+      .get(recipient) as { last_published_at: number | null } | undefined
+    return row?.last_published_at != null
+  }
+
   async ask(name: string, text: string): Promise<OutboundQuestion> {
     const recipient = this.resolveContact(name)
     // createOutboundQuestion runs this same permission check itself, in Spanish ("Pídeselo con
