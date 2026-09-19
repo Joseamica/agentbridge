@@ -1,6 +1,7 @@
-import { RelayError } from '@agentbridge/core'
-import { accept, adminEnrollLink, contacts, enroll, invite, revoke, whoami } from './commands/account'
+import { CLI_COMMAND, RelayError, UserFacingError, describeError } from '@agentbridge/core'
 import { ask, ticket } from './commands/ask'
+import { connect, link } from './commands/connect'
+import { approve, contacts, reject, requests, revoke, whoami } from './commands/contacts'
 import { doctorCommand } from './commands/doctor'
 import { setupCommand } from './commands/setup'
 import { setupResponderCommand } from './commands/setup-responder'
@@ -12,51 +13,47 @@ export type Command = (argv: string[], ctx: CliContext) => Promise<void>
 
 export const USAGE = `AgentBridge — pregúntale al agente de otra persona.
 
-Para empezar (recomendado):
-  agentbridge setup [--repo <carpeta>] [--responder-home <carpeta>]
-                              (te hace las preguntas necesarias y deja todo listo; las dos
-                               opciones son solo para quien corre agentbridge desde el código
-                               fuente — --responder-home es la carpeta del perfil dedicado del
-                               respondedor, no la de tu identidad)
+Para empezar:
+  ${CLI_COMMAND} setup                       (te hace las preguntas necesarias y deja todo listo)
 
-Alta y permisos:
-  agentbridge admin enroll-link --handle <h> --name <nombre> --relay <url> --admin-token <token>
-  agentbridge enroll <enlace> [--device <nombre>]
-  agentbridge whoami
-  agentbridge invite
-  agentbridge accept <enlace>
-  agentbridge contacts
-  agentbridge revoke <handle>
+Tu enlace y tus permisos:
+  ${CLI_COMMAND} link                        (muestra tu enlace, para compartirlo)
+  ${CLI_COMMAND} connect <enlace> [--note "quién eres"]
+  ${CLI_COMMAND} contacts                    (a quién puedes preguntarle y quién puede preguntarte)
+  ${CLI_COMMAND} whoami
+
+Solicitudes que te llegan:
+  ${CLI_COMMAND} requests
+  ${CLI_COMMAND} approve <id>
+  ${CLI_COMMAND} reject <id>
+  ${CLI_COMMAND} revoke <nombre>
 
 Preguntar:
-  agentbridge ask <handle> <pregunta…> [--wait <segundos>|--no-wait]
-  agentbridge ticket <ticket_id> [--wait <segundos>]
-  agentbridge mcp            (servidor MCP para Claude Code o Codex)
+  ${CLI_COMMAND} ask <nombre> <pregunta…> [--wait <segundos>|--no-wait]
+  ${CLI_COMMAND} ticket <id> [--wait <segundos>]
+  ${CLI_COMMAND} mcp                         (servidor MCP para Claude Code o Codex)
 
 Responder desde esta computadora:
-  agentbridge setup-responder --share <carpeta> [--home <carpeta>] [--repo <carpeta>] [--model sonnet] [--effort low]
-  agentbridge doctor [--home <carpeta>] [--share <carpeta>] [--repo <carpeta>]
+  ${CLI_COMMAND} setup-responder --share <carpeta> [--home <carpeta>] [--repo <carpeta>] [--model sonnet] [--effort low]
+  ${CLI_COMMAND} doctor [--home <carpeta>] [--share <carpeta>] [--repo <carpeta>]
 
-Variables: AGENTBRIDGE_HOME (carpeta de la credencial), AGENTBRIDGE_RELAY_URL, AGENTBRIDGE_ADMIN_TOKEN`
+Variable: AGENTBRIDGE_HOME (la carpeta con tu identidad y tu base de datos)`
 
 const COMMANDS: Record<string, Command> = {
   setup: setupCommand,
-  enroll,
-  whoami,
-  invite,
-  accept,
+  'setup-responder': setupResponderCommand,
+  doctor: doctorCommand,
+  link,
+  connect,
   contacts,
+  whoami,
+  requests,
+  approve,
+  reject,
   revoke,
   ask,
   ticket,
   mcp,
-  'setup-responder': setupResponderCommand,
-  doctor: doctorCommand,
-  admin: async (argv, ctx) => {
-    const [sub, ...rest] = argv
-    if (sub !== 'enroll-link') throw new CliError('Uso: agentbridge admin enroll-link --handle <h> --name <nombre> --relay <url> --admin-token <token>')
-    await adminEnrollLink(rest, ctx)
-  },
 }
 
 function isParseArgsError(err: unknown): err is NodeJS.ErrnoException {
@@ -92,13 +89,27 @@ function translateParseArgsError(err: NodeJS.ErrnoException): string {
   }
 }
 
-export async function run(argv: string[], ctx: CliContext): Promise<number> {
+// Same swallow-its-own-failure guard as the channel's own `log` (packages/channel/src/main.ts): a
+// closed stderr pipe must never be the thing that takes a short-lived CLI process down while it is
+// trying to report an unexpected failure that already has nowhere better to go.
+const log = (message: string) => {
+  try {
+    process.stderr.write(`[agentbridge] ${message}\n`)
+  } catch {
+    // Nowhere left to report a broken logger.
+  }
+}
+
+// A seam so a test can exercise the dispatch and error-handling logic against a fake command table
+// (one that always throws a chosen error) without needing a real command to fail in just the right
+// way. `run` is the only production caller and always passes the real COMMANDS table.
+export async function runWith(commands: Record<string, Command>, argv: string[], ctx: CliContext): Promise<number> {
   const [name, ...rest] = argv
   if (!name || name === 'help' || name === '--help' || name === '-h') {
     ctx.out.log(USAGE)
     return 0
   }
-  const command = COMMANDS[name]
+  const command = commands[name]
   if (!command) {
     ctx.out.error(`Comando desconocido: ${name}\n\n${USAGE}`)
     return 1
@@ -107,7 +118,7 @@ export async function run(argv: string[], ctx: CliContext): Promise<number> {
     await command(rest, ctx)
     return 0
   } catch (err) {
-    if (err instanceof CliError || err instanceof RelayError) {
+    if (err instanceof CliError || err instanceof UserFacingError || err instanceof RelayError) {
       ctx.out.error(err.message)
       return 1
     }
@@ -119,7 +130,15 @@ export async function run(argv: string[], ctx: CliContext): Promise<number> {
       ctx.out.error(RELAY_UNREACHABLE_ES)
       return 1
     }
-    ctx.out.error(`Error inesperado: ${err instanceof Error ? err.message : String(err)}`)
+    // Never the error's own message here: it can carry a filesystem path, relay text or decrypted
+    // content — this catch is the last line of defense for every command. The person sees a fixed
+    // Spanish sentence; only describeError's type-and-code goes to the log.
+    ctx.out.error(`Algo falló al ejecutar ese comando. Vuelve a intentarlo; si sigue fallando, corre: ${CLI_COMMAND} doctor`)
+    log(`command ${name} failed (${describeError(err)})`)
     return 2
   }
+}
+
+export async function run(argv: string[], ctx: CliContext): Promise<number> {
+  return runWith(COMMANDS, argv, ctx)
 }
