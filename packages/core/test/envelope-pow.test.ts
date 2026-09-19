@@ -94,12 +94,35 @@ describe('mineEvent across several workers', () => {
   })
 
   it('splits the nonce space, so the workers never try the same nonce twice', async () => {
-    // With one worker per lane and a stride equal to the lane count, lane k only ever tries nonces
-    // congruent to k. Two runs of the same event with different lane counts must both be valid.
-    const a = await mineEvent(event, 10, { workers: 1 })
-    const b = await mineEvent(event, 10, { workers: 4 })
-    expect(leadingZeroBits(a.id)).toBeGreaterThanOrEqual(10)
-    expect(leadingZeroBits(b.id)).toBeGreaterThanOrEqual(10)
+    // A regression that handed every lane the same start offset, or a stride of 1, would still
+    // find *a* valid nonce (mining doesn't care that lanes overlap) and would keep an
+    // end-result-only assertion green while silently destroying the whole point of this task. So
+    // this captures the workerData each lane actually receives and asserts the property that makes
+    // the search disjoint and complete: n workers get the n distinct start offsets 0..n-1, each
+    // with stride n.
+    const workerData: Array<{ start: number; stride: number }> = []
+    vi.resetModules()
+    vi.doMock('node:worker_threads', async () => {
+      const actual = await vi.importActual<typeof workerThreads>('node:worker_threads')
+      class RecordingWorker extends actual.Worker {
+        constructor(...args: ConstructorParameters<typeof actual.Worker>) {
+          super(...args)
+          workerData.push(args[1]?.workerData as { start: number; stride: number })
+        }
+      }
+      return { ...actual, Worker: RecordingWorker }
+    })
+    try {
+      const { mineEvent: mineWithRecordingWorker } = await import('../src/envelope/pow')
+      const mined = await mineWithRecordingWorker(event, 10, { workers: 4 })
+      expect(leadingZeroBits(mined.id)).toBeGreaterThanOrEqual(10)
+      expect(workerData).toHaveLength(4)
+      expect(workerData.map((d) => d.stride)).toEqual([4, 4, 4, 4])
+      expect(workerData.map((d) => d.start).sort((a, b) => a - b)).toEqual([0, 1, 2, 3])
+    } finally {
+      vi.doUnmock('node:worker_threads')
+      vi.resetModules()
+    }
   })
 
   it('stops every worker when the caller aborts', async () => {
