@@ -3,7 +3,7 @@ import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
+import { afterEach, beforeAll, describe, expect, it } from 'vitest'
 import {
   applyApproval,
   createOutboundQuestion,
@@ -157,9 +157,19 @@ describe('two identity creations at once', () => {
         'process.stdout.write(JSON.stringify({ publicKey: identity.publicKey, created }))',
       ].join('\n'),
     )
+    // Same two protections every other spawned process in this file already has (runCli's own
+    // timeout+kill; both mcp children pushed to cleanups before any await): registered here right
+    // after spawn(), before anything else runs, so a stall in either process (a plausible, if rare,
+    // filesystem hiccup from two processes racing loadOrCreateIdentity's mkdir/writeFile/link/unlink
+    // against one shared tmp directory) cannot leak an orphan — vitest's own it() timeout only fails
+    // the test, it never touches the child. Mirrors the sibling tests/responder/multiprocess.test.ts,
+    // which pushes every spawned child into a shared array for the same reason.
     const run = () =>
       new Promise<{ publicKey: string; created: boolean }>((resolve, reject) => {
         const child = spawn('npx', ['tsx', scriptPath, home], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] })
+        cleanups.push(async () => {
+          if (child.exitCode === null) child.kill('SIGKILL')
+        })
         let out = ''
         let err = ''
         child.stdout.on('data', (chunk) => {
@@ -168,8 +178,19 @@ describe('two identity creations at once', () => {
         child.stderr.on('data', (chunk) => {
           err += String(chunk)
         })
-        child.once('error', reject)
-        child.once('exit', (code) => (code === 0 ? resolve(JSON.parse(out) as { publicKey: string; created: boolean }) : reject(new Error(err))))
+        const timer = setTimeout(() => {
+          child.kill('SIGKILL')
+          reject(new Error('the identity script did not finish'))
+        }, 30_000)
+        child.once('error', (spawnErr) => {
+          clearTimeout(timer)
+          reject(spawnErr)
+        })
+        child.once('exit', (code) => {
+          clearTimeout(timer)
+          if (code === 0) resolve(JSON.parse(out) as { publicKey: string; created: boolean })
+          else reject(new Error(err))
+        })
       })
     const both = await Promise.all([run(), run()])
     expect(both[0]!.publicKey).toBe(both[1]!.publicKey)
@@ -238,11 +259,18 @@ describe('a command always ends', () => {
 // successful publish, which the in-process "two askers on one home and one board" test above already
 // covers against a real board.
 //
-// A SQLITE_BUSY here is expected under this contention and must be survived, not avoided: Task 6's
-// review found that a single rejected sync used to poison AskerService forever (a rejected `.then()`
-// chain never runs again), and two real processes running device.start()'s full timer set
-// (publisher every 5 s, history and purge on start) against one WAL file is exactly the load that
-// would have caught it. Nothing here serializes the two processes on purpose.
+// Nothing here serializes the two processes on purpose, but on this class of hardware it does not
+// reliably produce a genuine SQLITE_BUSY: `openStore`'s `PRAGMA busy_timeout = 5000` plus this
+// workload's short, single-table `BEGIN IMMEDIATE…COMMIT` transactions make two writers queue
+// rather than collide (confirmed empirically: ten runs of this exact test, none showing a
+// SQLITE_BUSY in either process's log). What this test genuinely proves is narrower and still real:
+// two independent OS processes, each running device.start()'s full timer set (live subscription,
+// publisher every 5 s, purge and history on start) against one WAL file with no delay between their
+// cold starts, end with exactly one stored question, no leaked outbox claim, and both exit cleanly.
+// That shape — two full persistent-asker machineries sharing one file at once — is exactly the load
+// under which Task 6's review found a single rejected sync used to poison AskerService forever (a
+// rejected `.then()` chain never runs again); this test would catch a reintroduction of that defect
+// on a run where contention actually occurs, but does not force one to occur.
 describe('an MCP server and a CLI ask --wait on the same home', () => {
   it('neither loses the question nor corrupts the other, and both end cleanly', async () => {
     const home = await seedHome({ url: 'wss://relay.invalid' })
