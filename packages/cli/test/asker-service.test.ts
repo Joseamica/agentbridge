@@ -395,4 +395,17 @@ describe('waitForAnswer', () => {
     const settled = await service.waitForAnswer({ recipient: them.publicKey, questionId: asked.questionId }, 0)
     expect(settled.state).toBe('sent')
   })
+
+  // Review finding 6: the caller-abort exit (an MCP request cancelled by Claude) had no test — only
+  // final-state, service-close and timeout were covered. This drives it through the real signal,
+  // not just an inspection of pause()'s listener cleanup.
+  it('ends the wait when the caller aborts, without throwing', async () => {
+    approvedContact()
+    const asked = await service.ask('ana', '¿alguien ahí?')
+    await service.sync()
+    const controller = new AbortController()
+    const waiting = service.waitForAnswer({ recipient: them.publicKey, questionId: asked.questionId }, 30, { signal: controller.signal })
+    controller.abort()
+    await expect(waiting).resolves.toMatchObject({ questionId: asked.questionId, state: 'sent' })
+  })
 })
