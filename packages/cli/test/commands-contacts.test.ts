@@ -275,4 +275,27 @@ describe('revoke', () => {
   it('says which names exist when the one given does not', async () => {
     await expect(revoke(['nadie'], ctx)).rejects.toThrow()
   })
+
+  // Final review, Important I2: revokeConnection's own idempotent early return (already revoked,
+  // nothing sent again — connect_revoked's policy is 'once') must not be announced the same way a
+  // fresh revoke is, matching approve/reject's own "no cambié nada" branch (Ruling 24/M1).
+  it('says nothing changed on a repeated revoke of the same contact', async () => {
+    await withStore((store) => {
+      recordIncomingRequest(store, {
+        pubkey: beto.publicKey,
+        requestId: uuid(5),
+        requestRumorId: 'aa'.repeat(32),
+        declaredName: 'Beto',
+        note: '',
+        relays: [board.url],
+        now: T0,
+      })
+    })
+    await approve([beto.publicKey.slice(0, 8)], ctx)
+    const name = await withStore((store) => getContact(store, beto.publicKey, 'inbound')!.localName!)
+    await revoke([name], ctx)
+    ctx.out.lines.length = 0
+    await revoke([name], ctx)
+    expect(ctx.out.lines.join('\n')).toMatch(/ya habías revocado/i)
+  })
 })

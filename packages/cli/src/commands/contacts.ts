@@ -119,11 +119,19 @@ export async function reject(argv: string[], ctx: CliContext): Promise<void> {
 export async function revoke(argv: string[], ctx: CliContext): Promise<void> {
   const name = argv[0]
   if (!name) throw new CliError(`Uso: ${CLI_COMMAND} revoke <nombre>   (el nombre que aparece en ${CLI_COMMAND} contacts)`)
-  const result = await withResponderSession(ctx, async ({ store, identity }) =>
+  const { changed, rejectedQuestions } = await withResponderSession(ctx, async ({ store, identity }) =>
     revokeConnection(store, { identity, name, now: nowSeconds() }),
   )
-  ctx.out.log(`Listo: ${forTerminal(name, 80)} ya no puede preguntarte.`)
-  if (result.rejectedQuestions > 0) {
-    ctx.out.log(`Cerré ${result.rejectedQuestions} pregunta(s) suya(s) que estaban esperando respuesta.`)
+  const safeName = forTerminal(name, 80)
+  if (!changed) {
+    // Same idempotent-repeat rule as approve/reject (Ruling 24/M1): revokeConnection's own early
+    // return for an already-revoked contact touches nothing and resends nothing — connect_revoked's
+    // policy is 'once' — so this must not claim to have just acted.
+    ctx.out.log(`Ya habías revocado a ${safeName}; no cambié nada.`)
+    return
+  }
+  ctx.out.log(`Listo: ${safeName} ya no puede preguntarte.`)
+  if (rejectedQuestions > 0) {
+    ctx.out.log(`Cerré ${rejectedQuestions} pregunta(s) suya(s) que estaban esperando respuesta.`)
   }
 }

@@ -3,6 +3,7 @@ import { createServer, type AddressInfo, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  CLI_COMMAND,
   NOSTR,
   UserFacingError,
   applyApproval,
@@ -135,6 +136,25 @@ describe('connect', () => {
     bare.close()
   })
 
+  // Final review, Critical C1: this message used to tell a person to run a bare `setup` — not a
+  // command that exists on any PATH, since AgentBridge is only ever run through npx.
+  it('tells a person to run a command that actually exists when they have not set their name yet', async () => {
+    const bare = await openStore(join(await mkdtemp(join(tmpdir(), 'ab-asker-bare2-')), 'home'), { relayPolicy: allowAnyRelay })
+    const bareService = new AskerService({ store: bare, identity: me, createSocket: plainSocketFactory })
+    try {
+      await bareService.connect(encodeLink(them.publicKey, [board.url]), 'hola')
+      throw new Error('expected connect to throw')
+    } catch (err) {
+      expect(err).toBeInstanceOf(UserFacingError)
+      const message = (err as Error).message
+      expect(message).not.toContain('con: setup')
+      expect(message).toContain(CLI_COMMAND)
+    } finally {
+      await bareService.close()
+      bare.close()
+    }
+  })
+
   it('says so when that person already approved this one', async () => {
     createOutboundRequest(store, { pubkey: them.publicKey, requestId: uuid(1), relays: [board.url], now: 2_000_000_000 })
     applyApproval(store, { pubkey: them.publicKey, requestId: uuid(1), generation: 1, name: 'Ana', relays: [board.url], now: 2_000_000_000 })
@@ -162,6 +182,23 @@ describe('ask', () => {
   it('refuses a name nobody in the contact list has', async () => {
     approved()
     await expect(service.ask('nadie', 'hola')).rejects.toThrow(UserFacingError)
+  })
+
+  // Final review, Critical C1: this message used to tell a person to run a bare `contacts` — not a
+  // command that exists on any PATH, since AgentBridge is only ever run through npx. It is also the
+  // message ask_contact hands Claude on every unresolved name (mcp-asker.ts), so a bare word here
+  // sends the model chasing a tool that does not exist either.
+  it('tells a person to run a command that actually exists when the name matches no contact', async () => {
+    approved()
+    try {
+      await service.ask('nadie', 'hola')
+      throw new Error('expected ask to throw')
+    } catch (err) {
+      expect(err).toBeInstanceOf(UserFacingError)
+      const message = (err as Error).message
+      expect(message).not.toContain('con: contacts')
+      expect(message).toContain(CLI_COMMAND)
+    }
   })
 
   it('refuses to ask someone who has not approved this person yet', async () => {

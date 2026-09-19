@@ -141,3 +141,11 @@ Plan 3 (el lado que pregunta). Verificadas y acotadas; ninguna bloquea el uso.
    comandos donde la persona acaba de pedir una acción y ya se le avisa que el primer paso (minar)
    tarda unos segundos; en el peor caso, con un tablero lento en las dos rondas, el comando completo
    se acerca a los treinta segundos en vez de diez.
+2. **Mientras espera, `ask --wait` corre el mismo trabajo de fondo que un servidor persistente.** El
+   spec dice que solo el servidor MCP y el canal, por ser persistentes, corren reintentos con
+   temporizador; `waitForAnswer` arranca igual la suscripción en vivo y, con ella, los temporizadores
+   de reintento, historial y purga, durante los segundos que dure `--wait` (hasta dos minutos), lo
+   que sube la contención sobre la base de datos si ese comando y el servidor MCP corren a la vez
+   sobre la misma carpeta. Se detiene en cuanto el comando termina: no queda nada corriendo después.
+   Aceptado a propósito (Ruling 25); `tests/asker/multiprocess.test.ts` cubre justamente un comando
+   y el servidor MCP compartiendo una carpeta.

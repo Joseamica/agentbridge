@@ -111,13 +111,23 @@ export function createAskerServer(service: AskerService, options: { version?: st
         case 'connect': {
           const args = ConnectArgs.parse(req.params.arguments ?? {})
           const outcome = await service.connect(args.link, args.note ?? '')
-          await service.sync(30_000)
+          // Same fix as commands/connect.ts's connect command (Fix round 1, I1; reverted here by
+          // Ruling 19 after this MCP copy carried the same 30_000): the sync below keeps its
+          // ordinary default budget. A longer one buys nothing — mining runs on its own separate
+          // budget (CONNECT_MINING_MS in service.ts) regardless of what maxMs this sync gets, and
+          // publisher.ts publishes a row it already claimed through to the end regardless of the
+          // deadline too (a claim in flight is never abandoned, only a *new* claim is refused once
+          // the deadline has passed).
+          await service.sync()
           if (outcome.kind === 'already_approved') {
             // outcome.name is that person's own declared name — third-party text a hostile contact
             // controls, same as any other declared name (see asker/format.ts's formatContactLine and
-            // commands/connect.ts's own already_approved branch). It reaches Claude's transcript, not
-            // just a terminal, so it goes through forTerminal here exactly as it does there.
-            return ok(`Esa persona ya te dio permiso (la tienes como ${forTerminal(outcome.name, 80)}).`)
+            // commands/connect.ts's own already_approved branch) — good for identifying them, wrong
+            // for addressing them: ask_contact resolves the slugified outcome.localName, the same
+            // handle commands/connect.ts's twin branch hands back (Ruling 20, M2). Handing back the
+            // declared name here would give the model a value ask_contact cannot resolve.
+            const safeName = forTerminal(outcome.name, 80)
+            return ok(`Esa persona ya te dio permiso (la tienes como ${safeName}). Llama ask_contact con contact: "${outcome.localName}".`)
           }
           if (outcome.kind === 'already_pending') return ok('Ya le enviaste una solicitud a esa persona y sigue en camino.')
           return ok('Solicitud enviada. Esa persona decide si te da permiso; te enteras cuando list_contacts la muestre como aprobada.')

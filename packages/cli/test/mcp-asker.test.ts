@@ -123,6 +123,27 @@ describe('the asker MCP server', () => {
     expect(text).not.toMatch(/\r/)
   })
 
+  // Final review, Important I1: Ruling 20 fixed this exact bug in the CLI twin
+  // (commands/connect.ts's already_approved branch) — hand back the slug ask_contact resolves
+  // (outcome.localName), not the raw declared name, which can carry spaces or accents that never
+  // match resolveContact's slugified lookup.
+  it('hands back the slug ask_contact resolves, not the raw declared name, when already approved', async () => {
+    createOutboundRequest(store, { pubkey: ana.publicKey, requestId: uuid(3), relays: [board.url], now: T0 })
+    applyApproval(store, { pubkey: ana.publicKey, requestId: uuid(3), generation: 1, name: 'Ana María', relays: [board.url], now: T0 })
+    const localName = getContact(store, ana.publicKey, 'outbound')?.localName
+    expect(localName).toBe('ana-maria')
+
+    const { text, isError } = await call('connect', { link: encodeLink(ana.publicKey, [board.url]) })
+    expect(isError).toBe(false)
+    expect(text).toContain('Ana María')
+    expect(text).toContain('ana-maria')
+    expect(text).not.toContain('contact: "Ana María"')
+
+    // The value handed back must actually work when passed straight to ask_contact.
+    const asked = await call('ask_contact', { contact: localName!, question: 'hola' })
+    expect(asked.isError).toBe(false)
+  })
+
   it('turns an unexpected failure into a Spanish tool error without leaking its text', async () => {
     approved()
     const broken = new AskerService({ store, identity: me, createSocket: plainSocketFactory })

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import {
+  CLI_COMMAND,
   Device,
   NOSTR,
   UserFacingError,
@@ -217,7 +218,7 @@ export class AskerService {
     }
     const profile = getProfile(this.store)
     if (!profile.name) {
-      throw new UserFacingError('Antes de pedirle permiso a alguien, escribe tu nombre con: setup')
+      throw new UserFacingError(`Antes de pedirle permiso a alguien, escribe tu nombre con: ${CLI_COMMAND} setup`)
     }
     const now = this.now()
     const requestId = randomUUID()
@@ -364,6 +365,6 @@ export class AskerService {
     if (byName) return byName
     const byKey = /^[0-9a-f]{64}$/.test(cleaned.toLowerCase()) ? getContact(this.store, cleaned.toLowerCase(), 'outbound') : null
     if (byKey) return byKey
-    throw new UserFacingError('No tienes ningún contacto con ese nombre. Revisa tu lista con: contacts')
+    throw new UserFacingError(`No tienes ningún contacto con ese nombre. Revisa tu lista con: ${CLI_COMMAND} contacts`)
   }
 }

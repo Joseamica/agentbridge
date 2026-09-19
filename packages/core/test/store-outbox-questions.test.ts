@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
+  CLI_COMMAND,
   LIMITS,
   NOSTR,
   UserFacingError,
@@ -97,6 +98,21 @@ describe('createOutboundQuestion', () => {
     expect(() => createOutboundQuestion(store, { identity: me, recipient: them.publicKey, text: 'hola', now: T0 })).toThrow(UserFacingError)
     expect(outbox()).toHaveLength(0)
     expect(listOutboundQuestions(store)).toEqual([])
+  })
+
+  // Final review, Critical C1: this message used to tell a person to run a bare `connect` — not a
+  // command that exists on any PATH, since AgentBridge is only ever run through npx.
+  it('tells a person to run a command that actually exists when permission is missing', () => {
+    createOutboundRequest(store, { pubkey: them.publicKey, requestId: uuid(1), relays: RELAYS, now: T0 })
+    try {
+      createOutboundQuestion(store, { identity: me, recipient: them.publicKey, text: 'hola', now: T0 })
+      throw new Error('expected createOutboundQuestion to throw')
+    } catch (err) {
+      expect(err).toBeInstanceOf(UserFacingError)
+      const message = (err as Error).message
+      expect(message).not.toContain('con connect y')
+      expect(message).toContain(CLI_COMMAND)
+    }
   })
 
   it('refuses a question that is too large, without storing anything', () => {

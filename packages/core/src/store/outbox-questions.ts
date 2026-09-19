@@ -4,6 +4,7 @@ import type { Identity } from '../identity'
 import { NOSTR } from '../nostr-constants'
 import type { Confidence } from '../protocol'
 import { UserFacingError } from '../errors'
+import { CLI_COMMAND } from '../published'
 import { askPermission, getContact } from './contacts'
 import type { Store } from './db'
 import type { RejectReason } from './inbox'
@@ -96,7 +97,7 @@ export function createOutboundQuestion(
   return store.tx(() => {
     const permission = askPermission(store, input.recipient)
     if (!permission) {
-      throw new UserFacingError('Esa persona todavía no te dio permiso para preguntarle. Pídeselo con connect y espera a que apruebe.')
+      throw new UserFacingError(`Esa persona todavía no te dio permiso para preguntarle. Pídeselo con ${CLI_COMMAND} connect y espera a que apruebe.`)
     }
     const contact = getContact(store, input.recipient, 'outbound')!
     if (contact.relays.length === 0) {
