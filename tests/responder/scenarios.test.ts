@@ -41,6 +41,13 @@ async function approvedPair(options: { attemptTimeoutMs?: number; clock?: Clock 
 }
 
 describe('responder scenarios', () => {
+  // Pins the Task 12 fix: `until` must actually await an async predicate rather than treat the
+  // returned Promise as always-truthy. Before the fix this resolved immediately without checking
+  // anything; after it, it really waits out the timeout and rejects.
+  it('rejects when an async predicate never becomes true', async () => {
+    await expect(until(async () => false, 200, 'never')).rejects.toThrow()
+  })
+
   it(
     'revocation cancels the active question in Claude, refuses its answer, tells the asker, and rejects a waiting question on retry',
     async () => {

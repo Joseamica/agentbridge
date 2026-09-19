@@ -31,7 +31,7 @@ import { createChannelServer } from '../../packages/channel/src/channel'
 import { Dispatcher, type ReplyArgs } from '../../packages/channel/src/dispatcher'
 import { plainSocketFactory } from '../../packages/core/test/support/fake-board'
 
-export { startFakeBoard, type FakeBoard, type FakeBoardOptions } from '../../packages/core/test/support/fake-board'
+export { startFakeBoard, plainSocketFactory, type FakeBoard, type FakeBoardOptions } from '../../packages/core/test/support/fake-board'
 export { testIdentity } from '../../packages/core/test/support/keys'
 
 export type Cleanups = Array<() => unknown>
@@ -40,10 +40,16 @@ export type ChannelNote = { content: string; meta: Record<string, string> }
 
 export const allowAnyRelay = (inputs: readonly unknown[]): string[] => inputs.filter((x): x is string => typeof x === 'string').slice(0, 5)
 
-export async function until(check: () => boolean, ms = 20_000, label = 'a condition', intervalMs = 25): Promise<void> {
-  const started = Date.now()
-  while (!check()) {
-    if (Date.now() - started > ms) throw new Error(`timed out waiting for ${label}`)
+export async function until(
+  check: () => boolean | Promise<boolean>,
+  timeoutMs = 20_000,
+  label = 'condition',
+  intervalMs = 25,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    if (await check()) return
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${label}`)
     await new Promise((resolve) => setTimeout(resolve, intervalMs))
   }
 }
@@ -51,6 +57,7 @@ export async function until(check: () => boolean, ms = 20_000, label = 'a condit
 export type ResponderHarness = {
   home: string
   store: Store
+  identity: Identity
   device: Device<ResponderInboundOutcome>
   dispatcher: Dispatcher
   notes: ChannelNote[]
@@ -130,6 +137,7 @@ export async function startResponder(input: {
   return {
     home,
     store,
+    identity: input.identity,
     device,
     dispatcher,
     notes,
