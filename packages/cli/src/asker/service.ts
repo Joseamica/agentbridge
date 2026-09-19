@@ -42,7 +42,10 @@ export type AskerServiceOptions = {
 export type ConnectOutcome =
   | { kind: 'requested'; pubkey: string; relays: string[] }
   | { kind: 'already_pending'; pubkey: string }
-  | { kind: 'already_approved'; pubkey: string; name: string }
+  // `name` is for identifying that person to the one running the command; `localName` is the exact,
+  // already-slugified string `ask`'s own resolveContact matches against (Fix round 1, M2) — a
+  // declared name can carry spaces, accents or characters `ask` would never resolve.
+  | { kind: 'already_approved'; pubkey: string; name: string; localName: string }
 
 const CLI_SYNC_MS = 10_000
 // Proof of work is CPU, not network: it gets its own budget so it never eats the ten seconds the
@@ -201,9 +204,16 @@ export class AskerService {
     const decoded = decodeLink(link)
     const existing = getContact(this.store, decoded.publicKey, 'outbound')
     if (existing?.state === 'approved') {
-      // The declared name is what the other person actually typed (original casing); localName is
-      // only the lowercase slug used for addressing (`ask ana ...`) and would read oddly here.
-      return { kind: 'already_approved', pubkey: decoded.publicKey, name: existing.declaredName ?? existing.localName ?? decoded.publicKey.slice(0, 8) }
+      // The declared name is what the other person actually typed (original casing) — good for
+      // identifying them, wrong for addressing them: `ask` matches on the slugified localName, which
+      // applyApproval always sets once a contact is approved.
+      const fallback = decoded.publicKey.slice(0, 8)
+      return {
+        kind: 'already_approved',
+        pubkey: decoded.publicKey,
+        name: existing.declaredName ?? existing.localName ?? fallback,
+        localName: existing.localName ?? fallback,
+      }
     }
     const profile = getProfile(this.store)
     if (!profile.name) {
