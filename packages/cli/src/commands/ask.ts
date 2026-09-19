@@ -1,53 +1,18 @@
-import { LIMITS, type RelayHttpClient, type TicketView } from '@agentbridge/core'
 import { parseArgs } from 'node:util'
-import { CliError, clientFor, requireConfig, type CliContext } from '../context'
+import { CLI_COMMAND, LIMITS } from '@agentbridge/core'
+import { formatQuestion } from '../asker/format'
+import { withAsker } from '../asker/session'
+import { CliError, type CliContext } from '../context'
 
-const TERMINAL = new Set<TicketView['status']>(['answered', 'expired', 'cancelled'])
-
-export function isTerminal(status: TicketView['status']): boolean {
-  return TERMINAL.has(status)
-}
-
-export function formatTicket(view: TicketView): string {
-  switch (view.status) {
-    case 'answered': {
-      const seconds = view.latencyMs === null ? '?' : Math.round(view.latencyMs / 1000)
-      return `@${view.to} contestó (${seconds} s):\n\n${view.answer}\n\nFuente: ${view.source}\nConfianza: ${view.confidence}`
-    }
-    case 'queued':
-      return `En cola: @${view.to} todavía no la recibe (su agente no está conectado o está contestando otra pregunta).`
-    case 'dispatched':
-      return `@${view.to} la está contestando.`
-    case 'expired':
-      return `Expiró sin respuesta de @${view.to}.`
-    case 'cancelled':
-      return `Se canceló: @${view.to} retiró el permiso.`
-  }
-}
-
-export async function waitForTicket(
-  client: Pick<RelayHttpClient, 'ticket'>,
-  ticketId: string,
-  totalSeconds: number,
-): Promise<TicketView> {
-  const deadline = Date.now() + totalSeconds * 1000
-  let view = await client.ticket(ticketId, 0)
-  while (!isTerminal(view.status)) {
-    const remaining = Math.floor((deadline - Date.now()) / 1000)
-    if (remaining <= 0) break
-    view = await client.ticket(ticketId, Math.min(LIMITS.longPollMaxSeconds, remaining))
-  }
-  return view
-}
-
-// Shared by `ask` and `ticket` so a mistyped --wait gives the exact same clean, local
-// Spanish message in both commands, instead of a bare `Number(...)` turning into NaN and
-// only failing much later at the relay with a generic "Datos inválidos en: wait".
+// Shared by `ask` and `ticket` so a mistyped --wait gives the exact same clean, local Spanish
+// message in both commands instead of turning into NaN and failing much later.
 function parseWaitSeconds(raw: string | undefined, fallback: number): number {
   const seconds = Number(raw ?? fallback)
   if (!Number.isFinite(seconds) || seconds < 0) throw new CliError('--wait debe ser un número de segundos')
   return seconds
 }
+
+const RETRY_NOTE = 'Si esa persona tiene su computadora apagada, la pregunta se reintenta sola cada vez que corres un comando, hasta una semana.'
 
 export async function ask(argv: string[], ctx: CliContext): Promise<void> {
   const { values, positionals } = parseArgs({
@@ -55,27 +20,50 @@ export async function ask(argv: string[], ctx: CliContext): Promise<void> {
     allowPositionals: true,
     options: { wait: { type: 'string' }, 'no-wait': { type: 'boolean' } },
   })
-  const [rawHandle, ...words] = positionals
-  const question = words.join(' ').trim()
-  if (!rawHandle || !question) throw new CliError('Uso: agentbridge ask <handle> <pregunta…> [--wait <segundos>|--no-wait]')
-  const totalSeconds = values['no-wait'] ? 0 : parseWaitSeconds(values.wait, 120)
+  const [name, ...words] = positionals
+  const text = words.join(' ').trim()
+  if (!name || !text) throw new CliError(`Uso: ${CLI_COMMAND} ask <nombre> <pregunta…> [--wait <segundos>|--no-wait]`)
+  if (text.length > LIMITS.questionMaxChars) throw new CliError(`La pregunta puede tener como máximo ${LIMITS.questionMaxChars} caracteres.`)
+  const waitSeconds = values['no-wait'] ? 0 : parseWaitSeconds(values.wait, 120)
 
-  const config = await requireConfig(ctx)
-  const client = clientFor(ctx, config)
-  const { ticketId } = await client.ask(rawHandle.replace(/^@/, ''), question)
-  ctx.out.log(`Pregunta enviada. ticket_id: ${ticketId}`)
-  if (totalSeconds === 0) return
-  const view = await waitForTicket(client, ticketId, totalSeconds)
-  ctx.out.log(formatTicket(view))
-  if (!isTerminal(view.status)) ctx.out.log(`Sigue pendiente. Consulta después con: agentbridge ticket ${ticketId} --wait 45`)
+  await withAsker(ctx, async (service) => {
+    const question = await service.ask(name, text)
+    // The second sync inside withAsker publishes it; sync here too so the identifier we print is
+    // already accompanied by a real send attempt when the person chose not to wait.
+    await service.sync()
+    // What actually happened is in the stored state: `sent` means a relay took it, `sending` means
+    // it is saved and still trying. Saying "enviada" either way would be a lie when every relay is
+    // down, which is exactly when a person needs the truth.
+    const stored = service.question(question.questionId)
+    ctx.out.log(
+      stored.state === 'sending'
+        ? `Pregunta guardada para ${name}, pendiente de envío: ningún tablero la aceptó todavía.`
+        : `Pregunta enviada a ${name}.`,
+    )
+    ctx.out.log(`Identificador: ${question.questionId}`)
+    ctx.out.log(RETRY_NOTE)
+    if (waitSeconds === 0) {
+      ctx.out.log(`Consulta la respuesta con: ${CLI_COMMAND} ticket ${question.questionId} --wait 60`)
+      return
+    }
+    ctx.out.log('')
+    const settled = await service.waitForAnswer({ recipient: question.recipient, questionId: question.questionId }, waitSeconds)
+    ctx.out.log(formatQuestion(settled, { contactName: name }))
+    if (settled.state !== 'answered' && settled.state !== 'rejected' && settled.state !== 'lost') {
+      ctx.out.log(`Sigue pendiente. Consulta después con: ${CLI_COMMAND} ticket ${question.questionId} --wait 60`)
+    }
+  })
 }
 
 export async function ticket(argv: string[], ctx: CliContext): Promise<void> {
   const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: { wait: { type: 'string' } } })
-  const ticketId = positionals[0]
-  if (!ticketId) throw new CliError('Uso: agentbridge ticket <ticket_id> [--wait <segundos>]')
+  const id = positionals[0]
+  if (!id) throw new CliError(`Uso: ${CLI_COMMAND} ticket <id> [--wait <segundos>]`)
   const waitSeconds = parseWaitSeconds(values.wait, 0)
-  const config = await requireConfig(ctx)
-  const view = await waitForTicket(clientFor(ctx, config), ticketId, waitSeconds)
-  ctx.out.log(formatTicket(view))
+
+  await withAsker(ctx, async (service) => {
+    const question = service.question(id)
+    const settled = waitSeconds > 0 ? await service.waitForAnswer({ recipient: question.recipient, questionId: question.questionId }, waitSeconds) : question
+    ctx.out.log(formatQuestion(settled))
+  })
 }

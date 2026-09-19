@@ -1,11 +1,32 @@
-import { LIMITS, RelayError, type RelayHttpClient } from '@agentbridge/core'
+import { LIMITS, RelayError, type RelayHttpClient, type TicketView } from '@agentbridge/core'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import { formatTicket } from './commands/ask'
 import { clientFor, requireConfig, type CliContext } from './context'
 import { isNetworkError, RELAY_UNREACHABLE_ES, zodFieldsMessage } from './spanish-errors'
+
+// Task 10 deleted `formatTicket` from `./commands/ask` along with the rest of the 0.1 relay-based
+// ticket view (`ask`/`ticket` now run over the stored asker state instead). This server still
+// speaks the old `RelayHttpClient`/`TicketView` API end to end, so it keeps its own copy of the
+// same formatting rather than importing a symbol that no longer exists. Task 11 replaces this
+// whole file with one built on `AskerService` and `formatQuestion`.
+function formatTicket(view: TicketView): string {
+  switch (view.status) {
+    case 'answered': {
+      const seconds = view.latencyMs === null ? '?' : Math.round(view.latencyMs / 1000)
+      return `@${view.to} contestó (${seconds} s):\n\n${view.answer}\n\nFuente: ${view.source}\nConfianza: ${view.confidence}`
+    }
+    case 'queued':
+      return `En cola: @${view.to} todavía no la recibe (su agente no está conectado o está contestando otra pregunta).`
+    case 'dispatched':
+      return `@${view.to} la está contestando.`
+    case 'expired':
+      return `Expiró sin respuesta de @${view.to}.`
+    case 'cancelled':
+      return `Se canceló: @${view.to} retiró el permiso.`
+  }
+}
 
 export type AskerApi = Pick<RelayHttpClient, 'contacts' | 'ask' | 'ticket'>
 
