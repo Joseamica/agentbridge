@@ -329,6 +329,32 @@ describe('BoardConnection', () => {
     expect(conn.isOpen).toBe(true)
   })
 
+  // Fix round 1 on Task 5: abort() used to settle only pendingOk, leaving a subscription's REQ
+  // running to its own EOSE/CLOSED timeout even though the caller had already moved on — the pool's
+  // comment claimed the socket work stopped, but `subs` still held the entry. abort() must tear the
+  // subscription down the same way unsubscribe() does (CLOSE sent, removed from `subs`) and tell the
+  // handler why, so nothing is left running and a later frame for that id is ignored quietly.
+  it('abort() tears down a pending subscription instead of leaving it running to its own timeout', async () => {
+    const { board, conn } = await setup({ ignoreReads: true })
+    const r = recorder()
+    conn.subscribe('s', [{ kinds: [1059] }], r.handlers)
+    await until(() => board.frames.some((f) => f[0] === 'REQ'))
+    const started = Date.now()
+    conn.abort('sync deadline reached')
+    expect(Date.now() - started).toBeLessThan(1_000)
+    expect(r.closed).toEqual(['error: sync deadline reached'])
+    expect((conn as unknown as { subs: Map<string, unknown> }).subs.size).toBe(0)
+    // The CLOSE frame travels over the real (loopback) socket, so it may not have arrived yet.
+    await until(() => board.frames.some((f) => f[0] === 'CLOSE'))
+    expect(board.frames.filter((f) => f[0] === 'CLOSE')).toHaveLength(1)
+
+    // Nothing is settled twice: a later, unrelated close of the socket must not call onClosed again
+    // for a subscription abort() already tore down.
+    board.disconnectAll()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(r.closed).toEqual(['error: sync deadline reached'])
+  })
+
   it('refuses heartbeat intervals that would turn into a reconnect storm', () => {
     for (const heartbeatMs of [0, -5, 1.5, 9, 2 ** 31]) {
       expect(() => new BoardConnection({ url: 'ws://127.0.0.1:1', identity: me, heartbeatMs })).toThrow(RangeError)

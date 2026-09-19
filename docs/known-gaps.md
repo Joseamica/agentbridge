@@ -122,3 +122,19 @@ Plan 2 (el lado que responde preguntas). Verificadas y acotadas; ninguna bloquea
    pendiente; si alguien cambia de tableros después de ser aprobado, sus acuses y respuestas siguen
    yendo a los viejos hasta que se revoque y vuelva a solicitar. Es como está especificado, pero no
    hay salida por protocolo; el plan 3 o 4 debe decidir si añade una.
+
+## 0.2 — preguntador: brechas verificadas y deliberadas
+
+Plan 3 (el lado que pregunta). Verificadas y acotadas; ninguna bloquea el uso.
+
+1. **Una sincronización corta puede tardar hasta unos veinte segundos, no diez, si el tablero de un
+   contacto está lento.** El plazo (`maxMs`, diez segundos por defecto) acota las lecturas de red de
+   la sincronización — cada consulta al tablero y cada publicación que todavía no empezó respetan
+   ese límite —, pero una fila que ya se minó y reclamó siempre se publica, aunque el plazo haya
+   vencido mientras tanto: descartarla significaría volver a minar la misma solicitud de conexión en
+   cada comando, para siempre (tarea 5 del plan 3). Esa publicación solo queda acotada por el tiempo
+   de espera propio del tablero por relé, así que la garantía real es "el plazo pactado, más como
+   mucho una ronda de publicación de una fila ya minada". Pasa en `connect` y en `ask`, los dos
+   comandos donde la persona acaba de pedir una acción y ya se le avisa que el primer paso (minar)
+   tarda unos segundos; en el peor caso, con un tablero lento, el comando completo tarda unos veinte
+   segundos en vez de diez.

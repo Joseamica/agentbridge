@@ -14,9 +14,10 @@ export type RecoverHistoryInput = {
   now: number
   handle(raw: unknown): Promise<void>
   queryTimeoutMs?: number
-  // Ruling 26: checked before every query. Once aborted no further query is sent, and the window
-  // being read and every window after it count as incomplete (a query already in flight still runs
-  // to its end; closing the pool ends it).
+  // Ruling 26 (Task 5: now also passed to `pool.query` itself, not just checked here): once
+  // aborted, no further query is sent, and a query already in flight ends at once too — the window
+  // being read and every window after it count as incomplete. Closing the pool still ends
+  // everything, as before.
   signal?: AbortSignal
 }
 

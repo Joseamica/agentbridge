@@ -155,6 +155,16 @@ export class BoardConnection extends EventEmitter {
     const waiting = [...this.pendingOk.values()]
     this.pendingOk.clear()
     for (const settle of waiting) settle({ ok: false, message: `error: ${reason}` })
+    // A cancelled query must not be left running to its own EOSE/CLOSED timeout either: every
+    // pending subscription is torn down the same way unsubscribe() ends one — CLOSE sent, removed
+    // from `subs`, so a lagging EVENT/EOSE/CLOSED for this id is quietly ignored by onFrame's own
+    // `if (!sub) return` — and told why, so its own wait (and whatever timer it holds, such as
+    // pool.ts's query timeout) settles now instead of running to its own end. The snapshot is taken
+    // before any of this runs, so tearing one down can never affect the others mid-loop.
+    for (const [id, sub] of [...this.subs.entries()]) {
+      this.unsubscribe(id)
+      void this.runHandler(() => sub.handlers.onClosed(`error: ${reason}`), 'closed')
+    }
   }
 
   private async readFrames(stream: AsyncIterable<unknown>, liveness: Liveness): Promise<void> {
