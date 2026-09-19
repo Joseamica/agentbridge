@@ -127,8 +127,8 @@ Plan 2 (el lado que responde preguntas). Verificadas y acotadas; ninguna bloquea
 
 Plan 3 (el lado que pregunta). Verificadas y acotadas; ninguna bloquea el uso.
 
-1. **Una sincronización corta puede tardar hasta unos veinte segundos, no diez, si el tablero de un
-   contacto está lento.** El plazo (`maxMs`, diez segundos por defecto) acota las lecturas de red de
+1. **Una sincronización corta puede pasar de los diez segundos —hasta cerca de treinta en el peor
+   caso— si el tablero de un contacto está lento.** El plazo (`maxMs`, diez segundos por defecto) acota las lecturas de red de
    la sincronización — cada consulta al tablero y cada publicación que todavía no empezó respetan
    ese límite —, pero una fila que ya se minó y reclamó siempre se publica, aunque el plazo haya
    vencido mientras tanto: descartarla significaría volver a minar la misma solicitud de conexión en
@@ -139,5 +139,5 @@ Plan 3 (el lado que pregunta). Verificadas y acotadas; ninguna bloquea el uso.
    pactado, más como mucho una fila ya reclamada que se pasa del plazo por cada ronda de publicación:
    como mucho dos por sincronización". Pasa en `connect` y en `ask`, los dos
    comandos donde la persona acaba de pedir una acción y ya se le avisa que el primer paso (minar)
-   tarda unos segundos; en el peor caso, con un tablero lento, el comando completo tarda unos veinte
-   segundos en vez de diez.
+   tarda unos segundos; en el peor caso, con un tablero lento en las dos rondas, el comando completo
+   se acerca a los treinta segundos en vez de diez.
