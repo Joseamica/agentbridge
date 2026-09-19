@@ -137,34 +137,48 @@ export class AskerService {
     const previous = this.syncing.catch(() => undefined)
     const run = previous.then(async () => {
       if (this.closed) return EMPTY_REPORT
-      // A reserved publish pass, under its own deadline, run before Device's own history-then-publish
-      // cycle: `Device.runSync` spends `maxMs` on history first, so a relay that never answers can
-      // leave `publishDue`'s signal already spent before its very first round even starts, and a
-      // command that just enqueued something (`ask`, `connect`) would report success having sent
-      // nothing. This does not change `Device`'s shared history-then-publish order — the responder
-      // still relies on that ordering — it only adds an extra, asker-only attempt. Bounded exactly
-      // like the overshoot `docs/known-gaps.md`'s 0.2 asker section already documents for a row that
-      // paid its proof of work before a deadline lapsed: only by the relay's own per-relay wait, not
-      // by history's clock.
-      const reserved = await this.publishReserved(maxMs)
-      const report = await this.device.syncOnce({ maxMs })
+      // One deadline for the whole sync, not two. The reserved pass, run before Device's own
+      // history-then-publish cycle, exists so a relay that never answers history cannot leave a
+      // command's own enqueued row unpublished (`Device.runSync` spends `maxMs` on history first, so
+      // publishDue's shared signal could otherwise already be spent before its very first round even
+      // starts). But giving that pass its own full `maxMs` and then handing device.syncOnce another
+      // full `maxMs` let one sync take up to twice what the caller asked for — exactly what the
+      // spec's ten seconds are supposed to bound. So the reserved pass spends from `maxMs`, and only
+      // what it did not spend goes to device.syncOnce; publishing still cannot be starved, because it
+      // goes first. If nothing is left, device.syncOnce still runs — with an already-expired
+      // deadline, not skipped — so nothing silently stops happening; wall time, not `this.now()`
+      // (which a test can hold still), is what measures the spend, matching how Device's own
+      // `setTimeout`-based deadline works.
+      // Each pass keeps its own "a row already claimed is always published" rule: the shared
+      // deadline bounds when a pass may *start* claiming a new row, not a claim already in flight
+      // (docs/known-gaps.md's 0.2 asker section, now updated for two passes instead of one).
+      const startedAt = Date.now()
+      const { report: reservedReport, timedOut: reservedTimedOut } = await this.publishReserved(maxMs)
+      const remainingMs = Math.max(0, maxMs - (Date.now() - startedAt))
+      const report = await this.device.syncOnce({ maxMs: remainingMs })
       const now = this.now()
       markSentQuestions(this.store, now)
       expireOutboundQuestions(this.store, now)
-      return { history: report.history, timedOut: report.timedOut, published: addPublishReports(reserved, report.published) }
+      return {
+        history: report.history,
+        // Either pass timing out is a timeout for the sync as a whole: a caller that only reads
+        // device.syncOnce's own flag would silently miss one that happened only in the reserved pass.
+        timedOut: reservedTimedOut || report.timedOut,
+        published: addPublishReports(reservedReport, report.published),
+      }
     })
     this.syncing = run.catch(() => EMPTY_REPORT)
     return run
   }
 
-  // See sync()'s comment. A deadline of its own, independent of whatever history spends inside
-  // device.syncOnce() right afterwards, so a row this command just enqueued always gets one real
-  // attempt this sync — not zero, which is what an already-spent shared deadline gives it.
-  private async publishReserved(maxMs: number): Promise<PublishReport> {
+  // See sync()'s comment. Shares the sync's own `maxMs`-sized deadline (not a second one of its own)
+  // so a row this command just enqueued always gets one real attempt this sync — not zero, which is
+  // what an already-spent deadline gives it — without doubling the sync's total network-bound time.
+  private async publishReserved(maxMs: number): Promise<{ report: PublishReport; timedOut: boolean }> {
     const deadline = new AbortController()
     const timer = setTimeout(() => deadline.abort(), maxMs)
     try {
-      return await publishDue({
+      const report = await publishDue({
         store: this.store,
         identity: this.identity,
         pool: this.device.pool,
@@ -174,6 +188,7 @@ export class AskerService {
         log: this.log,
         onPublished: this.handlePublished,
       })
+      return { report, timedOut: deadline.signal.aborted }
     } finally {
       clearTimeout(timer)
     }

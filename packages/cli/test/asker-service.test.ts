@@ -261,6 +261,78 @@ describe('sync', () => {
       await blackHole.close()
     }
   })
+
+  // Fix round 2, finding 1. The reserved publish pass and device.syncOnce used to each get their own
+  // full `maxMs` — a sync's deadline-bound network time could take up to twice what the caller asked
+  // for, which is exactly what a "ten-second" sync must not do. This pins the arithmetic directly and
+  // deterministically: given how long the reserved pass took (controlled through Date.now(), the same
+  // clock sync() itself reads — not this.now(), which a test can hold still for unrelated reasons),
+  // device.syncOnce must be handed only what is left of maxMs, never maxMs again in full.
+  //
+  // A real-relay version of this test was tried first and dropped: with nothing enqueued, the
+  // reserved pass has nothing to claim and returns in well under a millisecond whether or not it owns
+  // a full maxMs of its own, so a real black hole for history alone cannot tell a shared deadline
+  // apart from two independent ones — and publishDue's own publish step (packages/core's
+  // device/publisher.ts) is deliberately called without a signal at all (Task 5's Important 2 /
+  // Ruling 12: an already-mined row is never discarded), so a real black hole for the reserved pass's
+  // own target is bounded by BoardConnection's ~10s connect timeout, not by maxMs — accurate, but far
+  // too slow for a unit test to pin the arithmetic. Mocking is the precise tool here; the "still
+  // publishes what a command enqueued..." test above and the "start" test below already cover the
+  // real, end-to-end network paths.
+  it('hands device.syncOnce only what the reserved publish pass left of the deadline, not another full one', async () => {
+    let call = 0
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => (call++ === 0 ? 1_000_000 : 1_000_400))
+    const publishReservedSpy = vi
+      .spyOn(service as unknown as { publishReserved(maxMs: number): Promise<unknown> }, 'publishReserved')
+      .mockResolvedValueOnce({ report: { published: 0, failed: 0, postponed: 0, lost: 0 }, timedOut: false })
+    const syncOnceSpy = vi
+      .spyOn(service.device, 'syncOnce')
+      .mockResolvedValueOnce({ history: [], published: { published: 0, failed: 0, postponed: 0, lost: 0 }, timedOut: false })
+
+    // The reserved pass "took" 400ms of a 1000ms budget (the two Date.now() reads above): what
+    // remains for device.syncOnce is 600ms, never the original 1000ms again.
+    await service.sync(1_000)
+
+    expect(syncOnceSpy).toHaveBeenCalledWith({ maxMs: 600 })
+    nowSpy.mockRestore()
+    publishReservedSpy.mockRestore()
+    syncOnceSpy.mockRestore()
+  })
+
+  // Fix round 2, finding 1 (the "not skipped outright" half). When the reserved pass alone already
+  // spends the whole budget, device.syncOnce must still run — with an expired deadline, which it is
+  // built to handle on its own — rather than being skipped.
+  it('still calls device.syncOnce, with a zeroed-out deadline, when the reserved pass used the whole budget', async () => {
+    let call = 0
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => (call++ === 0 ? 1_000_000 : 1_002_000))
+    const publishReservedSpy = vi
+      .spyOn(service as unknown as { publishReserved(maxMs: number): Promise<unknown> }, 'publishReserved')
+      .mockResolvedValueOnce({ report: { published: 0, failed: 0, postponed: 0, lost: 0 }, timedOut: true })
+    const syncOnceSpy = vi
+      .spyOn(service.device, 'syncOnce')
+      .mockResolvedValueOnce({ history: [], published: { published: 0, failed: 0, postponed: 0, lost: 0 }, timedOut: false })
+
+    await service.sync(1_000)
+
+    expect(syncOnceSpy).toHaveBeenCalledTimes(1)
+    expect(syncOnceSpy).toHaveBeenCalledWith({ maxMs: 0 })
+    nowSpy.mockRestore()
+    publishReservedSpy.mockRestore()
+    syncOnceSpy.mockRestore()
+  })
+
+  // Fix round 2, finding 2. The merged report used to carry only device.syncOnce's own `timedOut`,
+  // silently dropping a timeout that happened only in the reserved pass. Isolates the merge itself —
+  // publishReserved is stubbed directly, decoupled from real relay timing — rather than relying on a
+  // real black hole to happen to produce exactly this combination.
+  it('reports timedOut when only the reserved publish pass timed out', async () => {
+    const reservedSpy = vi
+      .spyOn(service as unknown as { publishReserved(maxMs: number): Promise<unknown> }, 'publishReserved')
+      .mockResolvedValueOnce({ report: { published: 0, failed: 0, postponed: 0, lost: 0 }, timedOut: true })
+    const result = await service.sync(5_000)
+    expect(result.timedOut).toBe(true)
+    reservedSpy.mockRestore()
+  })
 })
 
 describe('start', () => {
