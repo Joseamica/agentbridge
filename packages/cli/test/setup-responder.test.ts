@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { beforeEach, describe, expect, it } from 'vitest'
 import {
+  defaultRunner,
   findPluginRoot,
   REPLY_TOOL_NAME,
   repoDirFromBundleLocation,
@@ -75,6 +76,32 @@ describe('responderSettings', () => {
       },
     })
   })
+})
+
+describe('defaultRunner', () => {
+  it(
+    'kills a real hung child when its signal aborts, rather than leaving it orphaned',
+    async () => {
+      // A real OS process, not a mock: a mock CommandRunner has no process for anything to kill,
+      // so it cannot prove this — see doctor.ts's own bounded login check, which relies on this
+      // exact behavior to avoid leaving `claude auth status` running forever.
+      const scriptPath = join(root, 'hang.js')
+      const pidPath = join(root, 'hang.pid')
+      await writeFile(
+        scriptPath,
+        ["require('node:fs').writeFileSync(process.argv[2], String(process.pid))", 'setInterval(() => {}, 1_000)', ''].join('\n'),
+      )
+      const result = await defaultRunner(process.execPath, [scriptPath, pidPath], { env: process.env, signal: AbortSignal.timeout(1_000) })
+      expect(result.code).toBe(124)
+      const pid = Number(await readFile(pidPath, 'utf8'))
+      // Signal 0 sends nothing; it only checks whether the process still exists. ESRCH means it
+      // is gone — defaultRunner's own kill must already have reaped it by the time the call
+      // resolves, not merely raced a promise while the real child (and its open stdio, which
+      // keeps the event loop alive) lived on.
+      expect(() => process.kill(pid, 0)).toThrow(/ESRCH/)
+    },
+    10_000,
+  )
 })
 
 describe('setupResponder', () => {

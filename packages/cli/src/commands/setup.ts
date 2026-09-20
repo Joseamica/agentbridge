@@ -430,9 +430,6 @@ export async function assessShareDir(
   return { exists, isHome, credentialConflict, problem, reasons }
 }
 
-const MCP_YESNO_GIVEUP_ES =
-  `No entendí tu respuesta. Puedes registrarlo tú cuando quieras con: claude mcp add agentbridge --scope user -- ${CLI_COMMAND} mcp`
-
 // The public entry point tests and setupCommand call. It's a thin wrapper around
 // `runGuidedSetup`: its only job is to turn a `PromptEOF` that escapes the whole flow into
 // INPUT_CLOSED_ES — reached whenever stdin closes or a test's scripted answers run out partway
@@ -648,27 +645,30 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     out.log('')
 
     out.log('Para preguntar desde tu propio Claude Code hace falta además registrar el servidor MCP de AgentBridge una vez.')
+    // A registration that stores only CLI_ARGV starts its server against the DEFAULT home. Someone
+    // who set AGENTBRIDGE_HOME for this run would end up with a Claude Code tool talking to a
+    // different identity than the one this setup just prepared — with no error, just an empty
+    // contact list. When the home is not the default, it travels with the registration. Computed
+    // before the yes/no question below so the give-up message offers this same command, not a
+    // second, hand-written one that forgets --env for a custom home.
+    const customHome = ctx.home !== agentbridgeHome({}) ? ctx.home : null
+    const envArgs = customHome ? ['--env', `AGENTBRIDGE_HOME=${customHome}`] : []
+    const manual = `claude mcp add agentbridge --scope user ${envArgs.join(' ')} -- ${CLI_COMMAND} mcp`.replace(/\s+/g, ' ')
+    const mcpYesNoGiveUpEs = `No entendí tu respuesta. Puedes registrarlo tú cuando quieras con: ${manual}`
     let wantsMcp: boolean
     try {
-      wantsMcp = await askWithRetries(prompt, out, '¿Lo registro ahora? [s/n]: ', parseYesNo, 'Escribe s (sí) o n (no).', MCP_YESNO_GIVEUP_ES)
+      wantsMcp = await askWithRetries(prompt, out, '¿Lo registro ahora? [s/n]: ', parseYesNo, 'Escribe s (sí) o n (no).', mcpYesNoGiveUpEs)
     } catch (err) {
       // Exhausting this one question must not throw away a verdict for work that may already
       // have succeeded on the responder side (the "ambas" role) — treat it as "no" and keep
       // going, the same graceful landing as if they had typed "n" the first time.
-      if (err instanceof CliError && err.message === MCP_YESNO_GIVEUP_ES) {
+      if (err instanceof CliError && err.message === mcpYesNoGiveUpEs) {
         out.log('No pude entender tu respuesta después de varios intentos; sigo sin registrar el servidor MCP automáticamente.')
         wantsMcp = false
       } else {
         throw err
       }
     }
-    // A registration that stores only CLI_ARGV starts its server against the DEFAULT home. Someone
-    // who set AGENTBRIDGE_HOME for this run would end up with a Claude Code tool talking to a
-    // different identity than the one this setup just prepared — with no error, just an empty
-    // contact list. When the home is not the default, it travels with the registration.
-    const customHome = ctx.home !== agentbridgeHome({}) ? ctx.home : null
-    const envArgs = customHome ? ['--env', `AGENTBRIDGE_HOME=${customHome}`] : []
-    const manual = `claude mcp add agentbridge --scope user ${envArgs.join(' ')} -- ${CLI_COMMAND} mcp`.replace(/\s+/g, ' ')
     let mcpRegistered = false
     if (wantsMcp) {
       const result = await ctx.run('claude', ['mcp', 'add', 'agentbridge', '--scope', 'user', ...envArgs, '--', ...CLI_ARGV, 'mcp'], { env: ctx.env })

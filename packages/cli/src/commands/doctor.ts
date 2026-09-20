@@ -250,17 +250,6 @@ export async function probeBoard(o: {
   return { ok: true, detail: 'publicar y leer, los dos' }
 }
 
-// A diagnostic that can hang forever is worse than one that says "I could not tell": the person is
-// left staring at a command that never returns, with no way to know which check stalled.
-async function runBounded(run: CommandRunner, command: string, args: string[], opts: { env: NodeJS.ProcessEnv }, ms: number) {
-  return Promise.race([
-    run(command, args, opts),
-    new Promise<{ code: number; stdout: string; stderr: string }>((resolve) =>
-      setTimeout(() => resolve({ code: 124, stdout: '', stderr: 'timeout' }), ms).unref(),
-    ),
-  ])
-}
-
 async function addProfileChecks(
   add: (name: string, ok: boolean, detail: string) => void,
   o: { profileHome: string; shareDir?: string; repoDir?: string; run: CommandRunner },
@@ -346,12 +335,19 @@ async function addProfileChecks(
     authDetail = `Aún no existe el perfil dedicado (${claudeConfigDir}); no se ha iniciado sesión.`
   } else {
     const authEnv = { ...process.env, CLAUDE_CONFIG_DIR: claudeConfigDir }
-    // defaultRunner resolves (never rejects) with code 127 when `spawn('claude', ...)` itself
-    // fails (binary missing, not executable, etc.) — its stderr is Node's own English message
-    // (e.g. "spawn claude ENOENT"). The `.catch` below only exists for a custom CommandRunner
-    // that rejects instead; it is coerced into the same 127 shape so both paths are handled
-    // identically, in Spanish, as a failing check rather than a crash or a silent pass.
-    const authResult = await runBounded(o.run, 'claude', ['auth', 'status', '--json'], { env: authEnv }, 15_000).catch(
+    // A diagnostic that can hang forever is worse than one that says "I could not tell": the
+    // person is left staring at a command that never returns, with no way to know which check
+    // stalled. The bound lives in the signal, not in a `Promise.race` here: `defaultRunner`
+    // passes `signal` straight to `spawn`, which is Node's own kill-on-abort — the only thing
+    // that actually reaps a hung child, rather than merely racing a promise while the real
+    // process (and its open stdio pipes, which keep the event loop alive) lives on. defaultRunner
+    // resolves (never rejects) with code 124 when the signal fires, and with code 127 when
+    // `spawn('claude', ...)` itself fails for an unrelated reason (binary missing, not
+    // executable, etc.) — its stderr is Node's own English message (e.g. "spawn claude ENOENT").
+    // The `.catch` below only exists for a custom CommandRunner that rejects instead; it is
+    // coerced into the same 127 shape so both paths are handled identically, in Spanish, as a
+    // failing check rather than a crash or a silent pass.
+    const authResult = await o.run('claude', ['auth', 'status', '--json'], { env: authEnv, signal: AbortSignal.timeout(15_000) }).catch(
       (err): { code: number; stdout: string; stderr: string } => ({
         code: 127,
         stdout: '',

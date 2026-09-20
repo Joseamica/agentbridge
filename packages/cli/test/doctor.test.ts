@@ -229,26 +229,26 @@ describe('runDoctor with a dedicated profile', () => {
     expect(check(await runDoctor(doctorOptions({ profileHome })), 'Permisos del respondedor').ok).toBe(true)
   })
 
-  it(
-    'does not hang forever when the login check never responds',
-    async () => {
-      // No identity is seeded on purpose: with no identity.json, the identity and board checks
-      // short-circuit and never touch the network, so this test only exercises the bounded
-      // subprocess call — a stalled `claude auth status`, e.g. a half-started session or a
-      // binary waiting on stdin, must not leave doctor hanging with the rest of the world. Real
-      // timers on purpose: runBounded's 15-second bound is not injectable (it is a fixed budget,
-      // not a test seam), and faking the clock here would also have to fake past the real
-      // filesystem awaits that run before it, which is its own source of flakiness.
-      await mkdir(profileHome, { recursive: true })
-      const { responderSettings } = await import('../src/commands/setup-responder')
-      await writeFile(join(profileHome, 'settings.json'), `${JSON.stringify(responderSettings(), null, 2)}\n`, { mode: 0o600 })
-      await mkdir(join(profileHome, 'claude'), { recursive: true })
-      const neverResolves = () => new Promise<{ code: number; stdout: string; stderr: string }>(() => {})
-      const checks = await runDoctor(doctorOptions({ profileHome, run: neverResolves }))
-      const auth = check(checks, 'Sesión iniciada en el perfil dedicado')
-      expect(auth.ok).toBe(false)
-      expect(auth.detail).toContain('15 segundos')
-    },
-    20_000,
-  )
+  it('reports the login check as failed when the runner reports its own bound firing, and passes it a signal', async () => {
+    // A hung `claude auth status` is not something doctor itself can bound with a mock runner —
+    // a mock has no OS process for anything to kill. That is proven separately, against a real
+    // child, in setup-responder.test.ts's "kills a real hung child" test for `defaultRunner`
+    // (the production runner). This test only checks doctor's half of the contract: it must pass
+    // an AbortSignal through, and must map the bounded runner's own report of that signal firing
+    // (code 124) to the existing Spanish detail — fast, with no real waiting.
+    await mkdir(profileHome, { recursive: true })
+    const { responderSettings } = await import('../src/commands/setup-responder')
+    await writeFile(join(profileHome, 'settings.json'), `${JSON.stringify(responderSettings(), null, 2)}\n`, { mode: 0o600 })
+    await mkdir(join(profileHome, 'claude'), { recursive: true })
+    let sawSignal: AbortSignal | undefined
+    const boundedRunner = async (_command: string, _args: string[], opts: { env: NodeJS.ProcessEnv; signal?: AbortSignal }) => {
+      sawSignal = opts.signal
+      return { code: 124, stdout: '', stderr: '' }
+    }
+    const checks = await runDoctor(doctorOptions({ profileHome, run: boundedRunner }))
+    const auth = check(checks, 'Sesión iniciada en el perfil dedicado')
+    expect(auth.ok).toBe(false)
+    expect(auth.detail).toContain('15 segundos')
+    expect(sawSignal).toBeInstanceOf(AbortSignal)
+  })
 })

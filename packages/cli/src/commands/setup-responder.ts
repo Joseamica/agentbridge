@@ -112,7 +112,10 @@ export function startScript(o: { shareDir: string; profileHome: string; identity
 export type CommandRunner = (
   command: string,
   args: string[],
-  opts: { env: NodeJS.ProcessEnv },
+  // `signal` is optional: every existing caller that only ever passed `{ env }` still type-checks
+  // unchanged. A caller that wants a bound subprocess passes an AbortSignal (`AbortSignal.timeout`
+  // is the common case) — `defaultRunner` below is what actually honors it.
+  opts: { env: NodeJS.ProcessEnv; signal?: AbortSignal },
 ) => Promise<{ code: number; stdout: string; stderr: string }>
 
 // Spawned without a shell (no `shell: true`), so args reach the child process as an argv
@@ -120,13 +123,38 @@ export type CommandRunner = (
 // no injection surface from repoDir or any other path we pass in.
 export const defaultRunner: CommandRunner = (command, args, opts) =>
   new Promise((resolvePromise) => {
-    const child = spawn(command, args, { env: opts.env, stdio: ['ignore', 'pipe', 'pipe'] })
+    // `signal` is handed straight to `spawn`: this is Node's own kill-on-abort, not a
+    // `Promise.race` layered on top that leaves the real child alive. Racing a promise instead of
+    // this would let the check resolve while an orphaned process (with open stdio pipes, which
+    // keep the event loop alive) lives on — exactly the wedged-command bug a bound is meant to
+    // prevent. See `packages/cli/test/setup-responder.test.ts`'s "kills a real hung child" test,
+    // which proves this with an actual OS process, not a mock.
+    const child = spawn(command, args, { env: opts.env, stdio: ['ignore', 'pipe', 'pipe'], signal: opts.signal })
     let stdout = ''
     let stderr = ''
+    let aborted = false
     child.stdout.on('data', (d) => (stdout += String(d)))
     child.stderr.on('data', (d) => (stderr += String(d)))
-    child.on('error', (err) => resolvePromise({ code: 127, stdout, stderr: err.message }))
-    child.on('close', (code) => resolvePromise({ code: code ?? 1, stdout, stderr }))
+    child.on('error', (err) => {
+      const isAbort = (err as NodeJS.ErrnoException).code === 'ABORT_ERR' || err.name === 'AbortError'
+      // Node raises this exact error as soon as the caller's AbortSignal fires and it calls
+      // kill() on the child — which happens before the OS has necessarily confirmed the process
+      // is actually gone. Resolving here for that case would let this function report success
+      // while the real process (and its open stdio pipes, which keep the event loop alive) is
+      // still around for a few more milliseconds. When the child was actually spawned
+      // (`child.pid` set), defer to `close`, which only fires once it has truly exited. A
+      // signal that was already aborted before spawn() could even start the process never gets a
+      // `close` at all, so that case (like a genuine spawn failure — binary missing, not
+      // executable, etc.) still resolves right here.
+      if (isAbort && child.pid !== undefined) {
+        aborted = true
+        return
+      }
+      resolvePromise({ code: isAbort ? 124 : 127, stdout, stderr: err.message })
+    })
+    // 124, not the process's own exit code, whenever the abort fired mid-flight — the caller's
+    // bound is what ended this run, not however the killed child happened to exit.
+    child.on('close', (code) => resolvePromise({ code: aborted ? 124 : (code ?? 1), stdout, stderr }))
   })
 
 async function exists(path: string): Promise<boolean> {
