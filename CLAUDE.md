@@ -2,7 +2,7 @@
 
 Relay + Claude Code channel plugin + CLI that lets one person ask another person's agent a question.
 
-- Runbook (Spanish, step by step): docs/runbooks/m1-acceptance.md
+- Runbook (Spanish, step by step): docs/runbooks/aceptacion-0.2.md
 - Known gaps and deliberate deferrals: docs/known-gaps.md
 - `npm test` needs neither Docker nor internet. `npm run test:live` is the only suite that talks to
   public Nostr relays; run it on purpose, never in a loop.
