@@ -229,9 +229,23 @@ export async function probeBoard(o: {
 
   const published = await o.pool.publish([o.relay], wrap)
   if (published.accepted.length === 0) {
-    // The relay's own words are third-party text and are not printed: as a category, the person's
-    // next step is the same either way.
-    return { ok: false, detail: `no aceptó publicar (puede que pida registro o esté bloqueando esta llave). Puedes cambiar tus tableros con: ${CLI_COMMAND} setup --relays "wss://uno,wss://otro"` }
+    // The relay's own words are third-party text and are not printed either way — but "I could
+    // not even reach it" and "it answered and said no" are different findings, and conflating
+    // them is how a board that is simply down (a failed handshake, a timeout) gets misread as one
+    // that is actively rejecting AgentBridge. `BoardPool.publish` already tells the two apart in
+    // its `rejected[].reason`: every reason this pool or the connection itself manufactures
+    // (a connect() failure, a guard, a timeout waiting for OK) is prefixed `error:`; the one
+    // reason that is NOT ours is the relay's own `OK <id> false <message>`, forwarded verbatim
+    // with no prefix — that, and only that, is a board that opened a connection and refused.
+    const reason = published.rejected.find((r) => r.relay === o.relay)?.reason ?? ''
+    const suggestion = `Puedes cambiar tus tableros con: ${CLI_COMMAND} setup --relays "wss://uno,wss://otro"`
+    if (reason.startsWith('error:')) {
+      return { ok: false, detail: `no pude conectarme con ese tablero. ${suggestion}` }
+    }
+    // Every gift wrap is signed by a fresh throwaway key (never this person's own), so a real
+    // rejection is never about a key the board recognises — it is a policy that refuses
+    // publishers it does not already know, which is a property of the board, not of this person.
+    return { ok: false, detail: `no aceptó publicar (puede que pida registro o tenga una política que no acepta remitentes desconocidos). ${suggestion}` }
   }
 
   // Read it back by the recipient tag rather than by id: the production filter type has no `ids`
@@ -250,9 +264,85 @@ export async function probeBoard(o: {
   return { ok: true, detail: 'publicar y leer, los dos' }
 }
 
+// Everything the shared folder itself is responsible for: whether `--share` was given, never
+// whether `--profile` was. A person who runs `doctor --share <carpeta>` alone must get these —
+// they are the whole reason `--share` exists as its own flag, and folding them into
+// `addProfileChecks` (gated on `--profile`) is what let an `AGENTS.md` sitting in the shared
+// folder go unreported when nobody happened to also pass `--profile`.
+async function addShareChecks(
+  add: (name: string, ok: boolean, detail: string) => void,
+  o: { shareDir: string; profileHome?: string },
+): Promise<void> {
+  const shareDir = resolve(o.shareDir)
+  const persona = await access(join(shareDir, 'CLAUDE.md'))
+    .then(() => true)
+    .catch(() => false)
+  // Neither branch names the shared folder or a path inside it — CLAUDE.md is a fixed name
+  // this check always looks for, not information about this person's own folder layout.
+  add('Carpeta compartida', persona, persona ? 'CLAUDE.md presente' : 'Falta CLAUDE.md en la carpeta compartida')
+
+  // Walk regardless of whether the persona file is there — a shared folder missing
+  // CLAUDE.md can still contain files (and escaping symlinks); "no persona" is not the
+  // same question as "any links escape", and skipping this while still reporting 'Ninguno'
+  // would claim a clean sweep that never happened. walkShareDir itself turns a missing or
+  // unreadable shareDir into an `unreadable` entry rather than throwing.
+  const rootReal = await realpath(shareDir).catch(() => shareDir)
+  const walk: WalkResult = { escaping: [], unreadable: [], skipped: [] }
+  await walkShareDir(shareDir, rootReal, walk)
+  const linksOk = walk.escaping.length === 0 && walk.unreadable.length === 0
+  // The shared folder's own paths never appear in this detail: they name the shared folder's
+  // internal layout, which no doctor line may print. Say how many and of what kind, not which.
+  const linkBits: string[] = []
+  if (walk.escaping.length) linkBits.push(`${walk.escaping.length} enlace(s) apuntan fuera de la carpeta`)
+  if (walk.unreadable.length) linkBits.push(`${walk.unreadable.length} ruta(s) no se pudieron revisar (sin permiso de lectura)`)
+  if (walk.skipped.length) linkBits.push(`${walk.skipped.length} carpeta(s) no se revisaron por dentro (.git o node_modules)`)
+  add('Sin enlaces que salgan de la carpeta', linksOk, linkBits.length ? linkBits.join(' · ') : 'Ninguno')
+
+  const projectConfig = await projectConfigArtifacts(shareDir)
+  const execRisk = projectConfig.filter((rel) => PROJECT_CONFIG_EXEC_RISK.has(rel))
+  const textInjection = projectConfig.filter((rel) => !PROJECT_CONFIG_EXEC_RISK.has(rel))
+  const projectConfigBits: string[] = []
+  if (execRisk.length) projectConfigBits.push(`${execRisk.length} archivo(s)/carpeta(s) que pueden ejecutar código o delegar a otro servidor fuera del control de permisos`)
+  if (textInjection.length) {
+    projectConfigBits.push(`${textInjection.length} archivo(s)/carpeta(s) que se inyectan como instrucciones del agente al arrancar, sin que nadie tenga que leerlos ni pedirlos`)
+  }
+  add(
+    'Sin configuración de proyecto en la carpeta compartida',
+    projectConfig.length === 0,
+    projectConfigBits.length ? `Encontrado — ${projectConfigBits.join(' · ')}` : 'Ninguna',
+  )
+
+  // This one needs both flags at once — it says nothing about the shared folder alone — so it
+  // only runs when `--profile` was also given, same as before the split.
+  if (o.profileHome) {
+    // `blockReadsOutsideWorkingDirectories` fences reads to the session's cwd — which IS
+    // shareDir — and the two Read(**/.env*) denies only cover shareDir too. If `--profile`
+    // (where settings.json and start.sh live) is the same folder as --share, or anywhere
+    // underneath it, none of that protects those files: they simply sit inside the fence
+    // instead of outside it, readable by any crafted question. Compare resolved paths (not the
+    // raw strings) so a relative path, `~`, a trailing slash, a symlink, or macOS's
+    // /tmp -> /private/tmp cannot hide an unsafe --profile behind a differently-spelled but
+    // identical location.
+    const profileReal = await resolveComparablePath(o.profileHome)
+    const shareReal = await resolveComparablePath(o.shareDir)
+    const profileOutsideShare = !isSameOrWithin(profileReal, shareReal)
+    add(
+      'El perfil dedicado está fuera de la carpeta compartida',
+      profileOutsideShare,
+      profileOutsideShare
+        ? 'sí'
+        : `--profile es la misma carpeta que --share o está dentro de ella: la sesión puede leer ahí settings.json y start.sh — permissions.blockReadsOutsideWorkingDirectories y las reglas Read(**/.env*) no protegen nada dentro de la carpeta compartida. Vuelve a correr: ${CLI_COMMAND} setup-responder --share <tu carpeta compartida> --profile <otra carpeta, fuera de ella>`,
+    )
+  }
+}
+
+// Everything the dedicated Claude Code profile is responsible for: whether `--profile` was
+// given, never whether `--share` was. Settings, the start script, the installed plugin and the
+// login check all live under `profileHome` regardless of whether a shared folder is in the
+// picture at all.
 async function addProfileChecks(
   add: (name: string, ok: boolean, detail: string) => void,
-  o: { profileHome: string; shareDir?: string; repoDir?: string; run: CommandRunner },
+  o: { profileHome: string; repoDir?: string; run: CommandRunner },
 ): Promise<void> {
   // Everything below lives under `profileHome`, independent of whether a shared folder was given —
   // a profile with no settings.json (or a weakened one) must fail loudly even when doctor is run
@@ -369,66 +459,6 @@ async function addProfileChecks(
   }
   add('Sesión iniciada en el perfil dedicado', loggedIn, authDetail)
 
-  if (o.shareDir) {
-    const shareDir = resolve(o.shareDir)
-    const persona = await access(join(shareDir, 'CLAUDE.md'))
-      .then(() => true)
-      .catch(() => false)
-    // Neither branch names the shared folder or a path inside it — CLAUDE.md is a fixed name
-    // this check always looks for, not information about this person's own folder layout.
-    add('Carpeta compartida', persona, persona ? 'CLAUDE.md presente' : 'Falta CLAUDE.md en la carpeta compartida')
-
-    // Walk regardless of whether the persona file is there — a shared folder missing
-    // CLAUDE.md can still contain files (and escaping symlinks); "no persona" is not the
-    // same question as "any links escape", and skipping this while still reporting 'Ninguno'
-    // would claim a clean sweep that never happened. walkShareDir itself turns a missing or
-    // unreadable shareDir into an `unreadable` entry rather than throwing.
-    const rootReal = await realpath(shareDir).catch(() => shareDir)
-    const walk: WalkResult = { escaping: [], unreadable: [], skipped: [] }
-    await walkShareDir(shareDir, rootReal, walk)
-    const linksOk = walk.escaping.length === 0 && walk.unreadable.length === 0
-    // The shared folder's own paths never appear in this detail: they name the shared folder's
-    // internal layout, which no doctor line may print. Say how many and of what kind, not which.
-    const linkBits: string[] = []
-    if (walk.escaping.length) linkBits.push(`${walk.escaping.length} enlace(s) apuntan fuera de la carpeta`)
-    if (walk.unreadable.length) linkBits.push(`${walk.unreadable.length} ruta(s) no se pudieron revisar (sin permiso de lectura)`)
-    if (walk.skipped.length) linkBits.push(`${walk.skipped.length} carpeta(s) no se revisaron por dentro (.git o node_modules)`)
-    add('Sin enlaces que salgan de la carpeta', linksOk, linkBits.length ? linkBits.join(' · ') : 'Ninguno')
-
-    const projectConfig = await projectConfigArtifacts(shareDir)
-    const execRisk = projectConfig.filter((rel) => PROJECT_CONFIG_EXEC_RISK.has(rel))
-    const textInjection = projectConfig.filter((rel) => !PROJECT_CONFIG_EXEC_RISK.has(rel))
-    const projectConfigBits: string[] = []
-    if (execRisk.length) projectConfigBits.push(`${execRisk.length} archivo(s)/carpeta(s) que pueden ejecutar código o delegar a otro servidor fuera del control de permisos`)
-    if (textInjection.length) {
-      projectConfigBits.push(`${textInjection.length} archivo(s)/carpeta(s) que se inyectan como instrucciones del agente al arrancar, sin que nadie tenga que leerlos ni pedirlos`)
-    }
-    add(
-      'Sin configuración de proyecto en la carpeta compartida',
-      projectConfig.length === 0,
-      projectConfigBits.length ? `Encontrado — ${projectConfigBits.join(' · ')}` : 'Ninguna',
-    )
-
-    // `blockReadsOutsideWorkingDirectories` fences reads to the session's cwd — which IS
-    // shareDir — and the two Read(**/.env*) denies only cover shareDir too. If `--profile`
-    // (where settings.json and start.sh live) is the same folder as --share, or anywhere
-    // underneath it, none of that protects those files: they simply sit inside the fence
-    // instead of outside it, readable by any crafted question. Compare resolved paths (not the
-    // raw strings) so a relative path, `~`, a trailing slash, a symlink, or macOS's
-    // /tmp -> /private/tmp cannot hide an unsafe --profile behind a differently-spelled but
-    // identical location.
-    const profileReal = await resolveComparablePath(o.profileHome)
-    const shareReal = await resolveComparablePath(o.shareDir)
-    const profileOutsideShare = !isSameOrWithin(profileReal, shareReal)
-    add(
-      'El perfil dedicado está fuera de la carpeta compartida',
-      profileOutsideShare,
-      profileOutsideShare
-        ? 'sí'
-        : `--profile es la misma carpeta que --share o está dentro de ella: la sesión puede leer ahí settings.json y start.sh — permissions.blockReadsOutsideWorkingDirectories y las reglas Read(**/.env*) no protegen nada dentro de la carpeta compartida. Vuelve a correr: ${CLI_COMMAND} setup-responder --share <tu carpeta compartida> --profile <otra carpeta, fuera de ella>`,
-    )
-  }
-
   if (o.repoDir) {
     const bundle = join(resolve(o.repoDir), 'plugins/agentbridge/dist/server.js')
     const built = await access(bundle)
@@ -493,7 +523,12 @@ export async function runDoctor(o: {
     store?.close()
   }
 
-  if (o.profileHome) await addProfileChecks(add, { profileHome: o.profileHome, shareDir: o.shareDir, repoDir: o.repoDir, run })
+  // Each flag brings its own checks: `--share` alone must still examine the shared folder (that
+  // is the whole point of I1's fix), and `--profile` alone must still examine the profile. The
+  // one check that needs both (the cross-containment check) lives inside addShareChecks and
+  // only fires when profileHome is also present — see the comment there.
+  if (o.shareDir) await addShareChecks(add, { shareDir: o.shareDir, profileHome: o.profileHome })
+  if (o.profileHome) await addProfileChecks(add, { profileHome: o.profileHome, repoDir: o.repoDir, run })
   return checks
 }
 

@@ -139,6 +139,24 @@ describe('runDoctor with an identity', () => {
     const boardCheck = check(await runDoctor(doctorOptions()), `Tablero ${board.url}`)
     expect(boardCheck.ok).toBe(false)
     expect(boardCheck.detail).toContain('no aceptó publicar')
+    // I3/Minor 5: nothing this person's own throwaway key could have caused, so the wording never
+    // points at "this key" — every wrap is signed by a fresh one the board has never seen before.
+    expect(boardCheck.detail).not.toContain('llave')
+  })
+
+  it('tells apart a board that never opened a connection from one that answered and refused', async () => {
+    // I3: a board that is simply unreachable (down, wrong port, failed handshake) must not be
+    // reported with the same "no aceptó publicar" a board that actually answered OK false gets —
+    // that is what made the dead default board (I2) misread as an active refusal instead of an
+    // outage. Nothing here is a real network: ws://127.0.0.1:1 is loopback with nothing listening.
+    await seedIdentity()
+    const store = await openStore(identityHome, { relayPolicy: allowAnyRelay })
+    setProfile(store, { relays: ['ws://127.0.0.1:1'], now: 1_700_000_001 })
+    store.close()
+    const boardCheck = check(await runDoctor(doctorOptions()), 'Tablero ws://127.0.0.1:1')
+    expect(boardCheck.ok).toBe(false)
+    expect(boardCheck.detail).toContain('no pude conectarme')
+    expect(boardCheck.detail).not.toContain('no aceptó publicar')
   })
 
   it('fails a board that accepts the event and then does not keep it', async () => {
@@ -250,5 +268,39 @@ describe('runDoctor with a dedicated profile', () => {
     expect(auth.ok).toBe(false)
     expect(auth.detail).toContain('15 segundos')
     expect(sawSignal).toBeInstanceOf(AbortSignal)
+  })
+})
+
+describe('runDoctor with --share alone (no --profile)', () => {
+  // I1: every shared-folder check used to live inside the profile-gated function, so
+  // `doctor --share <carpeta>` with no `--profile` examined nothing in it and still exited 0.
+  // These prove the opposite is now true: --share brings its own checks, unconditionally.
+  it('reports a shared folder missing its persona file even with no --profile', async () => {
+    await seedIdentity()
+    const checks = await runDoctor({ ...doctorOptions(), shareDir })
+    expect(check(checks, 'Carpeta compartida').ok).toBe(false)
+    // Nothing here required --profile: the check ran, and named its own missing CLAUDE.md, not
+    // the profile-only checks (which must not even appear when --profile was never given).
+    expect(checks.find((c) => c.name === 'Permisos del respondedor')).toBeUndefined()
+  })
+
+  it('catches an AGENTS.md sitting in the shared folder even with no --profile', async () => {
+    // The exact probe from the final review: an AGENTS.md injects itself into the responder's
+    // instructions at every session start, and used to sail through a --share-only run.
+    await seedIdentity()
+    await writeFile(join(shareDir, 'AGENTS.md'), '# instructions')
+    const checks = await runDoctor({ ...doctorOptions(), shareDir })
+    const projectConfig = check(checks, 'Sin configuración de proyecto en la carpeta compartida')
+    expect(projectConfig.ok).toBe(false)
+    expect(projectConfig.detail).toContain('se inyectan como instrucciones')
+    // The exit code doctorCommand derives from `checks.some(c => !c.ok)` must therefore be 1 —
+    // proven here at the level runDoctor actually controls: at least one check failed.
+    expect(checks.some((c) => !c.ok)).toBe(true)
+  })
+
+  it('does not report the profile/share cross-check when --profile was never given', async () => {
+    await seedIdentity()
+    const checks = await runDoctor({ ...doctorOptions(), shareDir })
+    expect(checks.find((c) => c.name === 'El perfil dedicado está fuera de la carpeta compartida')).toBeUndefined()
   })
 })
