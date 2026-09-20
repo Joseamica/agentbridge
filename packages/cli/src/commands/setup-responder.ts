@@ -200,14 +200,13 @@ export async function setupResponder(o: {
   effort?: string
   run: CommandRunner
   out: Output
-  // `agentbridge setup` calls this as one orchestrated step among several, and — unlike a
-  // standalone `setup-responder` run — has ALREADY handled identity (its own step 1, done
-  // before this function is ever called) and prints its own accurate "what's left" summary
-  // right after this returns. The "Siguientes pasos" block below is correct advice for someone
-  // who ran `setup-responder` directly, but its own step 1 ("da de alta este dispositivo")
-  // names the single-use enrollment link a `setup` caller already redeemed — printing it there
-  // would tell them to spend a link they no longer have. Defaults to true so every existing
-  // (standalone) caller is unaffected.
+  // `agentbridge setup` calls this as one orchestrated step among several, and prints its own
+  // accurate "what's left" summary right after this returns — built from doctor's checks, so it
+  // can skip "inicia sesión" once the profile is already logged in. The "Siguientes pasos" block
+  // below, whose own step 1 is "inicia sesión una vez en el perfil dedicado", is correct advice
+  // for someone who ran `setup-responder` directly, but printing it again from inside `setup`
+  // would duplicate — or, once already logged in, contradict — that summary. Defaults to true so
+  // every existing (standalone) caller is unaffected.
   printNextSteps?: boolean
 }): Promise<{ startScriptPath: string; claudeConfigDir: string; settingsPath: string }> {
   const shareDir = resolve(o.shareDir)
