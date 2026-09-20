@@ -1,3 +1,4 @@
+import { describeError } from '@agentbridge/core'
 import type { z } from 'zod'
 
 // Node's fetch (undici) always surfaces a network failure (connection refused, DNS
@@ -41,7 +42,8 @@ export function describeFsError(err: unknown): string {
     case 'ENOSPC':
       return 'no queda espacio en el disco'
     default:
-      return err instanceof Error ? err.message : String(err)
+      // Never the error's own message: it can carry a path this text must not carry.
+      return `no se pudo completar la operación (${describeError(err)})`
   }
 }
 

@@ -221,12 +221,17 @@ describe('setupResponder', () => {
     ).resolves.toBeDefined()
   })
 
-  it('fails with the command output when claude plugin install fails', async () => {
+  // The message never echoes the subprocess's own output (it can carry arbitrary text) — only
+  // which command failed and its exit code, plus how to see the real output by hand.
+  it('fails without leaking the raw command output when claude plugin install fails', async () => {
     const failing: CommandRunner = async (command, args) =>
       args.includes('install') ? { code: 1, stdout: '', stderr: 'plugin not found' } : { code: 0, stdout: '', stderr: '' }
-    await expect(
-      setupResponder({ shareDir, repoDir, profileHome: home, identityHome, run: failing, out: memoryOutput() }),
-    ).rejects.toThrow('plugin not found')
+    const err: unknown = await setupResponder({ shareDir, repoDir, profileHome: home, identityHome, run: failing, out: memoryOutput() }).catch(
+      (e) => e,
+    )
+    expect(err).toBeInstanceOf(CliError)
+    expect((err as CliError).message).toMatch(/código 1/)
+    expect((err as CliError).message).not.toContain('plugin not found')
   })
 
   it('does not treat an unrelated "already" failure as a successful idempotent install', async () => {
@@ -234,9 +239,12 @@ describe('setupResponder', () => {
       args.includes('install')
         ? { code: 1, stdout: '', stderr: 'the plugin registry was already unavailable when this request was attempted' }
         : { code: 0, stdout: '', stderr: '' }
-    await expect(
-      setupResponder({ shareDir, repoDir, profileHome: home, identityHome, run: failing, out: memoryOutput() }),
-    ).rejects.toThrow('already unavailable')
+    const err: unknown = await setupResponder({ shareDir, repoDir, profileHome: home, identityHome, run: failing, out: memoryOutput() }).catch(
+      (e) => e,
+    )
+    expect(err).toBeInstanceOf(CliError)
+    expect((err as CliError).message).toMatch(/código 1/)
+    expect((err as CliError).message).not.toContain('already unavailable')
   })
 
   it('treats a genuine "already installed" failure naming the target as success', async () => {

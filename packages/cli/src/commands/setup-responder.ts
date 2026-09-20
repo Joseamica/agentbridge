@@ -258,7 +258,7 @@ export async function setupResponder(o: {
     // (an unrelated crash message that happens to contain the word) must not read as success.
     const alreadyThere = /already/i.test(text) && text.includes(step.target)
     if (r.code !== 0 && !alreadyThere) {
-      throw new CliError(`Falló: claude ${step.args.join(' ')}\n${r.stderr || r.stdout}`)
+      throw new CliError(`Falló "claude ${step.args.join(' ')}" (código ${r.code}). Corre ese mismo comando a mano para ver qué dice.`)
     }
   }
 

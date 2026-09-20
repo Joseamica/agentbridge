@@ -1,13 +1,13 @@
-import { CLI_ARGV, CLI_COMMAND } from '@agentbridge/core'
+import { CLI_ARGV, CLI_COMMAND, agentbridgeHome, encodeLink, getProfile, loadOrCreateIdentity, nowSeconds, openStore, setProfile } from '@agentbridge/core'
 import type { Dirent } from 'node:fs'
 import { access, lstat, readdir, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
-import { CliError, PromptEOF, requireConfig, tryReadConfig, type CliContext, type Output, type Prompt } from '../context'
+import { CliError, PromptEOF, type CliContext, type Output, type Prompt } from '../context'
 import { isSameOrWithin, resolveComparablePath } from '../fs-paths'
 import { describeFsError } from '../spanish-errors'
-import { enroll } from './account'
+import { connect } from './connect'
 import { projectConfigArtifacts, runDoctor } from './doctor'
 import { defaultRunner, repoDirFromBundleLocation, setupResponder, type CommandRunner } from './setup-responder'
 
@@ -15,29 +15,40 @@ import { defaultRunner, repoDirFromBundleLocation, setupResponder, type CommandR
 // drive prompts with (real readline in production, a scripted queue in tests — see
 // context.ts's `Prompt` type) and a CommandRunner to hand to setupResponder/doctor and to the
 // `claude mcp add` step, so every subprocess spawn in this whole command goes through the same
-// injectable seam the rest of the CLI already tests with. `repoDir` and `responderHome` are
-// optional overrides: setupCommand fills them from --repo/--responder-home (or the same
-// defaults setup-responder and doctor use); tests always pass explicit temp directories so
-// nothing here ever touches a real ~/.agentbridge-responder or a real Claude Code checkout.
+// injectable seam the rest of the CLI already tests with. `repoDir` and `profileHome` are
+// optional overrides: setupCommand fills them from --repo/--profile (or the same defaults
+// setup-responder and doctor use); tests always pass explicit temp directories so nothing here
+// ever touches a real ~/.agentbridge-responder or a real Claude Code checkout.
 export type SetupContext = CliContext & {
   prompt: Prompt
   run: CommandRunner
   repoDir?: string
-  responderHome?: string
+  // Claude's dedicated profile (tarea 1). Never an AgentBridge home.
+  profileHome?: string
+  // The one seam this command needs for tests: `connect` mines 22 bits of proof of work, and the
+  // plan allows exactly one test in the whole repository to pay for that (tests/asker/flow.test.ts).
+  connectWith?: (link: string, ctx: CliContext) => Promise<void>
+  // From `--relays`. Empty or absent leaves the list alone.
+  relays?: string[]
 }
 
+// The truth today: the key and the name are only ever created by answering these two questions,
+// and nothing else creates them — `link` reads an existing identity and returns null when there
+// isn't one, it never creates one. So the only honest instruction for a non-interactive terminal
+// is "run this in a real one"; everything else in this message is what can genuinely be done by
+// hand once that has happened.
 export const NON_INTERACTIVE_ES = [
   'Este asistente necesita una terminal interactiva para hacerte preguntas, y esta no lo es',
   '(por ejemplo, se está corriendo dentro de un script, con la entrada redirigida, o en CI).',
   '',
-  'Corre el equivalente a mano, en este orden:',
-  `  AGENTBRIDGE_HOME=~/.agentbridge-responder ${CLI_COMMAND} enroll <tu enlace de alta>`,
-  `  ${CLI_COMMAND} setup-responder --share <carpeta compartida> --home ~/.agentbridge-responder`,
-  `  ${CLI_COMMAND} doctor --home ~/.agentbridge-responder --share <carpeta compartida>`,
-  `  AGENTBRIDGE_HOME=~/.agentbridge-responder ${CLI_COMMAND} invite`,
+  'La llave y tu nombre solo se crean aquí, contestando dos preguntas, así que corre este mismo',
+  'comando en una terminal de verdad. Lo demás sí se puede hacer a mano después:',
+  `  ${CLI_COMMAND} setup-responder --share <carpeta compartida> --profile ~/.agentbridge-responder`,
+  `  ${CLI_COMMAND} doctor --profile ~/.agentbridge-responder --share <carpeta compartida>`,
+  `  ${CLI_COMMAND} connect <enlace de la otra persona>`,
   `  claude mcp add agentbridge --scope user -- ${CLI_COMMAND} mcp`,
   '',
-  'O sigue la guía completa: docs/inicio-rapido.md',
+  'La guía completa está en docs/inicio-rapido.md',
 ].join('\n')
 
 // Distinct from NON_INTERACTIVE_ES on purpose. That one means "there was never a terminal to ask
@@ -89,6 +100,13 @@ function parseRole(raw: string): Role | null {
 function parseNonEmpty(raw: string): string | null {
   const trimmed = raw.trim()
   return trimmed.length > 0 ? trimmed : null
+}
+
+// Validated here rather than letting setProfile throw, so a name that is too long is one more
+// "I didn't understand that" retry instead of ending the whole guided run.
+function parseDisplayName(raw: string): string | null {
+  const trimmed = raw.trim()
+  return trimmed.length >= 1 && trimmed.length <= 80 ? trimmed : null
 }
 
 // Deliberately does not accept "sí", "s" or "y" as alternate spellings of the confirmation
@@ -345,22 +363,22 @@ export type ShareDirAssessment = {
 // second list of the same artifact names — see the comment on that export in doctor.ts.
 export async function assessShareDir(
   shareDirRaw: string,
-  guard: { identityHome: string; responderHome: string },
+  guard: { identityHome: string; profileHome: string },
 ): Promise<ShareDirAssessment> {
   const shareDir = resolve(shareDirRaw)
-  const [shareReal, homeReal, identityReal, responderReal] = await Promise.all([
+  const [shareReal, homeReal, identityReal, profileReal] = await Promise.all([
     resolveComparablePath(shareDir),
     resolveComparablePath(homedir()),
     resolveComparablePath(guard.identityHome),
-    resolveComparablePath(guard.responderHome),
+    resolveComparablePath(guard.profileHome),
   ])
   const isHome = shareReal === homeReal
 
   let credentialConflict: string | null = null
   if (isSameOrWithin(identityReal, shareReal)) {
     credentialConflict = `tu identidad de AgentBridge (${guard.identityHome})`
-  } else if (isSameOrWithin(responderReal, shareReal)) {
-    credentialConflict = `el perfil dedicado del respondedor (${guard.responderHome})`
+  } else if (isSameOrWithin(profileReal, shareReal)) {
+    credentialConflict = `el perfil dedicado del respondedor (${guard.profileHome})`
   }
 
   const inspected = await inspectPath(shareDir)
@@ -440,27 +458,47 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
   out.log('Te voy a hacer las preguntas necesarias para dejarlo listo. Puedes cancelar con Ctrl+C.')
   out.log('')
 
-  // 1. Identity — reuse enroll's own logic and messages verbatim; never re-derive a device
-  // token or re-implement what counts as "already enrolled". This identity lives at ctx.home
-  // (this device's default AgentBridge home) regardless of role — see the credential-copy step
-  // below for why the responding side still works from the very same, single enrollment link.
-  let config = await tryReadConfig(ctx)
-  if (!config) {
-    out.log('Esta computadora todavía no está dada de alta.')
-    out.log(`Pide un enlace de alta a quien opere el relay (o créalo tú con: ${CLI_COMMAND} admin enroll-link).`)
-    const link = await askWithRetries(
-      prompt,
-      out,
-      'Enlace de alta: ',
-      parseNonEmpty,
-      'Necesito el enlace que te mandaron para darte de alta.',
-      `No diste un enlace de alta. Vuelve a correr "${CLI_COMMAND} setup" cuando lo tengas, o da de alta a mano: ${CLI_COMMAND} enroll <enlace>`,
-    )
-    await enroll([link], ctx)
-    config = await requireConfig(ctx)
-  } else {
-    out.log(`Esta computadora ya está dada de alta como ${config.displayName} (@${config.handle}) en ${config.relayUrl}.`)
+  // 1. Identity and profile — one folder holds the key and the database, and every command this
+  // person types uses it, whichever side they are on.
+  const { identity, created } = await loadOrCreateIdentity(ctx.home)
+  out.log(created ? 'Creé tu llave en esta computadora.' : 'Ya tenías una llave en esta computadora.')
+
+  const store = await openStore(ctx.home, ctx.relayPolicy ? { relayPolicy: ctx.relayPolicy } : {})
+  let profile
+  try {
+    profile = getProfile(store)
+    if (!profile.name) {
+      const name = await askWithRetries(
+        prompt,
+        out,
+        '¿Cómo quieres que te vean las personas a las que te conectes? (tu nombre o apodo): ',
+        parseDisplayName,
+        'Escribe un nombre de 1 a 80 caracteres.',
+        `No me diste un nombre. Vuelve a correr "${CLI_COMMAND} setup" cuando quieras.`,
+      )
+      profile = setProfile(store, { name, now: nowSeconds() })
+    }
+    if (ctx.relays && ctx.relays.length > 0) {
+      // The spec's answer to a board that starts refusing service is "the list is configurable", so
+      // there has to be a way to configure it. `setup --relays "wss://a,wss://b"` is that way, it
+      // works on a rerun, and doctor's own failing-board line names it.
+      profile = setProfile(store, { relays: ctx.relays, now: nowSeconds() })
+      out.log(`Cambié tus tableros: ahora usas ${profile.relays.length}.`)
+    }
+  } finally {
+    // Closed before anything else runs: `connect` and `doctor` open this same database, and holding
+    // it open across a whole guided run would make their writes wait on a handle nothing needs.
+    store.close()
   }
+
+  const myLink = encodeLink(identity.publicKey, profile.relays)
+  out.log(`Te llamas ${profile.name} y usas ${profile.relays.length} tableros públicos.`)
+  out.log('(Son tableros de Nostr. No hay ningún servidor nuestro en medio.)')
+  // Printed here, for every role, because it is this person's identity and not a feature of one
+  // side: whoever wants to reach them needs exactly this string, and a test that checks it must not
+  // depend on which branch runs later.
+  out.log('Tu enlace es:')
+  out.log(`  ${myLink}`)
   out.log('')
 
   // 2. Which side
@@ -476,7 +514,7 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
   const willAsk = role === 'preguntar' || role === 'ambas'
   out.log('')
 
-  const done: string[] = [`Identidad: ${config.displayName} (@${config.handle}) en ${config.relayUrl}.`]
+  const done: string[] = [`Identidad lista como ${profile.name}.`]
   const pending: string[] = []
 
   // 3. Answering side
@@ -485,26 +523,26 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     out.log('')
     const defaultShare = join(homedir(), 'AgentBridge', 'compartido')
     const repoDir = ctx.repoDir ? resolve(ctx.repoDir) : await repoDirFromBundleLocation(import.meta.url)
-    const responderHome = ctx.responderHome ? resolve(ctx.responderHome) : join(homedir(), '.agentbridge-responder')
+    const profileHome = ctx.profileHome ? resolve(ctx.profileHome) : join(homedir(), '.agentbridge-responder')
 
     const shareDir = await chooseShareDir(prompt, out, defaultShare)
 
-    const assessment = await assessShareDir(shareDir, { identityHome: ctx.home, responderHome })
+    const assessment = await assessShareDir(shareDir, { identityHome: ctx.home, profileHome })
     if (assessment.problem) {
-      throw new CliError(`No puedo usar ${shareDir}: ${assessment.problem}. Elige otra ruta y vuelve a correr "${CLI_COMMAND} setup".`)
+      throw new CliError(`No puedo usar esa carpeta: ${assessment.problem}. Elige otra ruta y vuelve a correr "${CLI_COMMAND} setup".`)
     }
     if (assessment.isHome) {
       throw new CliError(
-        `No puedo usar ${shareDir} como carpeta compartida: es tu carpeta de usuario (home) y dejaría visible todo lo que tienes en la computadora. Vuelve a correr "${CLI_COMMAND} setup" con otra carpeta.`,
+        `Esa es tu carpeta de usuario, y compartirla dejaría visible todo lo que tienes en la computadora. Vuelve a correr "${CLI_COMMAND} setup" con otra carpeta.`,
       )
     }
     if (assessment.credentialConflict) {
       throw new CliError(
-        `No puedo usar ${shareDir} como carpeta compartida: ahí dentro está ${assessment.credentialConflict}, que guarda el token del dispositivo — cualquier pregunta podría leerlo y hacerse pasar por ti en el relay. Vuelve a correr "${CLI_COMMAND} setup" con otra carpeta.`,
+        `Ahí dentro está ${assessment.credentialConflict}. Tu llave secreta es tu identidad entera: quien la lea puede hacerse pasar por ti en cualquier tablero, para siempre, y no hay forma de revocarla. Vuelve a correr "${CLI_COMMAND} setup" con otra carpeta.`,
       )
     }
     if (assessment.reasons.length > 0) {
-      out.log(`Ojo: ${shareDir} se ve peligrosa para compartir —`)
+      out.log('Ojo: esa carpeta se ve peligrosa para compartir —')
       for (const reason of assessment.reasons) out.log(`  - ${reason}`)
       out.log(
         `Si de verdad quieres usarla de todos modos, escribe exactamente ${CONFIRM_WORD} (mayúsculas o minúsculas da igual). Cualquier otra respuesta cancela.`,
@@ -515,26 +553,19 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
         `Escribe ${CONFIRM_WORD} para continuar: `,
         parseConfirmation,
         `Para seguir con esta carpeta, escribe exactamente la palabra ${CONFIRM_WORD} (sin comillas; mayúsculas o minúsculas da igual).`,
-        `No escribiste "${CONFIRM_WORD}". No se tocó ${shareDir}. Vuelve a correr "${CLI_COMMAND} setup" con otra carpeta si quieres, o confirma esta de nuevo.`,
+        `No escribiste "${CONFIRM_WORD}", así que no toqué nada. Vuelve a correr "${CLI_COMMAND} setup" con otra carpeta si quieres.`,
       )
     }
-    // Never create the folder silently: say so before setupResponder does it.
-    out.log(assessment.exists ? `Voy a usar la carpeta que ya existe: ${shareDir}` : `${shareDir} no existe todavía; la voy a crear vacía.`)
+    out.log(assessment.exists ? 'Voy a usar la carpeta que ya existe.' : 'Esa carpeta no existe todavía; la voy a crear vacía.')
     out.log('')
 
     let setupResult: Awaited<ReturnType<typeof setupResponder>>
     try {
-      setupResult = await setupResponder({
-        shareDir,
-        repoDir,
-        profileHome: responderHome,
-        identityHome: ctx.home,
-        run: ctx.run,
-        out,
-        printNextSteps: false,
-      })
+      setupResult = await setupResponder({ shareDir, repoDir, profileHome, identityHome: ctx.home, run: ctx.run, out, printNextSteps: false })
     } catch (err) {
       if (err instanceof CliError) throw err
+      // describeFsError names the kind of filesystem problem (permissions, missing path) without
+      // echoing an arbitrary error message, which can carry paths this text must not carry.
       throw new CliError(
         `No pude preparar la carpeta compartida o el perfil dedicado: ${describeFsError(err)}. No se completó la instalación; revisa la ruta y vuelve a correr "${CLI_COMMAND} setup".`,
       )
@@ -542,43 +573,79 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     out.log('')
 
     out.log('Verificando con doctor…')
-    const checks = await runDoctor({ identityHome: ctx.home, profileHome: responderHome, shareDir, repoDir, run: ctx.run })
+    const checks = await runDoctor({
+      identityHome: ctx.home,
+      profileHome,
+      shareDir,
+      repoDir,
+      run: ctx.run,
+      createSocket: ctx.createSocket,
+      relayPolicy: ctx.relayPolicy,
+    })
     for (const c of checks) out.log(`${c.ok ? '[ok]    ' : '[falta] '}${c.name}: ${c.detail}`)
     out.log('')
 
-    // Doctor already said so a few lines above — repeating "log in" here when it just reported
-    // "Sesión activa" would be telling the person to redo something that is already done.
+    // Whoever is going to ask needs this string, and nothing else: there is no invitation to create
+    // and no relay to register with.
+    out.log('Este es tu enlace. Dáselo a quien quieras que pueda preguntarte:')
+    out.log(`  ${myLink}`)
+    out.log(`Cuando te manden una solicitud, la ves con: ${CLI_COMMAND} requests`)
+    out.log('')
+
     const alreadyLoggedIn = checks.some((c) => c.name === 'Sesión iniciada en el perfil dedicado' && c.ok)
     const remainingSteps = [
-      ...(alreadyLoggedIn
-        ? []
-        : [`Inicia sesión una vez en el perfil dedicado:  CLAUDE_CONFIG_DIR='${setupResult.claudeConfigDir}' claude   (usa /login y sal)`]),
+      ...(alreadyLoggedIn ? [] : [`Inicia sesión una vez en el perfil dedicado:  CLAUDE_CONFIG_DIR='${setupResult.claudeConfigDir}' claude   (usa /login y sal)`]),
       `Arráncalo:  ${setupResult.startScriptPath}`,
-      `Deja entrar a quien va a preguntarte:  ${CLI_COMMAND} invite   (y mándale el enlace que imprime)`,
+      'Dale tu enlace a quien vaya a preguntarte.',
     ]
     out.log('Para terminar de dejarlo contestando, en este orden:')
     remainingSteps.forEach((step, i) => out.log(`  ${i + 1}. ${step}`))
     out.log('')
 
-    // The verdict must reflect what doctor actually found, not just one check picked out of
-    // ten — reporting "listo" while doctor had just printed [falta] a few lines above is
-    // exactly the bug this replaces. Every failing check's own name and detail (already
-    // Spanish, already actionable — see doctor.ts) becomes a pending item verbatim.
-    done.push(`Perfil dedicado preparado en ${responderHome}.`)
+    done.push('Perfil dedicado del respondedor preparado.')
     for (const c of checks) {
       if (!c.ok) pending.push(`${c.name}: ${c.detail}`)
     }
     pending.push(`Arranca el respondedor: ${setupResult.startScriptPath}`)
-    pending.push(`Invita a quien va a preguntarte: ${CLI_COMMAND} invite`)
+    pending.push('Dale tu enlace a quien vaya a preguntarte.')
   }
 
   // 4. Asking side
   if (willAsk) {
-    out.log('Para poder preguntar, alguien tiene que haberte invitado antes. Si ya tienes su enlace, acéptalo con:')
-    out.log(`  ${CLI_COMMAND} accept <enlace de invitación>`)
-    out.log(`(Si no lo tienes, pídeselo — lo consigue con: ${CLI_COMMAND} invite)`)
+    out.log('Para preguntarle a alguien necesitas su enlace: una cadena que empieza con agentbridge:nprofile1.')
+    out.log(`Se lo pides por donde ya hablen. Esa persona lo saca con: ${CLI_COMMAND} link`)
+    const hasLink = await askWithRetries(
+      prompt,
+      out,
+      '¿Ya tienes su enlace? [s/n]: ',
+      parseYesNo,
+      'Escribe s (sí) o n (no).',
+      'No entendí tu respuesta; seguimos sin conectar a nadie por ahora.',
+    ).catch(() => false)
+
+    if (hasLink) {
+      const link = await askWithRetries(
+        prompt,
+        out,
+        'Pega su enlace: ',
+        parseNonEmpty,
+        'Pega la cadena completa, empieza con agentbridge:nprofile1.',
+        `No pegaste un enlace. Cuando lo tengas: ${CLI_COMMAND} connect <enlace>`,
+      )
+      // connect mines 22 bits of proof of work and says so before it starts (P5c). It also runs its
+      // own short-lived cycle, which is why the store above was closed first.
+      const connectWith = ctx.connectWith ?? ((value: string, inner: CliContext) => connect([value], inner))
+      await connectWith(link, ctx)
+      // Deliberately not "I sent your request": `connect` also returns normally when the contact was
+      // already approved and when every board refused the publication, and claiming a send that did
+      // not happen is how a person ends up waiting for an answer that was never coming. What it
+      // printed is what actually happened; this line only says where to look next.
+      pending.push(`Revisa cómo va: ${CLI_COMMAND} contacts`)
+    } else {
+      out.log(`Cuando lo tengas: ${CLI_COMMAND} connect <enlace>`)
+      pending.push(`Conéctate con quien vayas a preguntar: ${CLI_COMMAND} connect <enlace>`)
+    }
     out.log('')
-    pending.push(`Acepta la invitación de quien vas a preguntar: ${CLI_COMMAND} accept <enlace de invitación>`)
 
     out.log('Para preguntar desde tu propio Claude Code hace falta además registrar el servidor MCP de AgentBridge una vez.')
     let wantsMcp: boolean
@@ -595,37 +662,38 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
         throw err
       }
     }
+    // A registration that stores only CLI_ARGV starts its server against the DEFAULT home. Someone
+    // who set AGENTBRIDGE_HOME for this run would end up with a Claude Code tool talking to a
+    // different identity than the one this setup just prepared — with no error, just an empty
+    // contact list. When the home is not the default, it travels with the registration.
+    const customHome = ctx.home !== agentbridgeHome({}) ? ctx.home : null
+    const envArgs = customHome ? ['--env', `AGENTBRIDGE_HOME=${customHome}`] : []
+    const manual = `claude mcp add agentbridge --scope user ${envArgs.join(' ')} -- ${CLI_COMMAND} mcp`.replace(/\s+/g, ' ')
     let mcpRegistered = false
     if (wantsMcp) {
-      const result = await ctx.run(
-        'claude',
-        ['mcp', 'add', 'agentbridge', '--scope', 'user', '--', ...CLI_ARGV, 'mcp'],
-        { env: ctx.env },
-      )
+      const result = await ctx.run('claude', ['mcp', 'add', 'agentbridge', '--scope', 'user', ...envArgs, '--', ...CLI_ARGV, 'mcp'], { env: ctx.env })
       if (result.code === 0) {
         mcpRegistered = true
         out.log('Listo: el servidor MCP quedó registrado.')
       } else {
-        out.log(
-          `No pude registrar el servidor MCP automáticamente (${result.stderr || result.stdout || 'sin más detalle'}). Hazlo a mano:`,
-        )
-        out.log(`  claude mcp add agentbridge --scope user -- ${CLI_COMMAND} mcp`)
+        out.log(`No pude registrar el servidor MCP automáticamente (el comando terminó con código ${result.code}). Hazlo a mano:`)
+        out.log(`  ${manual}`)
       }
     } else {
       out.log('Está bien. Cuando quieras, corre:')
-      out.log(`  claude mcp add agentbridge --scope user -- ${CLI_COMMAND} mcp`)
+      out.log(`  ${manual}`)
     }
     out.log('')
     out.log('Importante: si ya tenías una sesión de Claude Code abierta, ciérrala y ábrela de nuevo — la herramienta nueva')
     out.log('no aparece hasta que reinicias la sesión.')
-    out.log(`Para preguntar desde la terminal en cualquier momento: ${CLI_COMMAND} ask <handle> "<pregunta>"`)
+    out.log(`Para preguntar desde la terminal en cualquier momento: ${CLI_COMMAND} ask <nombre> "<pregunta>"`)
     out.log('')
 
     if (mcpRegistered) {
       done.push('Servidor MCP registrado en Claude Code.')
       pending.push('Reinicia (o abre) tu sesión de Claude Code para que aparezca la herramienta nueva.')
     } else {
-      pending.push(`Registra el servidor MCP: claude mcp add agentbridge --scope user -- ${CLI_COMMAND} mcp`)
+      pending.push(`Registra el servidor MCP: ${manual}`)
     }
   }
 
@@ -644,9 +712,16 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
 }
 
 export async function setupCommand(argv: string[], ctx: CliContext): Promise<void> {
-  const { values } = parseArgs({ args: argv, options: { repo: { type: 'string' }, 'responder-home': { type: 'string' } } })
+  const { values } = parseArgs({
+    args: argv,
+    options: { repo: { type: 'string' }, profile: { type: 'string' }, relays: { type: 'string' } },
+  })
   if (!ctx.prompt) {
     throw new CliError(NON_INTERACTIVE_ES)
   }
-  await runSetup({ ...ctx, prompt: ctx.prompt, run: defaultRunner, repoDir: values.repo, responderHome: values['responder-home'] })
+  const relays = values.relays
+    ?.split(',')
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0)
+  await runSetup({ ...ctx, prompt: ctx.prompt, run: defaultRunner, repoDir: values.repo, profileHome: values.profile, relays })
 }
