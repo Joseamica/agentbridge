@@ -19,15 +19,25 @@ costo está escrito para que se pueda revertir con criterio.
    raíz del archivo se acepta y se ignora en silencio.
 2. **Las descripciones de herramientas MCP se quedan en inglés.** Las lee el modelo, no una
    persona. El CLAUDE.md del proyecto dice que las instrucciones al modelo van en inglés.
-3. **Un solo traductor de errores al español** (`packages/cli/src/spanish-errors.ts`) compartido
-   por el router y los dos servidores MCP. El mismo error en inglés se filtró tres veces en tareas
-   distintas antes de consolidarlo.
+3. **Un solo traductor de errores al español** (`packages/cli/src/spanish-errors.ts`), usado hoy
+   por `setup.ts` y por el servidor MCP del preguntador (`mcp-asker.ts`); el router ya no lo
+   importa. El mismo error en inglés se filtró tres veces en tareas distintas antes de
+   consolidarlo. `packages/channel/src/channel.ts` (otro workspace) tiene su propia copia de la
+   misma lógica para errores de Zod en vez de importar de aquí — deliberado y preexistente, pero
+   vale decirlo ya que la regla de "un solo traductor" está escrita en un lugar y rota en el de al
+   lado.
 4. **El modelo se valida por caracteres seguros, no por lista blanca.** Un id completo como
    `claude-haiku-4-5-20251001` es válido y una enumeración lo rechazaría. El esfuerzo sí es lista
    cerrada: `low|medium|high|xhigh|max`.
 5. **`doctor` depende de que `claude` esté instalado.** Un chequeo que no puede decirte que el
    perfil nunca inició sesión es justo el punto ciego que hacía que dijera "todo en orden" sobre
    una instalación rota. Si falta el comando, lo reporta en español.
+6. **La prueba de tablero de `doctor` (`probeBoard`) dirige su sobre a una llave efímera, no a la
+   propia**, aunque el spec dice "publica un sobre dirigido a la propia llave y lo vuelve a leer"
+   (`docs/superpowers/specs/2026-09-16-nostr-transport-design.md`, línea 284). Es más seguro, no
+   menos: un tablero que solo sirve sobres etiquetados para el lector autenticado haría fallar la
+   prueba en vez de darla por buena por error, y el destinatario efímero evita que `doctor` escriba
+   en la propia bandeja un sobre indescifrable que viviría ahí siete días.
 
 ## Pendiente, en orden de importancia
 
@@ -82,7 +92,7 @@ Plan 2 (el lado que responde preguntas). Verificadas y acotadas; ninguna bloquea
    (`ps -o lstart=`). En Linux esa hora se deriva del arranque del sistema, así que un salto del
    reloj (NTP, reanudar una VM) puede hacer que un canal vivo se vea como muerto: si en ese momento
    se abre un segundo canal, se queda con el candado y el primero se cierra solo (su pregunta
-   vuelve a la cola, no se pierde nada). Candidato de arreglo en el plan 4: en Linux leer los ticks
+   vuelve a la cola, no se pierde nada). Candidato de arreglo en un plan futuro: en Linux leer los ticks
    de arranque de `/proc/<pid>/stat`, que no se mueven.
 2. **Un mensaje que siempre falla al guardarse bloquea la recuperación histórica de ese tablero.**
    Si procesar un mensaje lanza siempre el mismo error, su identificador no se marca como visto y
