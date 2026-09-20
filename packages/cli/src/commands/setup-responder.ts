@@ -270,11 +270,7 @@ export async function setupResponder(o: {
     o.out.log('Siguientes pasos:')
     o.out.log(`  1. Inicia sesión una vez en el perfil dedicado:  CLAUDE_CONFIG_DIR=${quote(claudeConfigDir)} claude   (usa /login y sal)`)
     o.out.log(`  2. Arranca el respondedor:  ${quote(startScriptPath)}   (acepta la confirmación del canal de desarrollo)`)
-    // Still names the profile folder, not the identity folder: today's doctor checks
-    // settings.json/start.sh/the Claude login under a single --home, and those live in the
-    // profile. Task 2 gives doctor its own --profile flag and points --home at the identity
-    // instead — this line (and its test) is updated there, in the same commit.
-    o.out.log(`  3. Verifica:  ${CLI_COMMAND} doctor --home ${quote(profileHome)} --share ${quote(shareDir)} --repo ${quote(repoDir)}`)
+    o.out.log(`  3. Verifica:  ${CLI_COMMAND} doctor --home ${quote(identityHome)} --profile ${quote(profileHome)} --share ${quote(shareDir)} --repo ${quote(repoDir)}`)
   }
   return { startScriptPath, claudeConfigDir, settingsPath }
 }

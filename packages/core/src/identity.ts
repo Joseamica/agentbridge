@@ -77,6 +77,15 @@ export async function loadOrCreateIdentity(home: string): Promise<{ identity: Id
   }
 }
 
+// A key that is generated, used once and never written anywhere. `doctor`'s board probe addresses
+// its test envelope to this instead of to the person's own key, so the envelope is not addressed to
+// them, none of their subscriptions fetch it, and nothing they own is written because of a
+// diagnostic. Nobody can ever decrypt it: the secret is gone when the process ends.
+export function ephemeralIdentity(): Identity {
+  const secretKey = generateSecretKey()
+  return { secretKey, publicKey: getPublicKey(secretKey) }
+}
+
 export function encodeLink(publicKey: string, relays: readonly string[]): string {
   if (!HEX_64.test(publicKey)) throw new Error('encodeLink: publicKey must be 64 lowercase hex characters')
   return `${LINK_PREFIX}${nprofileEncode({ pubkey: publicKey, relays: relays.slice(0, NOSTR.maxRelaysPerContact) })}`

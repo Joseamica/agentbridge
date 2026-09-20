@@ -542,7 +542,7 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     out.log('')
 
     out.log('Verificando con doctor…')
-    const checks = await runDoctor({ home: responderHome, shareDir, repoDir, run: ctx.run, fetchImpl: ctx.fetchImpl })
+    const checks = await runDoctor({ identityHome: ctx.home, profileHome: responderHome, shareDir, repoDir, run: ctx.run })
     for (const c of checks) out.log(`${c.ok ? '[ok]    ' : '[falta] '}${c.name}: ${c.detail}`)
     out.log('')
 

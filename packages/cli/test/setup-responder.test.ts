@@ -84,7 +84,7 @@ describe('setupResponder', () => {
     const text = out.lines.join('\n')
     expect(text).toContain(`CLAUDE_CONFIG_DIR='${join(home, 'claude')}' claude`)
     expect(text).toContain(`'${join(home, 'start.sh')}'`)
-    expect(text).toContain(`${CLI_COMMAND} doctor --home '${home}'`)
+    expect(text).toContain(`${CLI_COMMAND} doctor --home '${identityHome}' --profile '${home}'`)
     expect(text).not.toContain('enroll')
     expect(text).not.toMatch(/(^|\s)agentbridge (enroll|doctor)\b/m)
   })

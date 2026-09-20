@@ -34,8 +34,8 @@ Preguntar:
   ${CLI_COMMAND} mcp                         (servidor MCP para Claude Code o Codex)
 
 Responder desde esta computadora:
-  ${CLI_COMMAND} setup-responder --share <carpeta> [--home <carpeta>] [--repo <carpeta>] [--model sonnet] [--effort low]
-  ${CLI_COMMAND} doctor [--home <carpeta>] [--share <carpeta>] [--repo <carpeta>]
+  ${CLI_COMMAND} setup-responder --share <carpeta> [--profile <carpeta>] [--repo <carpeta>] [--model sonnet] [--effort low]
+  ${CLI_COMMAND} doctor [--home <carpeta>] [--profile <carpeta>] [--share <carpeta>] [--repo <carpeta>]
 
 Variable: AGENTBRIDGE_HOME (la carpeta con tu identidad y tu base de datos)`
 
