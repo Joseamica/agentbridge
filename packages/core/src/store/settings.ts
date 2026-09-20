@@ -1,11 +1,15 @@
 import { UserFacingError } from '../errors'
 import type { Store } from './db'
 
-// The five public relays that accepted, served and kept sealed wraps in the 2026-09-16 live check.
+// The five public relays that accepted, served and kept sealed wraps in the 2026-09-16 live check
+// — except relay.nostr.net, swapped for relay.damus.io on 2026-09-19 after a direct probe: its
+// WebSocket handshake answered HTTP 500 (down, not merely refusing an unknown publisher), while
+// relay.damus.io accepted and served a real 16-bit-wrap publish on the same probe. `doctor`
+// checks every board here on every run — re-probe before swapping any of these again.
 export const DEFAULT_RELAYS: readonly string[] = [
   'wss://relay.primal.net',
   'wss://relay.snort.social',
-  'wss://relay.nostr.net',
+  'wss://relay.damus.io',
   'wss://nostr.oxtr.dev',
   'wss://nos.lol',
 ]

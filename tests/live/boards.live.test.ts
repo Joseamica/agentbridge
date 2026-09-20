@@ -16,8 +16,11 @@ import {
   type PrecheckedWrap,
 } from '@agentbridge/core'
 
-// The relays that accepted and served NIP-59 wraps in the 2026-09-16 spike.
-const RELAYS = ['wss://relay.primal.net', 'wss://relay.snort.social', 'wss://relay.nostr.net', 'wss://nostr.oxtr.dev', 'wss://nos.lol']
+// The relays that accepted and served NIP-59 wraps in the 2026-09-16 spike — except
+// relay.nostr.net, replaced with relay.damus.io on 2026-09-19 after the former's WebSocket
+// handshake started answering HTTP 500 (see the comment on DEFAULT_RELAYS in
+// packages/core/src/store/settings.ts, which this list mirrors).
+const RELAYS = ['wss://relay.primal.net', 'wss://relay.snort.social', 'wss://relay.damus.io', 'wss://nostr.oxtr.dev', 'wss://nos.lol']
 
 const newIdentity = (): Identity => {
   const secretKey = generateSecretKey()
