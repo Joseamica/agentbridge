@@ -1,4 +1,4 @@
-import { CLI_COMMAND, RelayError, UserFacingError, describeError } from '@agentbridge/core'
+import { CLI_COMMAND, UserFacingError, describeError } from '@agentbridge/core'
 import { ask, ticket } from './commands/ask'
 import { connect, link } from './commands/connect'
 import { approve, contacts, reject, requests, revoke, whoami } from './commands/contacts'
@@ -7,7 +7,6 @@ import { setupCommand } from './commands/setup'
 import { setupResponderCommand } from './commands/setup-responder'
 import { CliError, type CliContext } from './context'
 import { mcp } from './mcp-asker'
-import { isNetworkError, RELAY_UNREACHABLE_ES } from './spanish-errors'
 
 export type Command = (argv: string[], ctx: CliContext) => Promise<void>
 
@@ -118,16 +117,12 @@ export async function runWith(commands: Record<string, Command>, argv: string[],
     await command(rest, ctx)
     return 0
   } catch (err) {
-    if (err instanceof CliError || err instanceof UserFacingError || err instanceof RelayError) {
+    if (err instanceof CliError || err instanceof UserFacingError) {
       ctx.out.error(err.message)
       return 1
     }
     if (isParseArgsError(err)) {
       ctx.out.error(`${translateParseArgsError(err)}\n\n${USAGE}`)
-      return 1
-    }
-    if (isNetworkError(err)) {
-      ctx.out.error(RELAY_UNREACHABLE_ES)
       return 1
     }
     // Never the error's own message here: it can carry a filesystem path, relay text or decrypted
