@@ -21,13 +21,13 @@ pantalla.
 
 ## 0. Antes de empezar
 
-- **Dos computadoras.** La sección 6 (la prueba de 24 horas) exige que sean dos de verdad, en
+- **Dos computadoras.** La sección 5 (la prueba de 24 horas) exige que sean dos de verdad, en
   redes distintas — no dos usuarios del sistema en la misma Mac, y no la laptop de quien pregunta
-  cerrada mientras el mismo proceso sigue vivo. Para las secciones 1 a 5 y 7 basta con eso mismo,
+  cerrada mientras el mismo proceso sigue vivo. Para las secciones 1 a 4, 6 y 7 basta con eso mismo,
   o —si de verdad no tienes una segunda máquina a la mano para una primera pasada rápida— dos
-  usuarios del sistema con carpetas de `$HOME` distintas; pero no uses ese atajo para la sección 6.
+  usuarios del sistema con carpetas de `$HOME` distintas; pero no uses ese atajo para la sección 5.
 - **Node 22.13 en una y Node 24 en la otra** (o un gestor de versiones — `nvm`, `fnm`, `n`, el que
-  uses— para cambiar entre las dos en la misma máquina durante la sección 2). Son el piso y el
+  uses— para cambiar entre las dos en la misma máquina durante la sección 1). Son el piso y el
   techo que decimos soportar.
 - **Claude Code con sesión iniciada en las dos.**
 - Nada de Docker ni Postgres: 0.2 no tiene servidor propio que desplegar.
