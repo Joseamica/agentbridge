@@ -42,7 +42,9 @@ tener los dos a la vez.
 
 El permiso va **en una sola dirección**. Que Ana pueda preguntarle a Dev no le permite a Dev
 preguntarle a Ana. Si quieren las dos direcciones, hacen el paso del permiso dos veces, una en
-cada sentido. Cualquiera de los dos puede quitarlo cuando quiera, con `revoke`.
+cada sentido. `revoke` también va en una sola dirección: solo quien dio el permiso (quien
+contesta) puede quitarlo, al instante, con `revoke <nombre>`. Quien pregunta simplemente deja de
+preguntar — no hay un `revoke` para ese lado.
 
 En esta guía **Ana pregunta** y **Dev contesta**. Cambia los nombres por los de ustedes.
 
@@ -147,8 +149,9 @@ Adentro, escribe `/login`, inicia sesión, y `/exit`. Esto se hace una sola vez.
 ```
 
 La primera vez te va a preguntar si confías en cargar el "canal de desarrollo" — contesta que sí;
-es justo el plugin de AgentBridge que acabas de instalar. Deja esta terminal abierta: es la sesión
-que se queda esperando preguntas.
+es justo el plugin de AgentBridge que acabas de instalar. `start.sh` se queda ocupando esta
+terminal (termina entregándole el control a Claude Code) — déjala así, es la sesión que se queda
+esperando preguntas, y abre una terminal **nueva** para lo que sigue.
 
 ### Qué ves cuando llega una pregunta
 
@@ -250,14 +253,17 @@ Algo que confunde la primera vez:
 
 ## 6. Quitar el permiso
 
+Esto lo hace quien contesta, sobre alguien a quien le dio permiso de preguntarle — no al revés:
+quien pregunta no tiene un `revoke`, simplemente deja de preguntar.
+
 ```bash
 npx -y @joseamica/agentbridge@latest revoke <nombre>
 ```
 
-`<nombre>` es el que aparece en `contacts`. Si había una pregunta suya en camino cuando revocas,
-esa persona no recibe un "se canceló" al instante: recibe el rechazo (con motivo "el permiso con
-esa persona cambió mientras esta pregunta seguía en camino") **la próxima vez que su lado
-reintenta**, que puede tardar hasta unos minutos.
+`<nombre>` es el que aparece en `contacts`, en la lista de "Quién puede preguntarte a ti". Si había
+una pregunta suya en camino cuando revocas, esa persona no recibe un "se canceló" al instante:
+recibe el rechazo (con motivo "el permiso con esa persona cambió mientras esta pregunta seguía en
+camino") **la próxima vez que su lado reintenta**, que puede tardar hasta unos minutos.
 
 ## Antes de usarlo con algo que importe
 

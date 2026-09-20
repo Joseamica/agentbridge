@@ -37,7 +37,7 @@ flowchart LR
    There is no account and no server of ours.
 2. They exchange links (`agentbridge:nprofile1…`). One asks for permission with `connect`; the
    other sees it with `requests` and decides with `approve` or `reject`. Permission is
-   **directional** and revocable at any time with `revoke`.
+   **directional**, and only whoever granted it can take it back, at any time, with `revoke`.
 3. Questions and answers travel as NIP-59 sealed wraps through public Nostr boards. A board sees
    an encrypted envelope, the ephemeral key that published it, **the recipient's key it is
    addressed to**, its size and its timing. It never sees the content, and it never sees who wrote
@@ -128,8 +128,9 @@ boards; neither is exposed to the internet, and there's no server of ours in the
 | **Asker** | the person with the question | Asks from their own Claude Code, or from the CLI. |
 
 Permission is **directional**. Ana being allowed to ask Dev does not let Dev ask Ana. If you want
-both directions, do the grant step twice, once each way. Either side can revoke instantly with
-`revoke`.
+both directions, do the grant step twice, once each way. `revoke` is also directional: only the
+person who granted permission (the answerer) can take it back instantly with `revoke <name>`. The
+asker simply stops asking — there's no `revoke` for that side.
 
 The "locked room" is the important idea. The answerer picks one folder and copies into it only
 what they're willing to share. Their agent can read that folder and **nothing else on the
@@ -228,8 +229,9 @@ CLAUDE_CONFIG_DIR=~/.agentbridge-responder/claude claude   # once: /login, then 
 ```
 
 The first time it starts, it'll ask whether to trust the development channel — that's the
-AgentBridge plugin you just installed; accept it. Keep this running in its own terminal window, or
-under tmux.
+AgentBridge plugin you just installed; accept it. `start.sh` takes over this terminal (it ends by
+handing control to Claude Code) — keep it running there, or under tmux, and open a **new** terminal
+window for the next command.
 
 ```bash
 npx -y @joseamica/agentbridge@latest doctor --profile ~/.agentbridge-responder --share ~/AgentBridge/shared
@@ -323,8 +325,11 @@ Exit codes: `0` success, `1` expected failure, `2` unexpected.
 | `plugins/agentbridge` | Plugin manifests and the built bundle the responder's dedicated Claude Code profile loads. |
 | `tests/` | `asker/`, `responder/` and `acceptance/` run entirely in-process, no network. `tests/live` is the only suite that talks to real public boards. |
 
-Correlation deliberately never depends on the model copying an identifier: the channel validates a
-short code the model never sees, and the human-facing question code is checked for an exact match.
+Correlation's safety does not come from hiding an identifier from the model — the channel tells the
+model the short code and asks it to copy it back exactly. What actually protects it: at most one
+question is ever active at a time, and `reply`'s code is checked for an exact match against that
+one active question — a wrong or missing code fails the reply outright instead of ever landing on
+the wrong question.
 
 ## Development
 
