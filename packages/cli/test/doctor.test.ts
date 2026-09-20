@@ -159,6 +159,21 @@ describe('runDoctor with an identity', () => {
     expect(boardCheck.detail).not.toContain('no aceptó publicar')
   })
 
+  it('reports a real refusal as a refusal even when the relay uses NIP-01\'s own "error:" prefix', async () => {
+    // Follow-up to I3: NIP-01 defines `error:` as a RELAY's own catch-all prefix for a genuine
+    // `OK false` — the exact same prefix this codebase's own synthesized connection failures use.
+    // Classifying "could not connect" vs. "refused" by matching that text would misread a
+    // perfectly spec-compliant refusal as an outage, which is the same misdiagnosis I3 exists to
+    // prevent. The board here connects fine and then explicitly refuses with "error: …" — this
+    // must still read as a refusal, not as "no pude conectarme".
+    await seedIdentity()
+    board.options = { ...board.options, rejectWrites: 'error: some internal relay problem' }
+    const boardCheck = check(await runDoctor(doctorOptions()), `Tablero ${board.url}`)
+    expect(boardCheck.ok).toBe(false)
+    expect(boardCheck.detail).toContain('no aceptó publicar')
+    expect(boardCheck.detail).not.toContain('no pude conectarme')
+  })
+
   it('fails a board that accepts the event and then does not keep it', async () => {
     await seedIdentity()
     board.options = { ...board.options, dropIncoming: () => true }
@@ -302,5 +317,30 @@ describe('runDoctor with --share alone (no --profile)', () => {
     await seedIdentity()
     const checks = await runDoctor({ ...doctorOptions(), shareDir })
     expect(checks.find((c) => c.name === 'El perfil dedicado está fuera de la carpeta compartida')).toBeUndefined()
+  })
+})
+
+describe('runDoctor with --share and --profile together', () => {
+  // Minor (follow-up review): nothing exercised this combination, which is the only one that runs
+  // the cross-check comparing the two folders — proven here in both directions.
+  it('reports the cross-check as passing when the profile is outside the shared folder', async () => {
+    await seedIdentity()
+    await mkdir(profileHome, { recursive: true })
+    const checks = await runDoctor({ ...doctorOptions(), shareDir, profileHome })
+    const crossCheck = check(checks, 'El perfil dedicado está fuera de la carpeta compartida')
+    expect(crossCheck.ok).toBe(true)
+    // Both sides' own checks ran too — this combination must not silently drop either.
+    expect(checks.some((c) => c.name === 'Carpeta compartida')).toBe(true)
+    expect(checks.some((c) => c.name === 'Permisos del respondedor')).toBe(true)
+  })
+
+  it('fails the cross-check when the dedicated profile sits inside the shared folder', async () => {
+    await seedIdentity()
+    const profileInsideShare = join(shareDir, 'perfil')
+    await mkdir(profileInsideShare, { recursive: true })
+    const checks = await runDoctor({ ...doctorOptions(), shareDir, profileHome: profileInsideShare })
+    const crossCheck = check(checks, 'El perfil dedicado está fuera de la carpeta compartida')
+    expect(crossCheck.ok).toBe(false)
+    expect(crossCheck.detail).toContain('setup-responder')
   })
 })

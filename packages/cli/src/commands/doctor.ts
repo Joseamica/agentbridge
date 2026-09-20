@@ -227,24 +227,32 @@ export async function probeBoard(o: {
     return { ok: false, detail: `no pude preparar la prueba: ${describeError(err)}` }
   }
 
+  const suggestion = `Puedes cambiar tus tableros con: ${CLI_COMMAND} setup --relays "wss://uno,wss://otro"`
+  // Establish the connection as its own explicit step, before publishing anything — never
+  // classify "could not connect" vs. "refused" by matching text in the rejection reason. NIP-01
+  // defines `error:` as a RELAY's own catch-all prefix for a genuine `OK false`, which is exactly
+  // the same prefix this pool's own synthesized failures use (connect() errors, guards, timeouts —
+  // see BoardPool.publish/BoardConnection) — so a spec-compliant board that refuses with
+  // "error: some reason" would misread as "never reached it", the identical misdiagnosis that made
+  // relay.nostr.net's real outage look like an active refusal in the first place. Whether the
+  // socket itself opened is the one thing only this pool controls, never the relay, so it is the
+  // one thing safe to branch on. `BoardPool.connect` reuses this same connection for the publish
+  // right below — not a second, throwaway handshake.
+  try {
+    await o.pool.connect(o.relay)
+  } catch {
+    return { ok: false, detail: `no pude conectarme con ese tablero. ${suggestion}` }
+  }
+
   const published = await o.pool.publish([o.relay], wrap)
   if (published.accepted.length === 0) {
-    // The relay's own words are third-party text and are not printed either way — but "I could
-    // not even reach it" and "it answered and said no" are different findings, and conflating
-    // them is how a board that is simply down (a failed handshake, a timeout) gets misread as one
-    // that is actively rejecting AgentBridge. `BoardPool.publish` already tells the two apart in
-    // its `rejected[].reason`: every reason this pool or the connection itself manufactures
-    // (a connect() failure, a guard, a timeout waiting for OK) is prefixed `error:`; the one
-    // reason that is NOT ours is the relay's own `OK <id> false <message>`, forwarded verbatim
-    // with no prefix — that, and only that, is a board that opened a connection and refused.
-    const reason = published.rejected.find((r) => r.relay === o.relay)?.reason ?? ''
-    const suggestion = `Puedes cambiar tus tableros con: ${CLI_COMMAND} setup --relays "wss://uno,wss://otro"`
-    if (reason.startsWith('error:')) {
-      return { ok: false, detail: `no pude conectarme con ese tablero. ${suggestion}` }
-    }
-    // Every gift wrap is signed by a fresh throwaway key (never this person's own), so a real
-    // rejection is never about a key the board recognises — it is a policy that refuses
-    // publishers it does not already know, which is a property of the board, not of this person.
+    // The connection above already succeeded, so everything that can land here — the relay's own
+    // explicit OK false, or the connection dropping/timing out after we sent the event — happened
+    // only once the board was reachable. The relay's own words are third-party text and are not
+    // printed either way. Every gift wrap is signed by a fresh throwaway key (never this person's
+    // own), so a real rejection is never about a key the board recognises — it is a policy that
+    // refuses publishers it does not already know, which is a property of the board, not of this
+    // person.
     return { ok: false, detail: `no aceptó publicar (puede que pida registro o tenga una política que no acepta remitentes desconocidos). ${suggestion}` }
   }
 

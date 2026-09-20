@@ -19,6 +19,11 @@ export type FakeBoardOptions = {
   // like a relay stuck mid-write. Used to test a caller's own deadline against a publish that never
   // gets an answer.
   swallowPublishes?: boolean
+  // A relay that opens the connection fine and then genuinely refuses to publish, with this exact
+  // reason string. Exists so a test can hand back NIP-01's own `error:` catch-all prefix — the one
+  // a relay is free to use for any real refusal — to prove a caller does not mistake a spec-
+  // compliant refusal for "never connected" just because the text happens to start with `error:`.
+  rejectWrites?: string
   // Answer WebSocket pings (default true). The server is built with autoPong off, so this is the
   // only thing that answers them.
   respondToPings?: boolean
@@ -126,6 +131,10 @@ export async function startFakeBoard(initial: FakeBoardOptions = {}): Promise<Fa
         }
         if (!verifyEvent(JSON.parse(JSON.stringify(event)))) {
           send(session, ['OK', event?.id ?? '', false, 'invalid: bad signature'])
+          return
+        }
+        if (o().rejectWrites !== undefined) {
+          send(session, ['OK', event.id, false, o().rejectWrites as string])
           return
         }
         if (o().requireAuthToWrite && session.authed.size === 0) {

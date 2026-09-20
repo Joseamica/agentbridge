@@ -71,6 +71,20 @@ export class BoardPool {
     return conn
   }
 
+  // Exposed so a caller can make "the socket opened" its own explicit outcome, distinct from
+  // whatever happens afterwards on the wire. `doctor`'s board probe needs exactly this: NIP-01
+  // lets a relay answer `OK false` with any reason text it likes, including the same `error:`
+  // catch-all prefix this pool's own synthesized failures already use (see `publish`'s catch
+  // below and `BoardConnection`'s `CLOSED_REASON`/timeout/guard messages) — so classifying a
+  // rejection by its text can misread a spec-compliant refusal as "never connected", which is
+  // exactly what let a real relay outage read as an active refusal. Whether the socket itself
+  // opened is the one thing only this pool controls, never the relay, so it is what stays safe to
+  // branch on. Reuses (and caches) the same connection `publish`/`query` would open next — this
+  // is not a second, throwaway handshake.
+  async connect(relay: string): Promise<void> {
+    await this.connection(relay)
+  }
+
   // A helper used by both operations below: the caller's wait ends when the signal aborts, even
   // though the underlying socket work is also stopped through `abort()` on the connection.
   private async raceSignal<T>(work: Promise<T>, onAbort: () => T, signal?: AbortSignal): Promise<T> {
