@@ -1,4 +1,15 @@
-import { CLI_ARGV, CLI_COMMAND, agentbridgeHome, encodeLink, getProfile, loadOrCreateIdentity, nowSeconds, openStore, setProfile } from '@agentbridge/core'
+import {
+  CLI_ARGV,
+  CLI_COMMAND,
+  agentbridgeHome,
+  encodeLink,
+  getProfile,
+  loadOrCreateIdentity,
+  nowSeconds,
+  openStore,
+  setProfile,
+  type Profile,
+} from '@agentbridge/core'
 import type { Dirent } from 'node:fs'
 import { access, lstat, readdir, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -9,7 +20,7 @@ import { isSameOrWithin, resolveComparablePath } from '../fs-paths'
 import { describeFsError } from '../spanish-errors'
 import { connect } from './connect'
 import { projectConfigArtifacts, runDoctor } from './doctor'
-import { defaultRunner, repoDirFromBundleLocation, setupResponder, type CommandRunner } from './setup-responder'
+import { defaultRunner, quote, repoDirFromBundleLocation, setupResponder, type CommandRunner } from './setup-responder'
 
 // The guided flow needs two extra things the plain CliContext does not carry: something to
 // drive prompts with (real readline in production, a scripted queue in tests — see
@@ -28,8 +39,6 @@ export type SetupContext = CliContext & {
   // The one seam this command needs for tests: `connect` mines 22 bits of proof of work, and the
   // plan allows exactly one test in the whole repository to pay for that (tests/asker/flow.test.ts).
   connectWith?: (link: string, ctx: CliContext) => Promise<void>
-  // From `--relays`. Empty or absent leaves the list alone.
-  relays?: string[]
 }
 
 // The truth today: the key and the name are only ever created by answering these two questions,
@@ -484,13 +493,6 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
       )
       profile = setProfile(store, { name, now: nowSeconds() })
     }
-    if (ctx.relays && ctx.relays.length > 0) {
-      // The spec's answer to a board that starts refusing service is "the list is configurable", so
-      // there has to be a way to configure it. `setup --relays "wss://a,wss://b"` is that way, it
-      // works on a rerun, and doctor's own failing-board line names it.
-      profile = setProfile(store, { relays: ctx.relays, now: nowSeconds() })
-      out.log(`Cambié tus tableros: ahora usas ${profile.relays.length}.`)
-    }
   } finally {
     // Closed before anything else runs: `connect` and `doctor` open this same database, and holding
     // it open across a whole guided run would make their writes wait on a handle nothing needs.
@@ -606,8 +608,8 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
 
     const alreadyLoggedIn = checks.some((c) => c.name === 'Sesión iniciada en el perfil dedicado' && c.ok)
     const remainingSteps = [
-      ...(alreadyLoggedIn ? [] : [`Inicia sesión una vez en el perfil dedicado:  CLAUDE_CONFIG_DIR='${setupResult.claudeConfigDir}' claude   (usa /login y sal)`]),
-      `Arráncalo:  ${setupResult.startScriptPath}`,
+      ...(alreadyLoggedIn ? [] : [`Inicia sesión una vez en el perfil dedicado:  CLAUDE_CONFIG_DIR=${quote(setupResult.claudeConfigDir)} claude   (usa /login y sal)`]),
+      `Arráncalo:  ${quote(setupResult.startScriptPath)}`,
       'Dale tu enlace a quien vaya a preguntarte.',
     ]
     out.log('Para terminar de dejarlo contestando, en este orden:')
@@ -618,7 +620,10 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     for (const c of checks) {
       if (!c.ok) pending.push(`${c.name}: ${c.detail}`)
     }
-    pending.push(`Arranca el respondedor: ${setupResult.startScriptPath}`)
+    // Quoted like every other printed path in this command (Minor 1): a profile at
+    // `/tmp/mi respondedor`, or a home with an apostrophe in it, must still be a line that runs
+    // when pasted, not just when the default path happens to have neither.
+    pending.push(`Arranca el respondedor: ${quote(setupResult.startScriptPath)}`)
     pending.push('Dale tu enlace a quien vaya a preguntarte.')
   }
 
@@ -726,17 +731,44 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
   }
 }
 
+// I5: `doctor`'s own remediation line on a failing board, and the runbook's own worked example,
+// both hand a person exactly `setup --relays "wss://uno,wss://otro"` — mid-incident, on an
+// otherwise-working install. Before this, that command applied the list and then fell straight
+// through into the entire guided interview: for someone who answers "1" (contesta), that meant
+// `chooseShareDir` again, whose default is hard-coded and never read back from the existing
+// `start.sh` — so pressing Enter at the folder prompt (the exact answer the quick start's own
+// worked example models as normal) silently repointed a working responder at a brand-new, empty
+// `~/AgentBridge/compartido`, with no error anywhere. `--relays` now does only what it says:
+// write the list, print it, and exit. It never opens a prompt, so it works with no interactive
+// terminal at all — the guard below only ever applies to the guided flow that follows it.
+export async function applyRelays(ctx: CliContext, relays: readonly string[]): Promise<Profile> {
+  const store = await openStore(ctx.home, ctx.relayPolicy ? { relayPolicy: ctx.relayPolicy } : {})
+  let profile: Profile
+  try {
+    profile = setProfile(store, { relays, now: nowSeconds() })
+  } finally {
+    store.close()
+  }
+  ctx.out.log(`Cambié tus tableros: ahora usas ${profile.relays.length}.`)
+  for (const relay of profile.relays) ctx.out.log(`  ${relay}`)
+  return profile
+}
+
 export async function setupCommand(argv: string[], ctx: CliContext): Promise<void> {
   const { values } = parseArgs({
     args: argv,
     options: { repo: { type: 'string' }, profile: { type: 'string' }, relays: { type: 'string' } },
   })
-  if (!ctx.prompt) {
-    throw new CliError(NON_INTERACTIVE_ES)
-  }
   const relays = values.relays
     ?.split(',')
     .map((value) => value.trim())
     .filter((value) => value.length > 0)
-  await runSetup({ ...ctx, prompt: ctx.prompt, run: defaultRunner, repoDir: values.repo, profileHome: values.profile, relays })
+  if (relays && relays.length > 0) {
+    await applyRelays(ctx, relays)
+    return
+  }
+  if (!ctx.prompt) {
+    throw new CliError(NON_INTERACTIVE_ES)
+  }
+  await runSetup({ ...ctx, prompt: ctx.prompt, run: defaultRunner, repoDir: values.repo, profileHome: values.profile })
 }

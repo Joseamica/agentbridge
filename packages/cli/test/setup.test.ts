@@ -4,7 +4,7 @@ import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { plainSocketFactory, startFakeBoard, type FakeBoard } from '../../core/test/support/fake-board'
-import { runSetup, type SetupContext } from '../src/commands/setup'
+import { applyRelays, runSetup, setupCommand, type SetupContext } from '../src/commands/setup'
 import { memoryOutput, PromptEOF } from '../src/context'
 
 const allowAnyRelay = (inputs: readonly unknown[]): string[] => inputs.filter((x): x is string => typeof x === 'string').slice(0, 5)
@@ -183,6 +183,20 @@ describe('the answering side', () => {
     expect(text).toMatch(/dáselo|pásaselo|mándaselo/i)
   })
 
+  it('quotes a profile path with a space so the printed next steps still run (Minor 1)', async () => {
+    // setup-responder.ts's own next-steps output already quotes every path this way; setup.ts
+    // hand-wrote its own unquoted version of the same lines, which a profile at a path with a
+    // space (or an apostrophe) would break when pasted.
+    await seedIdentityAndProfile()
+    const spacedProfile = join(root, 'mi respondedor')
+    const out = memoryOutput()
+    const { prompt, expectDrained } = scripted(['1', shareDir, ''])
+    await runSetup(context({ prompt, out, profileHome: spacedProfile }))
+    expectDrained()
+    const text = out.lines.join('\n')
+    expect(text).toContain(`'${join(spacedProfile, 'start.sh')}'`)
+  })
+
   it("lists doctor's failing checks as pending work instead of claiming it is done", async () => {
     await seedIdentityAndProfile()
     const out = memoryOutput()
@@ -314,26 +328,34 @@ describe('the retry loop', () => {
   })
 })
 
+// I5: `--relays` must do only what it says — write the list and exit — never fall through into
+// the guided interview. These test the standalone path directly (`applyRelays`, and `setupCommand`
+// end to end), not `runSetup`: the guided flow no longer reads a relay list from its context at
+// all, so there is nothing left there for a --relays test to exercise.
 describe('--relays', () => {
-  it('writes the list to the profile', async () => {
+  it('writes the list and prints it, with no prompt and no interview, via the CLI entry point', async () => {
     await seedIdentityAndProfile()
     const out = memoryOutput()
-    const { prompt, expectDrained } = scripted(['2', 'n', 'n'])
-    await runSetup(context({ prompt, out, relays: ['wss://uno.example', 'wss://dos.example'] }))
-    expectDrained()
+    // No `prompt` in this context at all: proves the path is not gated behind an interactive
+    // terminal the way the guided flow it used to fall through into would be.
+    await setupCommand(['--relays', 'wss://uno.example,wss://dos.example'], {
+      home: identityHome,
+      out,
+      env: process.env,
+      relayPolicy: allowAnyRelay,
+      createSocket: plainSocketFactory,
+    })
     const store = await openStore(identityHome, { relayPolicy: allowAnyRelay })
     expect(getProfile(store).relays).toEqual(['wss://uno.example', 'wss://dos.example'])
     store.close()
     expect(out.lines.join('\n')).toMatch(/Cambié tus tableros: ahora usas 2/)
+    expect(out.lines.join('\n')).toContain('wss://uno.example')
+    expect(out.lines.join('\n')).toContain('wss://dos.example')
   })
 
   it('changes an already-configured list on a rerun, not only a first-time one', async () => {
-    // seedIdentityAndProfile already set relays to [board.url] and a name, so this run never asks
-    // the name question — proving the --relays branch is not accidentally gated behind it.
     await seedIdentityAndProfile()
-    const { prompt, expectDrained } = scripted(['2', 'n', 'n'])
-    await runSetup(context({ prompt, relays: ['wss://nuevo.example'] }))
-    expectDrained()
+    await applyRelays({ home: identityHome, out: memoryOutput(), env: process.env, relayPolicy: allowAnyRelay }, ['wss://nuevo.example'])
     const store = await openStore(identityHome, { relayPolicy: allowAnyRelay })
     expect(getProfile(store).relays).toEqual(['wss://nuevo.example'])
     store.close()
@@ -343,10 +365,36 @@ describe('--relays', () => {
     await seedIdentityAndProfile()
     // The permissive allowAnyRelay used everywhere else in this file would let a bogus string
     // through, so this test uses the real production policy to actually exercise the rejection.
-    const { prompt } = scripted(['2', 'n', 'n'])
-    await expect(runSetup(context({ prompt, relayPolicy: sanitizeRelayList, relays: ['not-a-real-relay'] }))).rejects.toThrow(/tablero/i)
+    await expect(
+      applyRelays({ home: identityHome, out: memoryOutput(), env: process.env, relayPolicy: sanitizeRelayList }, ['not-a-real-relay']),
+    ).rejects.toThrow(/tablero/i)
     const store = await openStore(identityHome, { relayPolicy: allowAnyRelay })
     expect(getProfile(store).relays).toEqual([board.url])
     store.close()
+  })
+
+  it('never touches the dedicated profile or start.sh (I5)', async () => {
+    // The bug this closes: following doctor's own remediation line used to fall through into the
+    // whole guided interview, and pressing Enter at its folder prompt — the quick start's own
+    // worked example for that exact prompt — silently repointed start.sh at a brand-new, empty
+    // folder. Proving --relays never touches either file is the regression test for that.
+    await seedIdentityAndProfile()
+    await mkdir(profileHome, { recursive: true })
+    const startPath = join(profileHome, 'start.sh')
+    await writeFile(startPath, '#!/bin/bash\necho el original\n', { mode: 0o755 })
+    const before = await readFile(startPath, 'utf8')
+    const beforeEntries = new Set(await import('node:fs/promises').then((fs) => fs.readdir(profileHome)))
+
+    await setupCommand(['--relays', 'wss://nuevo.example'], {
+      home: identityHome,
+      out: memoryOutput(),
+      env: process.env,
+      relayPolicy: allowAnyRelay,
+      createSocket: plainSocketFactory,
+    })
+
+    expect(await readFile(startPath, 'utf8')).toBe(before)
+    const afterEntries = new Set(await import('node:fs/promises').then((fs) => fs.readdir(profileHome)))
+    expect(afterEntries).toEqual(beforeEntries)
   })
 })
