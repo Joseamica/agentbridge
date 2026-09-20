@@ -1,4 +1,4 @@
-import { CLI_ARGV, CLI_COMMAND, writeConfig } from '@agentbridge/core'
+import { CLI_ARGV, CLI_COMMAND } from '@agentbridge/core'
 import type { Dirent } from 'node:fs'
 import { access, lstat, readdir, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -524,41 +524,19 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
 
     let setupResult: Awaited<ReturnType<typeof setupResponder>>
     try {
-      setupResult = await setupResponder({ shareDir, repoDir, home: responderHome, run: ctx.run, out, printNextSteps: false })
+      setupResult = await setupResponder({
+        shareDir,
+        repoDir,
+        profileHome: responderHome,
+        identityHome: ctx.home,
+        run: ctx.run,
+        out,
+        printNextSteps: false,
+      })
     } catch (err) {
       if (err instanceof CliError) throw err
       throw new CliError(
         `No pude preparar la carpeta compartida o el perfil dedicado: ${describeFsError(err)}. No se completó la instalación; revisa la ruta y vuelve a correr "${CLI_COMMAND} setup".`,
-      )
-    }
-
-    // The dedicated responder session always runs with AGENTBRIDGE_HOME=<responderHome> (see
-    // startScript() in setup-responder.ts) — a device enrolled only at ctx.home (this device's
-    // default identity, from step 1) would leave that session with no config.json to read, and
-    // it exits immediately with "no config". Enrollment codes are single-use, so this person
-    // only has the one link; copying the very same device token here — rather than a second
-    // enrollment — is what lets a single link produce a responder that actually connects, and
-    // is also what lets "both ask and answer" work: the same identity is simply valid from two
-    // directories instead of needing two device tokens. Never overwrites a config that is
-    // already there for a DIFFERENT identity — that would silently swap out a working
-    // responder's credential out from under it.
-    const existingResponderConfig = await tryReadConfig({ home: responderHome })
-    if (!existingResponderConfig) {
-      await writeConfig(config, responderHome)
-      out.log(`Copié tu credencial al perfil dedicado (${responderHome}) para que el respondedor pueda conectarse.`)
-    } else if (existingResponderConfig.handle !== config.handle) {
-      out.log(
-        `Ojo: el perfil dedicado (${responderHome}) ya tenía otra identidad (@${existingResponderConfig.handle}); no la reemplacé. Si quieres usar @${config.handle} ahí, hazlo a mano.`,
-      )
-    } else if (existingResponderConfig.deviceToken !== config.deviceToken) {
-      // Same person (same handle), but a token that no longer matches the one this device just
-      // used — e.g. this identity was re-enrolled since the last time `setup` ran. Left alone,
-      // the responder would keep authenticating with a token the relay may no longer honor,
-      // with nothing said about it. Refreshing is safe here specifically because the handle
-      // already matches: this is the same identity's current credential, not a different one.
-      await writeConfig(config, responderHome)
-      out.log(
-        `Actualicé la credencial del perfil dedicado (${responderHome}): tenía un token distinto para la misma identidad (@${config.handle}).`,
       )
     }
     out.log('')

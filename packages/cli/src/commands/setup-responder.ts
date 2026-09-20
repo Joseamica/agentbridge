@@ -67,7 +67,10 @@ This folder is shared through AgentBridge. People your owner authorized send que
 - Always answer with the reply tool: copy the code exactly, list the files you used in source, and set confidence to seguro, creo or no_se. If the files do not contain the answer, say so with confidence no_se.
 `
 
-const quote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`
+// Exported so setup.ts prints paths with the same quoting rule this file's own start script
+// and next-steps output use — a profile at `/tmp/mi respondedor` or a home with an apostrophe
+// in it must still produce a line that runs.
+export const quote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`
 
 // start.sh is a 0755 script the owner is told to run; an unvalidated --model/--effort value
 // (typed by hand, or passed through automation) would otherwise land in that script verbatim.
@@ -84,15 +87,23 @@ export const ALLOWED_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as cons
 // validates the shape (letters, digits, dot, underscore, hyphen) rather than the value.
 const SAFE_MODEL_PATTERN = /^[A-Za-z0-9._-]+$/
 
-export function startScript(o: { shareDir: string; home: string; model: string; effort: string }): string {
+export function startScript(o: { shareDir: string; profileHome: string; identityHome: string; model: string; effort: string }): string {
   return [
     '#!/bin/bash',
     'set -euo pipefail',
     `cd ${quote(o.shareDir)}`,
-    `export AGENTBRIDGE_HOME=${quote(o.home)}`,
-    `export CLAUDE_CONFIG_DIR=${quote(join(o.home, 'claude'))}`,
+    // The identity and the database are the person's own, shared with every command they type
+    // (the spec keeps identity and state in one folder). Pointing this at the dedicated profile
+    // would give the answering side a second key and a second database: their own `requests`,
+    // `approve`, `reject` and `revoke` would read a store the channel never writes to, and they
+    // would have two links without knowing it.
+    `export AGENTBRIDGE_HOME=${quote(o.identityHome)}`,
+    // Claude's own profile, on the other hand, IS dedicated: its own config directory and its own
+    // locked-down settings.json, so a login and a permission set here never touch the person's
+    // everyday Claude Code.
+    `export CLAUDE_CONFIG_DIR=${quote(join(o.profileHome, 'claude'))}`,
     'exec claude --dangerously-load-development-channels plugin:agentbridge@agentbridge-local \\',
-    `  --permission-mode dontAsk --settings ${quote(join(o.home, 'settings.json'))} \\`,
+    `  --permission-mode dontAsk --settings ${quote(join(o.profileHome, 'settings.json'))} \\`,
     `  --model ${quote(o.model)} --effort ${quote(o.effort)}`,
     '',
   ].join('\n')
@@ -127,14 +138,14 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-// Only chmods a directory this call is creating for the first time. `--home` (or the share
+// Only chmods a directory this call is creating for the first time. `--profile` (or the share
 // folder) can be mistyped and happen to already exist — someone's real home directory,
 // another project, a folder they keep other things in — and re-permissioning it out from
 // under them is exactly the kind of silent side effect a misaimed flag must not cause.
 // mkdir's `mode` is subject to the process umask and only ever applies to directories it
 // actually creates, so the explicit chmod after is what makes a *freshly created* directory
 // land at exactly `mode` regardless of umask; a pre-existing one is left exactly as found.
-// `mkdir(recursive: true)` can create more than the leaf — `--home ~/a/b/responder` with
+// `mkdir(recursive: true)` can create more than the leaf — `--profile ~/a/b/responder` with
 // neither `a` nor `b` existing yet creates both — and every one of those new intermediate
 // directories needs the same treatment, or `~/a` and `~/a/b` are left world-readable at the
 // default umask even though `responder` itself ends up at `mode`.
@@ -153,7 +164,10 @@ async function ensureOwnedDir(path: string, mode: number): Promise<void> {
 export async function setupResponder(o: {
   shareDir: string
   repoDir: string
-  home: string
+  // Claude's dedicated profile: settings.json, CLAUDE_CONFIG_DIR and start.sh. Never AgentBridge's
+  // identity or database — those live in identityHome, which this function only reads.
+  profileHome: string
+  identityHome: string
   model?: string
   effort?: string
   run: CommandRunner
@@ -170,20 +184,26 @@ export async function setupResponder(o: {
 }): Promise<{ startScriptPath: string; claudeConfigDir: string; settingsPath: string }> {
   const shareDir = resolve(o.shareDir)
   const repoDir = resolve(o.repoDir)
-  const home = resolve(o.home)
+  const profileHome = resolve(o.profileHome)
+  const identityHome = resolve(o.identityHome)
 
-  // The device token (config.json), settings.json and start.sh all live under `home`.
-  // `blockReadsOutsideWorkingDirectories` only fences reads to the session's cwd — shareDir —
-  // and the two Read(**/.env*) denies only cover shareDir too, so if `home` is shareDir itself,
-  // or anywhere underneath it, none of that protects those files: a crafted question can just
-  // read the device token. Compare resolved paths, not the raw --share/--home strings, so a
-  // relative path, `~`, a trailing slash, a symlink, or macOS's /tmp -> /private/tmp cannot
-  // hide the same location behind two different spellings. Checked before anything is created.
-  const homeReal = await resolveComparablePath(o.home)
-  const shareReal = await resolveComparablePath(o.shareDir)
-  if (isSameOrWithin(homeReal, shareReal)) {
+  // Two separate refusals, because they are two different dangers with two different fixes.
+  // `blockReadsOutsideWorkingDirectories` fences reads to the shared folder, so anything INSIDE
+  // it is readable by a crafted question: settings.json and start.sh would let someone rewrite
+  // what the responder is allowed to do, and identity.json is the secret key itself.
+  const [profileReal, identityReal, shareReal] = await Promise.all([
+    resolveComparablePath(o.profileHome),
+    resolveComparablePath(o.identityHome),
+    resolveComparablePath(o.shareDir),
+  ])
+  if (isSameOrWithin(profileReal, shareReal)) {
     throw new CliError(
-      `--home (${o.home}) no puede ser la misma carpeta que --share, ni estar dentro de ella (${o.shareDir}): ahí la sesión que responde puede leer el token del dispositivo, settings.json y start.sh — permissions.blockReadsOutsideWorkingDirectories y las reglas Read(**/.env*) no protegen nada dentro de la carpeta compartida. Usa una carpeta --home distinta, fuera de --share.`,
+      'El perfil dedicado no puede ser la carpeta compartida ni estar dentro de ella: ahí la sesión que responde puede leer y reescribir settings.json y start.sh. Pasa otra carpeta con --profile, fuera de la compartida.',
+    )
+  }
+  if (isSameOrWithin(identityReal, shareReal)) {
+    throw new CliError(
+      'Tu llave secreta quedaría dentro de la carpeta compartida, donde cualquier pregunta podría leerla y hacerse pasar por ti para siempre. Elige una carpeta compartida que no contenga tu carpeta de identidad.',
     )
   }
 
@@ -199,12 +219,12 @@ export async function setupResponder(o: {
     throw new CliError(`Esfuerzo no soportado: "${effort}". Usa uno de: ${ALLOWED_EFFORTS.join(', ')}`)
   }
 
-  await ensureOwnedDir(home, 0o700)
-  const claudeConfigDir = join(home, 'claude')
+  await ensureOwnedDir(profileHome, 0o700)
+  const claudeConfigDir = join(profileHome, 'claude')
   await ensureOwnedDir(claudeConfigDir, 0o700)
   await ensureOwnedDir(shareDir, 0o700)
 
-  const settingsPath = join(home, 'settings.json')
+  const settingsPath = join(profileHome, 'settings.json')
   if (await exists(settingsPath)) {
     o.out.log(
       `Ya existe ${settingsPath}; no lo toqué. Verifica que siga denegando Bash, Edit, Write, NotebookEdit, WebFetch, WebSearch, Agent y lecturas de .env, y que permissions.blockReadsOutsideWorkingDirectories esté en true (dentro de "permissions", no junto a él).`,
@@ -221,8 +241,8 @@ export async function setupResponder(o: {
     await writeFile(personaPath, RESPONDER_PERSONA)
   }
 
-  const startScriptPath = join(home, 'start.sh')
-  await writeFile(startScriptPath, startScript({ shareDir, home, model, effort }), { mode: 0o755 })
+  const startScriptPath = join(profileHome, 'start.sh')
+  await writeFile(startScriptPath, startScript({ shareDir, profileHome, identityHome, model, effort }), { mode: 0o755 })
   await chmod(startScriptPath, 0o755)
 
   const env = { ...process.env, CLAUDE_CONFIG_DIR: claudeConfigDir }
@@ -242,13 +262,19 @@ export async function setupResponder(o: {
     }
   }
 
-  o.out.log(`Respondedor preparado en ${home}`)
+  o.out.log(`Perfil del respondedor preparado en ${profileHome}`)
   if (o.printNextSteps ?? true) {
+    // Every path that goes into a command a person will paste is quoted with the same helper the
+    // start script uses: a profile at `/tmp/mi respondedor` or a home with an apostrophe in it must
+    // still produce a line that runs.
     o.out.log('Siguientes pasos:')
-    o.out.log(`  1. Da de alta este dispositivo:  AGENTBRIDGE_HOME=${quote(home)} ${CLI_COMMAND} enroll <enlace>`)
-    o.out.log(`  2. Inicia sesión una vez en el perfil dedicado:  CLAUDE_CONFIG_DIR=${quote(claudeConfigDir)} claude   (usa /login y sal)`)
-    o.out.log(`  3. Arranca el respondedor:  ${startScriptPath}   (acepta la confirmación del canal de desarrollo)`)
-    o.out.log(`  4. Verifica:  ${CLI_COMMAND} doctor --home ${quote(home)} --share ${quote(shareDir)} --repo ${quote(repoDir)}`)
+    o.out.log(`  1. Inicia sesión una vez en el perfil dedicado:  CLAUDE_CONFIG_DIR=${quote(claudeConfigDir)} claude   (usa /login y sal)`)
+    o.out.log(`  2. Arranca el respondedor:  ${quote(startScriptPath)}   (acepta la confirmación del canal de desarrollo)`)
+    // Still names the profile folder, not the identity folder: today's doctor checks
+    // settings.json/start.sh/the Claude login under a single --home, and those live in the
+    // profile. Task 2 gives doctor its own --profile flag and points --home at the identity
+    // instead — this line (and its test) is updated there, in the same commit.
+    o.out.log(`  3. Verifica:  ${CLI_COMMAND} doctor --home ${quote(profileHome)} --share ${quote(shareDir)} --repo ${quote(repoDir)}`)
   }
   return { startScriptPath, claudeConfigDir, settingsPath }
 }
@@ -287,24 +313,25 @@ export async function repoDirFromBundleLocation(bundleUrl: string): Promise<stri
   return found
 }
 
-const defaultRepoDir = () => repoDirFromBundleLocation(import.meta.url)
-
 export async function setupResponderCommand(argv: string[], ctx: CliContext): Promise<void> {
   const { values } = parseArgs({
     args: argv,
     options: {
       share: { type: 'string' },
-      home: { type: 'string' },
+      profile: { type: 'string' },
       repo: { type: 'string' },
       model: { type: 'string' },
       effort: { type: 'string' },
     },
   })
-  if (!values.share) throw new CliError('Uso: agentbridge setup-responder --share <carpeta> [--home <carpeta>] [--repo <carpeta>]')
+  if (!values.share) {
+    throw new CliError(`Uso: ${CLI_COMMAND} setup-responder --share <carpeta> [--profile <carpeta>] [--repo <carpeta>]`)
+  }
   await setupResponder({
     shareDir: values.share,
-    home: values.home ?? join(homedir(), '.agentbridge-responder'),
-    repoDir: values.repo ?? (await defaultRepoDir()),
+    repoDir: values.repo ?? (await repoDirFromBundleLocation(import.meta.url)),
+    profileHome: values.profile ?? join(homedir(), '.agentbridge-responder'),
+    identityHome: ctx.home,
     model: values.model,
     effort: values.effort,
     run: defaultRunner,
