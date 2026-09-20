@@ -73,6 +73,74 @@ describe('public Nostr relays (live, opt-in)', () => {
     expect(retrievable).toBeGreaterThanOrEqual(1)
   })
 
+  it('carries a correlated answer back to the one who asked, decrypting to the same text', async () => {
+    const questionSeen = new SeenIds()
+    const answerSeen = new SeenIds()
+    const questionId = randomUUID()
+    const askedText = 'Prueba en vivo de AgentBridge 0.2: pregunta de ida y vuelta'
+    const answerText = 'Prueba en vivo de AgentBridge 0.2: aquí está la respuesta correlacionada'
+
+    let answerWrap: Awaited<ReturnType<typeof wrapRumor>> | null = null
+    let answerOutcome: Awaited<ReturnType<typeof recipientPool.publish>> | null = null
+
+    // The one who answers: opens the question, then wraps and publishes an answer back to the asker.
+    const responderLive = recipientPool.subscribeLive<PrecheckedWrap>(RELAYS, {
+      precheck: (raw) => {
+        const pre = precheckWrap(raw, { identity: recipient, now: nowSeconds(), seen: questionSeen })
+        return pre.ok ? pre : null
+      },
+      process: async (item) => {
+        const opened = openWrap(item, { identity: recipient, now: nowSeconds(), seen: questionSeen })
+        if (!opened.ok || opened.message.type !== 'question' || opened.message.questionId !== questionId || opened.senderPubkey !== sender.publicKey) return
+        answerWrap = await wrapRumor(
+          createRumor({ v: 1, type: 'answer', questionId, text: answerText, source: 'prueba en vivo', confidence: 'seguro' }, recipient, nowSeconds()),
+          recipient,
+          sender.publicKey,
+          { now: nowSeconds() },
+        )
+        answerOutcome = await recipientPool.publish(RELAYS, answerWrap)
+        log(`answer publish: ${JSON.stringify(answerOutcome)}`)
+      },
+    })
+    await sleep(3_000)
+
+    const questionWrap = await wrapFor({ v: 1, type: 'question', questionId, generation: 1, text: askedText })
+    const questionOutcome = await senderPool.publish(RELAYS, questionWrap)
+    log(`round-trip question publish: ${JSON.stringify(questionOutcome)}`)
+    expect(questionOutcome.accepted.length).toBeGreaterThanOrEqual(1)
+
+    for (let i = 0; i < 300 && !answerOutcome; i++) await sleep(100)
+    await responderLive.close()
+    expect(answerOutcome).not.toBeNull()
+    expect(answerWrap).not.toBeNull()
+    expect(answerOutcome!.accepted.length).toBeGreaterThanOrEqual(1)
+
+    // The one who asked: reads the boards back and decrypts the answer that came back.
+    const wrap = answerWrap!
+    const stored = await Promise.all(
+      answerOutcome!.accepted.map((relay) =>
+        senderPool.query(relay, { kinds: [1059], '#p': [sender.publicKey], since: wrap.created_at - 1, until: wrap.created_at + 1, limit: 10 }),
+      ),
+    )
+
+    let decodedQuestionId: string | null = null
+    let decodedText: string | null = null
+    for (const result of stored) {
+      for (const raw of result.events) {
+        const pre = precheckWrap(raw, { identity: sender, now: nowSeconds(), seen: answerSeen })
+        if (!pre.ok) continue
+        const opened = openWrap(pre, { identity: sender, now: nowSeconds(), seen: answerSeen })
+        if (opened.ok && opened.message.type === 'answer' && opened.senderPubkey === recipient.publicKey) {
+          decodedQuestionId = opened.message.questionId
+          decodedText = opened.message.text
+        }
+      }
+    }
+    log(`round-trip answer decoded: ${JSON.stringify({ decodedQuestionId, decodedText })}`)
+    expect(decodedQuestionId).toBe(questionId)
+    expect(decodedText).toBe(answerText)
+  })
+
   it('reports how the relays treat five quick publishes from one identity', async () => {
     const outcomes = []
     for (let i = 0; i < 5; i++) outcomes.push(await senderPool.publish(RELAYS, await wrapFor({ v: 1, type: 'receipt', questionId: randomUUID() })))
