@@ -15,8 +15,8 @@
 - **Node y dependencias.** Node floor `>=22.13` en el `package.json` raíz y en `scripts/pack.mjs`. Ninguna dependencia de ejecución nueva. `nostr-tools` exactamente `2.25.2` y `ws` exactamente `8.21.3`.
 - **Idioma.** El texto que lee una persona es español. Los identificadores, los registros, los nombres y las descripciones de las herramientas MCP y las instrucciones al modelo van en inglés.
 - **Toda instrucción impresa usa `CLI_COMMAND`**, nunca un `agentbridge` escrito a mano ni el nombre pelón de un comando: quien lo lea tiene que poder copiarlo y que funcione.
-- **Errores.** Ningún mensaje ni registro incluye la llave secreta ni contenido descifrado de terceros. Un error inesperado se describe solo con `describeError` (su tipo y su código); solo el mensaje de un `UserFacingError` se muestra tal cual. El texto que viene de un relé pasa por `sanitizeRelayText` antes de cualquier registro; el texto de otra persona pasa por `forTerminal` (campos cortos) o `forTerminalBlock` (prosa de varias líneas). **Nunca se imprime la salida cruda de un subproceso** (`claude plugin install`, `claude mcp add`): se dice qué paso falló y su código.
-- **Rutas de la carpeta compartida.** La regla de la especificación se aplica así en este plan: un comando que la persona acaba de correr **sí** puede decirle en su propia pantalla qué carpeta está usando —lo acaba de escribir— pero **ningún mensaje de error, ninguna línea de `doctor` y ningún registro** nombran la carpeta compartida, sus rutas internas o los nombres de archivo que hay dentro. Esos textos viajan: acaban en un reporte, en una captura o en el registro del canal, que es justo donde no deben estar. Donde hace falta decir algo, se dice **cuántos** y **de qué tipo**, no cuáles.
+- **Errores.** Ningún mensaje ni registro incluye la llave secreta ni contenido descifrado de terceros. Un error inesperado se describe solo con `describeError` (su tipo y su código); solo el mensaje de un `UserFacingError` se muestra tal cual. El texto que viene de un relé pasa por `sanitizeRelayText` antes de cualquier registro; el texto de otra persona pasa por `forTerminal` (campos cortos) o `forTerminalBlock` (prosa de varias líneas). **Nunca se imprime la salida cruda de un subproceso** (`claude plugin install`, `claude mcp add`): se dice qué paso falló y con qué código.
+- **Rutas de la carpeta compartida.** La regla de la especificación se aplica así en este plan: un comando que la persona acaba de correr **sí** puede decirle en su propia pantalla qué carpeta está usando —la acaba de escribir— pero **ningún mensaje de error, ninguna línea de `doctor` y ningún registro** nombran la carpeta compartida, sus rutas internas o los nombres de archivo que hay dentro. Esos textos viajan: acaban en un reporte, en una captura o en el registro del canal, que es justo donde no deben estar. Donde hace falta decir algo, se dice **cuántos** y **de qué tipo**, no cuáles.
 - **Estado local.** Una sola carpeta de identidad y estado, `~/.agentbridge` o `AGENTBRIDGE_HOME`, con permisos 0700: `identity.json` en 0600 y `agentbridge.db` en WAL. El perfil dedicado de Claude (`CLAUDE_CONFIG_DIR`, `settings.json`, `start.sh`) es **otra** carpeta y no contiene identidad ni base de datos.
 - **Pruebas.** `npm test` no necesita Docker ni internet. `npm run test:live` es la única suite que toca relés públicos, y este plan la corre **una vez**, a propósito, en la tarea de verificación.
 - **Sin cobro.** AgentBridge 0.2 es gratis para todas las personas: este plan no construye ninguna comprobación de licencia ni un gancho para una futura.
@@ -29,7 +29,7 @@ Cada una resuelve algo que la especificación deja abierto o que los planes 1 a 
 
 - **Q1 — El respondedor deja de tener su propia carpeta de AgentBridge.** Hoy `start.sh` exporta `AGENTBRIDGE_HOME=<perfil>`, así que en 0.2 la sesión que responde tendría **otra llave y otra base de datos** que quien pregunta en la misma computadora: `requests`, `approve`, `reject` y `revoke` (plan 3, P10) leerían la base equivocada y esa persona tendría dos enlaces distintos sin saberlo. La especificación es explícita: *una sola carpeta de identidad y estado*. A partir de este plan el perfil dedicado guarda solo lo de Claude — `CLAUDE_CONFIG_DIR`, `settings.json`, `start.sh` — y la sesión encerrada usa la misma `~/.agentbridge` que el resto. `setupResponder` pasa a llamar a ese directorio `profileHome`, y ya no copia credencial ninguna.
 - **Q2 — `setup` no toca la carpeta compartida sin decirlo, y conserva entera la protección que ya existe.** Todo el trabajo del 0.1 sobre la carpeta a compartir (el recorrido completo, los repositorios de git, los archivos que parecen credenciales, los enlaces simbólicos, `node_modules`, la palabra `CONFIRMAR`, el rechazo duro si ahí dentro vive la identidad) se conserva tal cual. Lo único que cambia es a quién protege: ya no hay `config.json` con un token, pero sí `identity.json` con la llave secreta, que es estrictamente peor de filtrar.
-- **Q3 — `doctor` prueba cada tablero publicando y leyendo de verdad.** Un tablero que acepta la conexión pero rechaza `EVENT` (o que acepta y no devuelve nada al leer) es indistinguible de uno sano si solo se abre el socket. La prueba usa un mensaje dirigido a la propia llave, con prueba de trabajo de 16 bits, y no deja basura observable para nadie más. Es la única parte de este plan que toca la red, y por eso `doctor` vive detrás de un plazo acotado.
+- **Q3 — `doctor` prueba cada tablero publicando y leyendo de verdad.** Un tablero que acepta la conexión pero rechaza `EVENT` — o que acepta y luego no devuelve lo que guardó — es indistinguible de uno sano si solo se abre el socket. La prueba publica un sobre sellado **dirigido a una llave efímera**, generada y tirada en el momento, y lo vuelve a leer: así no está dirigido a esta persona, ninguna de sus suscripciones lo pide, nadie puede descifrarlo nunca, y ningún camino de recepción suyo se toca. Es la única parte de este plan que habla con la red, y por eso va detrás de dos plazos: uno de red y otro, aparte, para minar.
 - **Q4 — La 0.1 se borra en un solo commit, después de que `setup` y `doctor` dejen de importarla.** `RelayHttpClient` (`packages/core/src/http.ts`), `packages/cli/src/commands/account.ts`, `clientFor` y el `ClientConfig`/`readConfig`/`writeConfig` del `config.json` salen juntos; `agentbridgeHome` se queda. Borrarlos antes rompe la compilación del CLI entero, que es exactamente lo que el plan 3 evitó (P9).
 - **Q5 — Los documentos se reescriben, no se parchan.** El README, `docs/inicio-rapido.md` y el runbook de aceptación describen hoy un relé, un enlace de alta y un token. Editar frase por frase deja contradicciones invisibles; cada uno se reescribe completo desde el flujo real de 0.2, y la parte de privacidad se copia de la especificación en vez de reinventarse.
 - **Q6 — La prueba de 24 horas y el apagado de Render no los hace un agente.** La tarea de aceptación deja el runbook, los comandos exactos y una lista de verificación, y se detiene. Publicar en npm necesita la llave de acceso de la persona dueña en su propia terminal, y borrar el servicio de Render es irreversible.
@@ -42,8 +42,8 @@ Qué toca cada tarea y de qué se hace responsable cada archivo al terminar el p
 | Archivo | Después de este plan |
 |---|---|
 | `packages/cli/src/commands/setup-responder.ts` | Prepara **el perfil de Claude** del respondedor: `settings.json`, `CLAUDE_CONFIG_DIR`, `start.sh`, el `CLAUDE.md` de la carpeta compartida y el complemento. Ya no es una carpeta de AgentBridge: `start.sh` apunta a la identidad única. (Tarea 1) |
-| `packages/cli/src/commands/setup.ts` | Guía completa de 0.2: crea la llave, pregunta el nombre, escribe el perfil, pregunta el papel, prepara la carpeta compartida y el perfil dedicado, muestra tu enlace o toma el de la otra persona, registra el servidor MCP y da un veredicto. (Tarea 2) |
-| `packages/cli/src/commands/doctor.ts` | Diagnóstico sin relé: llave presente, 0600 y fuera de la carpeta compartida; carpeta 0700; base de datos accesible; candado del canal; por cada tablero, publicar **y** leer; solicitudes pendientes; y todo lo que ya revisa de la sesión encerrada. (Tarea 3) |
+| `packages/cli/src/commands/setup.ts` | Guía completa de 0.2: crea la llave, pregunta el nombre, escribe el perfil, pregunta el papel, prepara la carpeta compartida y el perfil dedicado, muestra tu enlace o toma el de la otra persona, registra el servidor MCP y da un veredicto. (Tarea 3) |
+| `packages/cli/src/commands/doctor.ts` | Diagnóstico sin relé: llave presente, 0600 y fuera de la carpeta compartida; carpeta 0700; base de datos accesible; candado del canal; por cada tablero, publicar **y** leer; solicitudes pendientes; y todo lo que ya revisa de la sesión encerrada. (Tarea 2) |
 | `packages/cli/src/commands/account.ts` | **Borrado.** (Tarea 4) |
 | `packages/core/src/http.ts` | **Borrado** con `RelayHttpClient` y `codeFromUrl`. (Tarea 4) |
 | `packages/core/src/config.ts` | Se queda solo con `agentbridgeHome`. `ClientConfig`, `readConfig` y `writeConfig` se borran. (Tarea 4) |
@@ -53,15 +53,15 @@ Qué toca cada tarea y de qué se hace responsable cada archivo al terminar el p
 | `README.md`, `docs/inicio-rapido.md` | Reescritos para el flujo sin servidor propio, con la sección de privacidad de la especificación. (Tarea 6) |
 | `docs/runbooks/m1-acceptance.md` | Reescrito como el runbook de aceptación de 0.2, con la prueba de 24 horas y la lista de apagado de Render. (Tarea 7) |
 | `CLAUDE.md`, `docs/known-gaps.md` | Sin Docker ni Postgres; las brechas de 0.2 ordenadas y sin las del relé que ya no existe. (Tarea 8) |
-| — | Verificación completa del plan y de la rama. (Tarea 9) |
+| — | Verificación completa del plan y de la rama. (Tarea 10) |
 
 ### Pruebas nuevas o reescritas
 
 | Archivo | Qué prueba |
 |---|---|
 | `packages/cli/test/setup-responder.test.ts` | Que `start.sh` apunta a la identidad única y no crea una carpeta de AgentBridge; que el rechazo cubre las dos carpetas. (Tarea 1) |
-| `packages/cli/test/setup.test.ts` | La guía completa contra una casa temporal: identidad creada una sola vez, perfil escrito, enlace mostrado, `connect` llamado, resumen honesto. (Tarea 2) |
-| `packages/cli/test/doctor.test.ts` | Cada chequeo por separado contra un tablero falso, incluido el tablero que acepta la conexión pero rechaza publicar. (Tarea 3) |
+| `packages/cli/test/setup.test.ts` | La guía completa contra una casa temporal: identidad creada una sola vez, perfil escrito, enlace mostrado, `connect` llamado, resumen honesto. (Tarea 3) |
+| `packages/cli/test/doctor.test.ts` | Cada chequeo por separado contra un tablero falso, incluidos el que rechaza publicar, el que acepta y no guarda, y el que no deja leer. (Tarea 2) |
 | `packages/core/test/http.test.ts`, `packages/core/test/config.test.ts` | **Borradas** con el código que probaban. (Tarea 4) |
 | `tests/acceptance/packaging.test.ts` | Que el paquete armado arranca y que su `engines` y su contenido son los que decimos. (Tarea 5) |
 
@@ -136,7 +136,7 @@ describe('setupResponder guards both folders against the shared one', () => {
       out,
     }).catch((e: unknown) => e)
     expect(err).toBeInstanceOf(CliError)
-    expect((err as CliError).message).toContain('tu llave')
+    expect((err as CliError).message).toMatch(/tu llave/i)
   })
 
   it('prepares the profile when both folders are outside the shared one', async () => {
@@ -263,9 +263,12 @@ Cambia el mensaje final y los siguientes pasos, que hoy nombran un comando que y
 ```ts
   o.out.log(`Perfil del respondedor preparado en ${profileHome}`)
   if (o.printNextSteps ?? true) {
+    // Every path that goes into a command a person will paste is quoted with the same helper the
+    // start script uses: a profile at `/tmp/mi respondedor` or a home with an apostrophe in it must
+    // still produce a line that runs.
     o.out.log('Siguientes pasos:')
     o.out.log(`  1. Inicia sesión una vez en el perfil dedicado:  CLAUDE_CONFIG_DIR=${quote(claudeConfigDir)} claude   (usa /login y sal)`)
-    o.out.log(`  2. Arranca el respondedor:  ${startScriptPath}   (acepta la confirmación del canal de desarrollo)`)
+    o.out.log(`  2. Arranca el respondedor:  ${quote(startScriptPath)}   (acepta la confirmación del canal de desarrollo)`)
     o.out.log(`  3. Verifica:  ${CLI_COMMAND} doctor --home ${quote(identityHome)} --share ${quote(shareDir)} --repo ${quote(repoDir)}`)
   }
 ```
@@ -323,7 +326,21 @@ y **borra entero** el bloque que copiaba la credencial al perfil dedicado (desde
 Run: `npx vitest run packages/cli/test/setup-responder.test.ts && npm run typecheck`
 Expected: PASS y typecheck limpio.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 9: Cover the paths that break a printed command**
+
+`quote` es local a `setup-responder.ts`; expórtala para que `setup.ts` imprima con la misma regla, y añade una prueba con una carpeta con espacio y otra con apóstrofo:
+
+```ts
+it('quotes a profile path with a space so the printed commands still run', async () => {
+  const out = memoryOutput()
+  const spaced = join(root, 'mi respondedor')
+  await setupResponder({ shareDir, repoDir, profileHome: spaced, identityHome, run: runner, out })
+  const printed = out.lines.join('\n')
+  expect(printed).toContain(`'${join(spaced, 'start.sh')}'`)
+})
+```
+
+- [ ] **Step 10: Commit**
 
 ```bash
 git add packages/cli/src/commands/setup-responder.ts packages/cli/src/commands/setup.ts packages/cli/test/setup-responder.test.ts
@@ -517,17 +534,27 @@ describe('runDoctor with an identity', () => {
     expect(boardCheck.detail).toContain('leer')
   })
 
-  it('fails a board that returns something other than what was published', async () => {
+  it('fails a board that answers with a corrupted copy of what was published', async () => {
     await seedIdentity()
-    // A board can answer a read with an event carrying the right id and the wrong contents. The
-    // probe has to compare what came back, not the label on it.
-    board.options = { ...board.options, beforeEose: () => [{ id: 'f'.repeat(64), kind: 1059, content: 'otra cosa', tags: [], sig: '', pubkey: 'a'.repeat(64), created_at: 1 }] }
+    // The board keeps nothing (so its own retained copy cannot satisfy the read) and answers the
+    // read with the same event id and a different content — the shape a board would use to make a
+    // probe believe a message is there when what it has is not what was published.
+    let captured: Record<string, unknown> | null = null
+    board.options = {
+      ...board.options,
+      dropIncoming: (event) => {
+        captured = { ...(event as unknown as Record<string, unknown>) }
+        return true
+      },
+      beforeEose: () => (captured ? [{ ...captured, content: 'otra cosa' }] : []),
+    }
     expect(check(await runDoctor(doctorOptions()), `Tablero ${board.url}`).ok).toBe(false)
   })
 
   it('counts pending requests and says how to see them', async () => {
     await seedIdentity()
     const store = await openStore(identityHome, { relayPolicy: allowAnyRelay })
+    const now = Math.floor(Date.now() / 1000)
     recordIncomingRequest(store, {
       pubkey: 'b'.repeat(64),
       requestId: '11111111-1111-4111-8111-111111111111',
@@ -535,12 +562,32 @@ describe('runDoctor with an identity', () => {
       declaredName: 'Beto',
       note: 'hola',
       relays: [board.url],
-      now: 1_700_000_000,
+      // Fresh, against the same clock doctor uses: a 2023 timestamp would be expired by the time
+      // `requests` ran, and doctor would be announcing something that vanishes when the person
+      // types the command it just told them to type.
+      now,
     })
     store.close()
     const requests = check(await runDoctor(doctorOptions()), 'Solicitudes pendientes')
     expect(requests.detail).toContain('1')
     expect(requests.detail).toContain('requests')
+  })
+
+  it('does not count a request that has already aged out', async () => {
+    await seedIdentity()
+    const store = await openStore(identityHome, { relayPolicy: allowAnyRelay })
+    const { NOSTR } = await import('@agentbridge/core')
+    recordIncomingRequest(store, {
+      pubkey: 'd'.repeat(64),
+      requestId: '22222222-2222-4222-8222-222222222222',
+      requestRumorId: 'e'.repeat(64),
+      declaredName: 'Vieja',
+      note: '',
+      relays: [board.url],
+      now: Math.floor(Date.now() / 1000) - NOSTR.requestMaxAgeSeconds - 60,
+    })
+    store.close()
+    expect(check(await runDoctor(doctorOptions()), 'Solicitudes pendientes').detail).toContain('ninguna')
   })
 })
 
@@ -598,6 +645,7 @@ import {
   getProfile,
   listPendingRequests,
   loadIdentity,
+  NOSTR,
   openStore,
   wrapRumor,
   type Identity,
@@ -637,6 +685,8 @@ async function identityCheck(o: { identityHome: string; shareDir?: string }): Pr
     const detail = looksLikeProfile
       ? `Esa carpeta parece el perfil dedicado de Claude, no tu carpeta de identidad: pásala con --profile y deja --home para la que tiene identity.json.`
       : `Todavía no tienes una llave en esta computadora. Créala con: ${CLI_COMMAND} setup`
+    // Every remediation line names a command a person can paste, with CLI_COMMAND — never a bare
+    // "vuelve a correr setup".
     return { check: { name: 'Llave de AgentBridge', ok: false, detail }, identity: null }
   }
 
@@ -658,7 +708,17 @@ async function identityCheck(o: { identityHome: string; shareDir?: string }): Pr
     }
   }
   return {
-    check: { name: 'Llave de AgentBridge', ok: problems.length === 0, detail: problems.length ? problems.join(' · ') : 'presente, en 0600, y fuera de la carpeta compartida' },
+    // Only claims what was actually checked: an ordinary `doctor` run has no --share, so saying
+    // "outside the shared folder" there would be a verdict nobody reached.
+    check: {
+      name: 'Llave de AgentBridge',
+      ok: problems.length === 0,
+      detail: problems.length
+        ? problems.join(' · ')
+        : o.shareDir
+          ? 'presente, en 0600, y fuera de la carpeta compartida'
+          : 'presente y en 0600 (para revisar que esté fuera de la carpeta compartida, corre doctor con --share)',
+    },
     identity,
   }
 }
@@ -718,7 +778,7 @@ export async function probeBoard(o: {
   if (published.accepted.length === 0) {
     // The relay's own words are third-party text and are not printed: as a category, the person's
     // next step is the same either way.
-    return { ok: false, detail: 'no aceptó publicar (puede que pida registro o esté bloqueando esta llave)' }
+    return { ok: false, detail: `no aceptó publicar (puede que pida registro o esté bloqueando esta llave). Puedes cambiar tus tableros con: ${CLI_COMMAND} setup --relays "wss://uno,wss://otro"` }
   }
 
   // Read it back by the recipient tag rather than by id: the production filter type has no `ids`
@@ -727,10 +787,12 @@ export async function probeBoard(o: {
   if (!read.complete && read.events.length === 0) return { ok: false, detail: 'aceptó publicar pero no me dejó leer' }
   // Compare the signed fields, not the claimed id: a board can answer with an event that carries
   // the right id and different contents.
-  const found = read.events.some((e) => {
-    const event = e as Partial<typeof wrap> | null
-    return event?.id === wrap.id && event.sig === wrap.sig && event.content === wrap.content && event.pubkey === wrap.pubkey
-  })
+  // Every signed field, not a sample of four: an id is a claim, and a board that alters the tags,
+  // the kind or the date has not returned what was published.
+  const signedFields = (e: Record<string, unknown>) =>
+    JSON.stringify([e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, e.sig])
+  const expected = signedFields(wrap as unknown as Record<string, unknown>)
+  const found = read.events.some((e) => e !== null && typeof e === 'object' && signedFields(e as Record<string, unknown>) === expected)
   if (!found) return { ok: false, detail: 'aceptó publicar pero no me devolvió lo que publiqué' }
   return { ok: true, detail: 'publicar y leer, los dos' }
 }
@@ -769,8 +831,11 @@ export async function runDoctor(o: {
       const holder = getChannelLock(store)
       add('Candado del canal', true, holder ? `lo tiene el proceso ${holder.pid} (época ${holder.epoch})` : 'libre: ningún canal está despachando ahora mismo')
 
-      const pending = listPendingRequests(store)
-      add('Solicitudes pendientes', true, pending.length === 0 ? 'ninguna' : `${pending.length}; míralas con: ${CLI_COMMAND} requests`)
+      // The same expiry boundary `requests` applies, so doctor never announces a request that
+      // vanishes the moment the person runs the command it just told them to run. Counting only:
+      // it must not clear the notification state, which belongs to whoever actually shows them.
+      const fresh = listPendingRequests(store).filter((request) => (request.requestedAt ?? 0) > now() - NOSTR.requestMaxAgeSeconds)
+      add('Solicitudes pendientes', true, fresh.length === 0 ? 'ninguna' : `${fresh.length}; míralas con: ${CLI_COMMAND} requests`)
 
       if (identityResult.identity) {
         const relays = getProfile(store).relays
@@ -815,7 +880,26 @@ Cuatro cambios dentro de ese cuerpo, todos por la misma razón:
 - los detalles dejan de imprimir la ruta de la carpeta compartida y los nombres de archivos que hay dentro: dicen **cuántos** encontraron y de qué tipo, porque ese texto acaba en un registro que puede viajar;
 - cualquier instrucción usa `CLI_COMMAND`.
 
-- [ ] **Step 10: Rewrite `doctorCommand` and update the help**
+- [ ] **Step 10: Bound the subprocess that can hang**
+
+El chequeo de sesión iniciada corre `claude auth status` y lo espera. `defaultRunner` no tiene plazo ni cancelación: si ese proceso se queda colgado —una sesión a medio iniciar, un binario esperando entrada— `doctor` se cuelga con él, y ninguno de los dos plazos de esta tarea lo cubre. Envuelve la llamada con un plazo que **mate al hijo** y produzca un chequeo fallido:
+
+```ts
+// A diagnostic that can hang forever is worse than one that says "I could not tell": the person is
+// left staring at a command that never returns, with no way to know which check stalled.
+async function runBounded(run: CommandRunner, command: string, args: string[], opts: { env: NodeJS.ProcessEnv }, ms: number) {
+  return Promise.race([
+    run(command, args, opts),
+    new Promise<{ code: number; stdout: string; stderr: string }>((resolve) =>
+      setTimeout(() => resolve({ code: 124, stdout: '', stderr: 'timeout' }), ms).unref(),
+    ),
+  ])
+}
+```
+
+y en `addProfileChecks`, usa `runBounded(o.run, 'claude', ['auth', 'status', '--json'], { env: authEnv }, 15_000)`, reportando el código 124 como `no pude comprobarlo: el comando claude no respondió en 15 segundos`. Añade una prueba con un runner que nunca resuelve y comprueba que `runDoctor` termina de todos modos.
+
+- [ ] **Step 11: Rewrite `doctorCommand` and update the help**
 
 ```ts
 export async function doctorCommand(argv: string[], ctx: CliContext): Promise<void> {
@@ -851,12 +935,12 @@ Y en `packages/cli/src/commands/setup-responder.ts`, el paso 3 que imprime:
 
 con su aserción correspondiente en `setup-responder.test.ts` actualizada en este mismo commit.
 
-- [ ] **Step 11: Run the tests to verify they pass**
+- [ ] **Step 12: Run the tests to verify they pass**
 
 Run: `npx vitest run packages/cli/test/doctor.test.ts packages/cli/test/setup-responder.test.ts packages/cli/test/router.test.ts && npm run typecheck`
 Expected: PASS y typecheck limpio. `setup.ts` todavía llama a `runDoctor` con la forma vieja: arréglalo aquí con lo mínimo para que compile — `runDoctor({ identityHome: ctx.home, profileHome: responderHome, shareDir, repoDir, run: ctx.run })` — porque la tarea 3 reescribe ese archivo entero.
 
-- [ ] **Step 12: Commit**
+- [ ] **Step 13: Commit**
 
 ```bash
 git add packages/cli/src/commands/doctor.ts packages/cli/src/commands/setup-responder.ts packages/cli/src/commands/setup.ts packages/cli/src/router.ts packages/core/src/identity.ts packages/cli/test/doctor.test.ts packages/cli/test/setup-responder.test.ts
@@ -1081,8 +1165,11 @@ describe('the answering side', () => {
     await runSetup(context({ prompt, out }))
     expectDrained()
     const text = out.lines.join('\n')
-    expect(text).toContain('Pendiente:')
-    expect(text).toMatch(/Tablero/)
+    // Searching the whole output would pass on the "[falta] Tablero …" line doctor prints on its
+    // own. What this test is about is the summary: the failing check has to be repeated under
+    // "Pendiente:", where the person looks for what is left to do.
+    const summary = text.slice(text.indexOf('Pendiente:'))
+    expect(summary).toMatch(/Tablero/)
   })
 })
 ```
@@ -1117,6 +1204,8 @@ export type SetupContext = CliContext & {
   // The one seam this command needs for tests: `connect` mines 22 bits of proof of work, and the
   // plan allows exactly one test in the whole repository to pay for that (tests/asker/flow.test.ts).
   connectWith?: (link: string, ctx: CliContext) => Promise<void>
+  // From `--relays`. Empty or absent leaves the list alone.
+  relays?: string[]
 }
 ```
 
@@ -1194,6 +1283,13 @@ Sustituye el bloque `// 1. Identity …` completo (desde `let config = await try
       )
       profile = setProfile(store, { name, now: nowSeconds() })
     }
+    if (ctx.relays && ctx.relays.length > 0) {
+      // The spec's answer to a board that starts refusing service is "the list is configurable", so
+      // there has to be a way to configure it. `setup --relays "wss://a,wss://b"` is that way, it
+      // works on a rerun, and doctor's own failing-board line names it.
+      profile = setProfile(store, { relays: ctx.relays, now: nowSeconds() })
+      out.log(`Cambié tus tableros: ahora usas ${profile.relays.length}.`)
+    }
   } finally {
     // Closed before anything else runs: `connect` and `doctor` open this same database, and holding
     // it open across a whole guided run would make their writes wait on a handle nothing needs.
@@ -1203,6 +1299,11 @@ Sustituye el bloque `// 1. Identity …` completo (desde `let config = await try
   const myLink = encodeLink(identity.publicKey, profile.relays)
   out.log(`Te llamas ${profile.name} y usas ${profile.relays.length} tableros públicos.`)
   out.log('(Son tableros de Nostr. No hay ningún servidor nuestro en medio.)')
+  // Printed here, for every role, because it is this person's identity and not a feature of one
+  // side: whoever wants to reach them needs exactly this string, and a test that checks it must not
+  // depend on which branch runs later.
+  out.log('Tu enlace es:')
+  out.log(`  ${myLink}`)
   out.log('')
 ```
 
@@ -1350,30 +1451,83 @@ Sustituye el bloque `if (willAsk) { … }` desde su primer `out.log` hasta justo
     out.log('')
 ```
 
-El bloque del servidor MCP se queda como está, salvo su última línea:
+El bloque del servidor MCP cambia en tres cosas:
+
+```ts
+    // A registration that stores only CLI_ARGV starts its server against the DEFAULT home. Someone
+    // who set AGENTBRIDGE_HOME for this run would end up with a Claude Code tool talking to a
+    // different identity than the one this setup just prepared — with no error, just an empty
+    // contact list. When the home is not the default, it travels with the registration.
+    const customHome = ctx.home !== agentbridgeHome({}) ? ctx.home : null
+    const envArgs = customHome ? ['--env', `AGENTBRIDGE_HOME=${customHome}`] : []
+    const manual = `claude mcp add agentbridge --scope user ${envArgs.join(' ')} -- ${CLI_COMMAND} mcp`.replace(/\s+/g, ' ')
+```
+
+- la llamada pasa a ser `ctx.run('claude', ['mcp', 'add', 'agentbridge', '--scope', 'user', ...envArgs, '--', ...CLI_ARGV, 'mcp'], { env: ctx.env })`;
+- cada instrucción manual que se imprime usa `manual`, no una cadena escrita aparte, para que las dos digan lo mismo;
+- **la salida del subproceso no se imprime**: si falla, se dice que falló y con qué código, no lo que escribió.
+
+```ts
+      if (result.code === 0) {
+        mcpRegistered = true
+        out.log('Listo: el servidor MCP quedó registrado.')
+      } else {
+        out.log(`No pude registrar el servidor MCP automáticamente (el comando terminó con código ${result.code}). Hazlo a mano:`)
+        out.log(`  ${manual}`)
+      }
+```
+
+y la última línea del bloque:
 
 ```ts
     out.log(`Para preguntar desde la terminal en cualquier momento: ${CLI_COMMAND} ask <nombre> "<pregunta>"`)
 ```
 
+Añade `agentbridgeHome` a las importaciones de `@agentbridge/core`.
+
 - [ ] **Step 7: Rewrite `setupCommand`**
 
 ```ts
 export async function setupCommand(argv: string[], ctx: CliContext): Promise<void> {
-  const { values } = parseArgs({ args: argv, options: { repo: { type: 'string' }, profile: { type: 'string' } } })
+  const { values } = parseArgs({
+    args: argv,
+    options: { repo: { type: 'string' }, profile: { type: 'string' }, relays: { type: 'string' } },
+  })
   if (!ctx.prompt) {
     throw new CliError(NON_INTERACTIVE_ES)
   }
-  await runSetup({ ...ctx, prompt: ctx.prompt, run: defaultRunner, repoDir: values.repo, profileHome: values.profile })
+  const relays = values.relays
+    ?.split(',')
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0)
+  await runSetup({ ...ctx, prompt: ctx.prompt, run: defaultRunner, repoDir: values.repo, profileHome: values.profile, relays })
 }
 ```
 
-- [ ] **Step 8: Run the tests to verify they pass**
+- [ ] **Step 8: Stop the two places that print a raw message**
+
+`describeFsError` termina hoy en `err instanceof Error ? err.message : String(err)`: cualquier error que no sea uno de los códigos conocidos se imprime tal cual, y ese mensaje puede traer una ruta de la carpeta compartida. Cambia solo esa rama por una categoría segura, dejando intactos los casos con nombre:
+
+```ts
+    default:
+      // Never the error's own message: it can carry a path this text must not carry.
+      return `no se pudo completar la operación (${describeError(err)})`
+```
+
+con `describeError` importado de `@agentbridge/core`. Y en `packages/cli/src/commands/setup-responder.ts`, el fallo de `claude plugin install` deja de pegar la salida del subproceso:
+
+```ts
+    if (r.code !== 0 && !alreadyThere) {
+      throw new CliError(`Falló "claude ${step.args.join(' ')}" (código ${r.code}). Corre ese mismo comando a mano para ver qué dice.`)
+    }
+```
+
+- [ ] **Step 9: Run the tests to verify they pass**
 
 Run: `npx vitest run packages/cli/test/setup.test.ts packages/cli/test/setup-responder.test.ts packages/cli/test/doctor.test.ts && npm run typecheck`
 Expected: PASS y typecheck limpio. Si `npm run typecheck` señala algo que siga nombrando `config` o `responderHome` dentro de `setup.ts`, es esta tarea la que lo dejó a medias: arréglalo aquí.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add packages/cli/src/commands/setup.ts packages/cli/test/setup.test.ts
@@ -1654,7 +1808,9 @@ Además:
 
 - [ ] **Step 2: Rewrite `docs/inicio-rapido.md`**
 
-Es la guía que una persona no técnica sigue en su terminal, así que se escribe como una secuencia de pasos con lo que va a ver. La analogía de la recepción del edificio **se cambia**, porque ya no hay recepción: los dos dejan sobres cerrados en varios tableros de anuncios públicos; cualquiera ve que hay un sobre, nadie puede abrirlo, y ni siquiera se sabe de quién a quién va.
+Es la guía que una persona no técnica sigue en su terminal, así que se escribe como una secuencia de pasos con lo que va a ver. La analogía de la recepción del edificio **se cambia**, porque ya no hay recepción: los dos dejan sobres cerrados en varios tableros de anuncios públicos. Cualquiera ve que hay un sobre y nadie puede abrirlo.
+
+**Lo que la guía no puede decir** es que "ni siquiera se sabe de quién a quién va" — la frase que está hoy en el documento y que hay que quitar. El sobre lleva por fuera **la llave de quien lo recibe**, porque así es como esa persona lo encuentra; lo que no lleva es quién lo escribió (va firmado por una llave de un solo uso). Así que quien opere un tablero puede ver que cierta llave recibe sobres, y su tamaño y su hora. La guía lo dice en una línea, sin adornos, igual que la sección de privacidad de la especificación.
 
 La guía cubre, en este orden:
 1. Qué necesitas antes de empezar (Node 22.13 o más, Claude Code instalado y con sesión iniciada).
@@ -1978,10 +2134,11 @@ Lo que no se pueda correr aquí **se anota como pendiente manual** en el reporte
 - [ ] **Step 4: Nothing of the 0.1 survives**
 
 ```bash
-git grep -n "RelayHttpClient\|clientFor\|deviceToken\|relayUrl\|enroll\|invite\|admin enroll-link" -- packages plugins scripts tests
-git grep -rn "en línea\|desconectado" -- packages plugins
+git grep -n -e RelayHttpClient -e clientFor -e deviceToken -e relayUrl -e enroll -e invite -e 'admin enroll-link' \
+  -- packages/cli/src packages/core/src packages/channel/src plugins scripts
+git grep -n -e 'en línea' -e desconectado -- packages/cli/src packages/core/src packages/channel/src plugins
 ```
-Expected: nada en el primero salvo, si acaso, una mención histórica en documentación; nada en el segundo.
+Expected: nada. El barrido va **solo sobre `src/`**: las pruebas afirman a propósito que esas palabras ya no aparecen en la ayuda ni en el paquete (`router.test.ts`, y las que añade la tarea 5), así que exigir cero aciertos en todo el repositorio contradice a las pruebas que precisamente lo garantizan.
 
 - [ ] **Step 5: Finish the live round trip before running it**
 
@@ -1994,11 +2151,20 @@ Expected: **verde**. Se corre una sola vez, se anota cuánto tardó y qué table
 
 - [ ] **Step 7: `doctor` against the real boards, in a temporary home**
 
+`link` necesita una identidad que en una casa vacía todavía no existe, así que se crea primero con la función real. El script vive **en el repositorio**, no en la casa temporal: una importación relativa se resuelve contra el archivo que la contiene.
+
 ```bash
-AGENTBRIDGE_HOME=$(mktemp -d) node packages/cli/dist/main.js link
-AGENTBRIDGE_HOME=<el mismo> node packages/cli/dist/main.js doctor
+H=$(mktemp -d)
+cat > scripts/seed-identity.ts <<'EOF'
+import { loadOrCreateIdentity } from '../packages/core/src/identity'
+loadOrCreateIdentity(process.env.AB_HOME as string).then(({ created }) => console.log(created ? 'creada' : 'ya estaba'))
+EOF
+AB_HOME=$H npx tsx scripts/seed-identity.ts
+rm scripts/seed-identity.ts
+AGENTBRIDGE_HOME=$H node packages/cli/dist/main.js link
+AGENTBRIDGE_HOME=$H node packages/cli/dist/main.js doctor
 ```
-Expected: `doctor` publica y lee en cada tablero por defecto y reporta cada uno. Es la primera vez en todo el plan que esa comprobación corre contra la red de verdad, y es exactamente lo que una persona verá el primer día.
+Expected: `link` imprime un enlace y `doctor` publica y lee en cada uno de los cinco tableros por defecto, reportando cada uno por separado. Es la primera vez en todo el plan que esa comprobación corre contra la red de verdad, y es exactamente lo que una persona verá el primer día.
 
 - [ ] **Step 8: Report and stop**
 
