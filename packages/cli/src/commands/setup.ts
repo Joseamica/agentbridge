@@ -352,6 +352,12 @@ export type ShareDirAssessment = {
   // the token inside is full impersonation on the relay, and confirming a choice doesn't make
   // that any less true.
   credentialConflict: string | null
+  // What is actually at stake in `credentialConflict`, since it is not the same thing for the two
+  // branches: the identity folder holds the secret key itself, but the dedicated profile (Q1 of
+  // this plan) holds no key or database at all — only settings.json and start.sh, which control
+  // what the answering session is allowed to do. A caller that prints one message for both would
+  // overclaim for the profile branch.
+  credentialConflictKind: 'identity' | 'profile' | null
   // Non-null when the path itself cannot be used as a shared folder at all — a plain file
   // sitting where a folder is expected, a dangling symlink, or an unreadable path — as opposed
   // to a folder that exists and is merely risky (`reasons`, confirmable).
@@ -375,10 +381,13 @@ export async function assessShareDir(
   const isHome = shareReal === homeReal
 
   let credentialConflict: string | null = null
+  let credentialConflictKind: 'identity' | 'profile' | null = null
   if (isSameOrWithin(identityReal, shareReal)) {
     credentialConflict = `tu identidad de AgentBridge (${guard.identityHome})`
+    credentialConflictKind = 'identity'
   } else if (isSameOrWithin(profileReal, shareReal)) {
     credentialConflict = `el perfil dedicado del respondedor (${guard.profileHome})`
+    credentialConflictKind = 'profile'
   }
 
   const inspected = await inspectPath(shareDir)
@@ -427,7 +436,7 @@ export async function assessShareDir(
       )
     }
   }
-  return { exists, isHome, credentialConflict, problem, reasons }
+  return { exists, isHome, credentialConflict, credentialConflictKind, problem, reasons }
 }
 
 // The public entry point tests and setupCommand call. It's a thin wrapper around
@@ -534,9 +543,15 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
       )
     }
     if (assessment.credentialConflict) {
-      throw new CliError(
-        `Ahí dentro está ${assessment.credentialConflict}. Tu llave secreta es tu identidad entera: quien la lea puede hacerse pasar por ti en cualquier tablero, para siempre, y no hay forma de revocarla. Vuelve a correr "${CLI_COMMAND} setup" con otra carpeta.`,
-      )
+      // What is actually at stake differs by branch (Q1: the dedicated profile holds no key or
+      // database) — naming the wrong one would either overclaim (a leaked settings.json is not
+      // "tu identidad entera") or underclaim (a leaked identity.json is worse than a permission
+      // file), so each says only what is true of it.
+      const stake =
+        assessment.credentialConflictKind === 'identity'
+          ? 'Tu llave secreta es tu identidad entera: quien la lea puede hacerse pasar por ti en cualquier tablero, para siempre, y no hay forma de revocarla.'
+          : 'Ahí viven settings.json y start.sh, que controlan qué puede hacer la sesión que contesta preguntas: quien los lea o los reescriba podría aflojar sus permisos o cambiar qué corre.'
+      throw new CliError(`Ahí dentro está ${assessment.credentialConflict}. ${stake} Vuelve a correr "${CLI_COMMAND} setup" con otra carpeta.`)
     }
     if (assessment.reasons.length > 0) {
       out.log('Ojo: esa carpeta se ve peligrosa para compartir —')

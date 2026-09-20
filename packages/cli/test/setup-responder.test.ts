@@ -78,6 +78,22 @@ describe('responderSettings', () => {
   })
 })
 
+// Polls for a file to appear, bounded, rather than assuming it is already there. The hung-child
+// test below needs the pid independently of whether `defaultRunner`'s own promise ever settles
+// (see the comment there), and the script writes it with a synchronous `writeFileSync` as its
+// very first statement, so in the passing case this resolves within a poll or two.
+async function waitForFile(path: string, timeoutMs: number): Promise<string> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    try {
+      return await readFile(path, 'utf8')
+    } catch {
+      if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}`)
+      await new Promise((r) => setTimeout(r, 20))
+    }
+  }
+}
+
 describe('defaultRunner', () => {
   it(
     'kills a real hung child when its signal aborts, rather than leaving it orphaned',
@@ -91,14 +107,42 @@ describe('defaultRunner', () => {
         scriptPath,
         ["require('node:fs').writeFileSync(process.argv[2], String(process.pid))", 'setInterval(() => {}, 1_000)', ''].join('\n'),
       )
-      const result = await defaultRunner(process.execPath, [scriptPath, pidPath], { env: process.env, signal: AbortSignal.timeout(1_000) })
-      expect(result.code).toBe(124)
-      const pid = Number(await readFile(pidPath, 'utf8'))
-      // Signal 0 sends nothing; it only checks whether the process still exists. ESRCH means it
-      // is gone — defaultRunner's own kill must already have reaped it by the time the call
-      // resolves, not merely raced a promise while the real child (and its open stdio, which
-      // keeps the event loop alive) lived on.
-      expect(() => process.kill(pid, 0)).toThrow(/ESRCH/)
+      // `pid` is captured independently of `defaultRunner`'s own promise, and a watchdog bounds
+      // the wait for that promise too: if a future regression stops passing `signal` to `spawn`
+      // (or otherwise breaks the kill-on-abort path this test exists to catch), the real child's
+      // `close` event would never fire and a bare `await defaultRunner(...)` would hang this test
+      // — and, with its stdio pipes still referenced by this process, plausibly the whole
+      // `vitest run` — forever, instead of failing in a bounded time. The `finally` below then
+      // force-kills whatever pid was captured on every path, proven or not.
+      let pid: number | undefined
+      try {
+        // Started, not awaited, before polling for the pid file: the child only exists once this
+        // call spawns it, so awaiting the file first would just wait out its own timeout with
+        // nothing ever having been launched.
+        const runnerPromise = defaultRunner(process.execPath, [scriptPath, pidPath], { env: process.env, signal: AbortSignal.timeout(1_000) })
+        pid = Number(await waitForFile(pidPath, 5_000))
+        const result = await Promise.race([
+          runnerPromise,
+          new Promise<{ code: number; stdout: string; stderr: string }>((resolve) =>
+            setTimeout(() => resolve({ code: -1, stdout: '', stderr: 'test watchdog: defaultRunner never settled' }), 5_000).unref(),
+          ),
+        ])
+        expect(result.code).toBe(124)
+        // Signal 0 sends nothing; it only checks whether the process still exists. ESRCH means it
+        // is gone — defaultRunner's own kill must already have reaped it by the time the call
+        // resolves, not merely raced a promise while the real child (and its open stdio, which
+        // keeps the event loop alive) lived on.
+        expect(() => process.kill(pid!, 0)).toThrow(/ESRCH/)
+      } finally {
+        if (pid !== undefined) {
+          try {
+            process.kill(pid, 'SIGKILL')
+          } catch {
+            // Already dead (ESRCH) is the expected, passing-case outcome; this is the safety net
+            // for when it is not.
+          }
+        }
+      }
     },
     10_000,
   )

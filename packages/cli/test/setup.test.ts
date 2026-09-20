@@ -1,6 +1,6 @@
-import { decodeLink, loadIdentity, loadOrCreateIdentity, openStore, setProfile } from '@agentbridge/core'
-import { access, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { decodeLink, getProfile, loadIdentity, loadOrCreateIdentity, openStore, sanitizeRelayList, setProfile } from '@agentbridge/core'
+import { access, mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { plainSocketFactory, startFakeBoard, type FakeBoard } from '../../core/test/support/fake-board'
@@ -107,7 +107,6 @@ describe('the identity step', () => {
     await runSetup(context({ prompt, out }))
     expectDrained()
     const store = await openStore(identityHome, { relayPolicy: allowAnyRelay })
-    const { getProfile } = await import('@agentbridge/core')
     expect(getProfile(store).name).toBe('Ana')
     store.close()
   })
@@ -199,5 +198,155 @@ describe('the answering side', () => {
     // "Pendiente:", where the person looks for what is left to do.
     const summary = text.slice(text.indexOf('Pendiente:'))
     expect(summary).toMatch(/Tablero/)
+  })
+})
+
+// This coverage was deleted with the 0.1 relay in commit 7054236 and promised to return once
+// plans 3/4 rewrote `setup` — the underlying logic (scanShareDirForDanger, the CONFIRMAR gate,
+// the hard refusals) is unchanged from 0.1, but until now nothing in the repo exercised it. Every
+// test here drives the real flow through `runSetup`, the same way a person would answer it, not
+// `assessShareDir`/`scanShareDirForDanger` in isolation.
+describe('the shared-folder protection', () => {
+  it('flags a git repo and a credential-looking file, and only proceeds once CONFIRMAR is typed', async () => {
+    await seedIdentityAndProfile()
+    await mkdir(join(shareDir, '.git'), { recursive: true })
+    await writeFile(join(shareDir, '.env'), 'SECRET=x')
+    const out = memoryOutput()
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR'])
+    await runSetup(context({ prompt, out }))
+    expectDrained()
+    const text = out.lines.join('\n')
+    expect(text).toMatch(/repositorio de git/)
+    expect(text).toMatch(/parecen credenciales/)
+    // It really did proceed past the gate, not just print the warning and stop.
+    await expect(access(join(shareDir, 'CLAUDE.md'))).resolves.toBeUndefined()
+  })
+
+  it('leaves a dangerous folder untouched when the person never types CONFIRMAR', async () => {
+    await seedIdentityAndProfile()
+    await mkdir(join(shareDir, '.git'), { recursive: true })
+    await writeFile(join(shareDir, '.env'), 'SECRET=x')
+    // MAX_ATTEMPTS is 3: three wrong answers exhaust the retry budget and end the run.
+    const { prompt } = scripted(['1', shareDir, '', 'no', 'no', 'no'])
+    await expect(runSetup(context({ prompt }))).rejects.toThrow(/CONFIRMAR/)
+    await expect(access(join(shareDir, 'CLAUDE.md'))).rejects.toThrow()
+  })
+
+  it('flags a symlink inside the folder as a reason to confirm, without following it', async () => {
+    await seedIdentityAndProfile()
+    await mkdir(shareDir, { recursive: true })
+    await symlink(root, join(shareDir, 'enlace'))
+    const out = memoryOutput()
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR'])
+    await runSetup(context({ prompt, out }))
+    expectDrained()
+    expect(out.lines.join('\n')).toMatch(/enlaces simbólicos/)
+  })
+
+  it('flags an un-descended node_modules instead of silently skipping what is inside it', async () => {
+    await seedIdentityAndProfile()
+    await mkdir(join(shareDir, 'node_modules', 'algun-paquete'), { recursive: true })
+    await writeFile(join(shareDir, 'node_modules', 'algun-paquete', '.env'), 'SECRET=y')
+    const out = memoryOutput()
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR'])
+    await runSetup(context({ prompt, out }))
+    expectDrained()
+    // Specifically the "did not look inside" reason, not "found credentials in there" — the
+    // latter would mean the scan recursed into node_modules after all, which it must never do.
+    expect(out.lines.join('\n')).toMatch(/no revisé dentro de node_modules/)
+  })
+
+  it('refuses the home directory outright — no CONFIRMAR can override it', async () => {
+    await seedIdentityAndProfile()
+    const { prompt } = scripted(['1', homedir(), ''])
+    await expect(runSetup(context({ prompt }))).rejects.toThrow(/carpeta de usuario/i)
+  })
+
+  it('refuses a folder that would contain the identity, naming the key as the stake', async () => {
+    await seedIdentityAndProfile()
+    const { prompt } = scripted(['1', root, ''])
+    await expect(runSetup(context({ prompt }))).rejects.toThrow(/llave/i)
+  })
+
+  it('refuses a folder that would contain the dedicated profile, naming settings/start.sh — not the key — as the stake', async () => {
+    await seedIdentityAndProfile()
+    // A folder that contains only the (custom) profile home, not the identity home: root also
+    // holds identityHome as a sibling, so the conflict must be scoped to a fresh subtree.
+    const conflictParent = join(root, 'perfil-en-conflicto')
+    const conflictProfileHome = join(conflictParent, 'perfil')
+    const { prompt } = scripted(['1', conflictParent, ''])
+    const err: unknown = await runSetup(context({ prompt, profileHome: conflictProfileHome })).catch((e) => e)
+    expect(err).toBeInstanceOf(Error)
+    expect((err as Error).message).toMatch(/settings\.json/)
+    expect((err as Error).message).toMatch(/start\.sh/)
+    // The overclaim this replaces: the profile branch holds no key, so it must not say so.
+    expect((err as Error).message).not.toMatch(/llave secreta es tu identidad entera/)
+  })
+})
+
+describe('closed input vs. no terminal at all', () => {
+  it('reports "se cerró la entrada" — never "no es una terminal interactiva" — when the stream ends mid-run', async () => {
+    // Ends right after the name question, before the role question is ever asked: a real Ctrl-D
+    // partway through, not a session that never had a prompt to begin with (that case is
+    // setupCommand's own upfront check and uses a different, unrelated message).
+    const { prompt } = scripted(['Ana'])
+    const err: unknown = await runSetup(context({ prompt })).catch((e) => e)
+    expect(err).toBeInstanceOf(Error)
+    expect((err as Error).message).toMatch(/se cerró la entrada/i)
+    expect((err as Error).message).not.toMatch(/terminal interactiva/i)
+  })
+})
+
+describe('the retry loop', () => {
+  it('asks the same question again after an invalid answer, instead of failing the whole run', async () => {
+    const out = memoryOutput()
+    const { prompt, expectDrained } = scripted(['Ana', 'x', '2', 'n', 'n'])
+    await runSetup(context({ prompt, out }))
+    expectDrained()
+    expect(out.lines.join('\n')).toMatch(/No entendí "x"/)
+  })
+
+  it('gives up with the Spanish message once every retry attempt is spent', async () => {
+    // The name question passes on the first try; the role question then gets three wrong answers
+    // in a row, exhausting MAX_ATTEMPTS.
+    const { prompt } = scripted(['Ana', 'x', 'y', 'z'])
+    await expect(runSetup(context({ prompt }))).rejects.toThrow(/No pude entender qué ibas a hacer/)
+  })
+})
+
+describe('--relays', () => {
+  it('writes the list to the profile', async () => {
+    await seedIdentityAndProfile()
+    const out = memoryOutput()
+    const { prompt, expectDrained } = scripted(['2', 'n', 'n'])
+    await runSetup(context({ prompt, out, relays: ['wss://uno.example', 'wss://dos.example'] }))
+    expectDrained()
+    const store = await openStore(identityHome, { relayPolicy: allowAnyRelay })
+    expect(getProfile(store).relays).toEqual(['wss://uno.example', 'wss://dos.example'])
+    store.close()
+    expect(out.lines.join('\n')).toMatch(/Cambié tus tableros: ahora usas 2/)
+  })
+
+  it('changes an already-configured list on a rerun, not only a first-time one', async () => {
+    // seedIdentityAndProfile already set relays to [board.url] and a name, so this run never asks
+    // the name question — proving the --relays branch is not accidentally gated behind it.
+    await seedIdentityAndProfile()
+    const { prompt, expectDrained } = scripted(['2', 'n', 'n'])
+    await runSetup(context({ prompt, relays: ['wss://nuevo.example'] }))
+    expectDrained()
+    const store = await openStore(identityHome, { relayPolicy: allowAnyRelay })
+    expect(getProfile(store).relays).toEqual(['wss://nuevo.example'])
+    store.close()
+  })
+
+  it('refuses a malformed list the way setProfile does, and leaves the existing one in place', async () => {
+    await seedIdentityAndProfile()
+    // The permissive allowAnyRelay used everywhere else in this file would let a bogus string
+    // through, so this test uses the real production policy to actually exercise the rejection.
+    const { prompt } = scripted(['2', 'n', 'n'])
+    await expect(runSetup(context({ prompt, relayPolicy: sanitizeRelayList, relays: ['not-a-real-relay'] }))).rejects.toThrow(/tablero/i)
+    const store = await openStore(identityHome, { relayPolicy: allowAnyRelay })
+    expect(getProfile(store).relays).toEqual([board.url])
+    store.close()
   })
 })
