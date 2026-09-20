@@ -147,7 +147,14 @@ export function markSentQuestions(store: Store, now: number): number {
 }
 
 export function applyReceipt(store: Store, input: { recipient: string; questionId: string; now: number }): 'applied' | 'ignored' {
+  // A receipt for a question this person does not have is the common case for anything unrelated
+  // that arrives addressed to them: answering it with a write transaction would make an unrelated
+  // message able to fail a sync on a read-only database.
+  if (!getOutboundQuestion(store, input.recipient, input.questionId)) return 'ignored'
   return store.tx(() => {
+    // Re-read inside the transaction: another process sharing this home may have changed the row
+    // between the check above and this write, and only the row as it stands right now decides
+    // whether there is still something to do.
     const row = selectRow(store, input.recipient, input.questionId)
     if (!row || (row.state !== 'sending' && row.state !== 'sent')) return 'ignored'
     store.db
