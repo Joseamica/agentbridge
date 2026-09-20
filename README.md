@@ -1,7 +1,8 @@
 # AgentBridge
 
 Ask another person's coding agent a question — across different machines, networks and
-subscriptions — without waiting for that person to become available.
+subscriptions — without waiting for that person to become available, and without either of you
+running a server.
 
 > **Language note:** the code, comments and this README are in English. Everything the tool
 > *says to a human* — CLI output, errors, the agent-facing channel notices — is in Spanish,
@@ -20,24 +21,32 @@ later, ask *their* Claude Code, copy the answer back, and you've lost the aftern
 The bottleneck isn't the answer. It's the human in the middle relaying it.
 
 AgentBridge lets your agent ask their agent directly, with the other person's explicit,
-revocable permission, inside a box they control.
+revocable permission, inside a folder they control.
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    A["Your Claude Code<br/>(ask_contact)"] -->|question| R["Relay<br/>identity · grants · tickets"]
-    R -->|dispatch| C["Their Claude Code<br/>locked-down session"]
-    C -->|reply| R
-    R -->|answer| A
+    A["Your Claude Code<br/>(ask_contact)"] -->|sealed wrap| B1["Public Nostr boards<br/>(five, by default)"]
+    B1 -->|sealed wrap| C["Their Claude Code<br/>locked-down session"]
+    C -->|sealed wrap| B1
+    B1 -->|answer| A
 ```
 
-1. Both people enroll once against a relay you host. Credentials never travel agent-to-agent.
-2. One grants the other permission to ask. Grants are **directional** and revocable at any time.
-3. The asker's agent calls `ask_contact`. The relay queues a ticket.
-4. The responder's agent — running in a dedicated, permission-restricted Claude Code session —
-   receives the question as a channel notification and answers with a single `reply` tool.
-5. The answer comes back through `check_answer`. Nobody had to be online at the same moment.
+1. Each person runs `setup` once: it creates a key on their own machine and writes their profile.
+   There is no account and no server of ours.
+2. They exchange links (`agentbridge:nprofile1…`). One asks for permission with `connect`; the
+   other sees it with `requests` and decides with `approve` or `reject`. Permission is
+   **directional** and revocable at any time with `revoke`.
+3. Questions and answers travel as NIP-59 sealed wraps through public Nostr boards. A board sees
+   an encrypted envelope, the ephemeral key that published it, **the recipient's key it is
+   addressed to**, its size and its timing. It never sees the content, and it never sees who wrote
+   it — but a board operator can watch which key receives envelopes, and correlate sizes and
+   timing across boards.
+4. The responder's agent runs in a dedicated, permission-restricted Claude Code session that can
+   read one folder and nothing else, and answers with a single `reply` tool.
+5. The answer comes back through `check_answer` or `ticket`. Nobody had to be online at the same
+   moment; a question is retried for up to seven days.
 
 ## Security model — read this before you install it
 
@@ -67,35 +76,60 @@ fence holds. So the boundary is enforced by configuration, not by asking the mod
   `.mcp.json`, `.claude/agents`, `.claude/skills`, `.claude/commands`, `CLAUDE.local.md`,
   `AGENTS.md` — takes effect at the next session start. `agentbridge doctor` flags all of them;
   nothing prevents a sync client or a `git pull` from placing them.
-- **Whoever runs the relay reads everything.** Question and answer content is stored in plaintext
-  for 7 days. Device tokens are stored only as SHA-256 hashes, but the relay operator holds the
-  admin token and is the identity provider. Run your own relay, and tell your counterpart that
-  you do.
 
-`agentbridge doctor` is how you verify all of this on a real install. Run it before you trust it.
+`agentbridge doctor` is how you verify all of this on a real install, including that every board
+you use actually accepts and returns what you publish. Run it before you trust it.
+
+## Privacy: what's guaranteed and what isn't
+
+**Guaranteed:**
+
+- Nobody outside the two of you can read questions, answers, names or notes.
+- The public event never names the sender: anyone watching a board sees "an envelope for key X",
+  signed by a single-use key that is thrown away right after.
+- Nobody can impersonate a contact: every message is only accepted if the seal is signed by the
+  expected key.
+
+**Not guaranteed:**
+
+- **Hiding who talks to whom from a board's operator.** A board can correlate the IP that
+  publishes an envelope for X with the IP that later reads X's envelopes, and — where it requires
+  NIP-42 AUTH — the actual key doing the reading. Copying the same envelope to several boards lets
+  an operator correlate across boards too.
+- **Forward secrecy.** If your key is ever stolen, whoever holds it can decrypt any envelope
+  addressed to you that a board kept.
+- **Deletion.** The NIP-40 expiration tag asks boards to delete after 7 days; it does not force
+  them to.
+- **Availability under a targeted attack.** Rate limits contain casual abuse; an attacker with
+  real resources can degrade service for one specific key, including crowding out legitimate
+  questions.
+- **Protecting the key from other programs you run.** The 0600 permission on `identity.json`
+  keeps other users of the machine out, not other programs of yours. The locked-down responder
+  session cannot read it, by the same permission rule that keeps it out of everything else outside
+  the shared folder — but an ordinary Claude Code session on the same machine could.
+
+And the one that matters most in practice: **everything in the shared folder is readable by
+anyone you've given permission to ask you.** That includes a stray `.env` or key file — say it out
+loud to the other person before either of you puts anything in there.
 
 ## Requirements
 
-- Node.js >= 22.4 (developed on 24)
+- Node.js >= 22.13
 - Claude Code (developed against 2.1.270) on the responder's machine
-- Postgres 16 for the relay — Docker locally, a managed instance in production
-- A host for the relay. A `render.yaml` blueprint is included.
+
+There is nothing to deploy, host or pay for. Both machines only ever talk *out* to public Nostr
+boards; neither is exposed to the internet, and there's no server of ours in the middle.
 
 ## Two people, two roles
 
-The two machines never talk to each other and neither is exposed to the internet. Both call *out*
-to a relay you host — think of it as a reception desk both people trust.
-
-There are three roles. In a two-person pilot one person usually holds two of them.
-
 | Role | Who it is | What they do |
 | --- | --- | --- |
-| **Relay operator** | whoever hosts it, usually you | Deploys the relay once and issues one enrollment link per person. Can read every question and answer — say that out loud to the other person. |
 | **Answerer** | the person whose knowledge you want | Leaves a Claude Code session running in a locked room, with copies of only the files they chose to share. |
 | **Asker** | the person with the question | Asks from their own Claude Code, or from the CLI. |
 
 Permission is **directional**. Ana being allowed to ask Dev does not let Dev ask Ana. If you want
-both directions, do the grant step twice, once each way. Either side can revoke instantly.
+both directions, do the grant step twice, once each way. Either side can revoke instantly with
+`revoke`.
 
 The "locked room" is the important idea. The answerer picks one folder and copies into it only
 what they're willing to share. Their agent can read that folder and **nothing else on the
@@ -105,18 +139,18 @@ room is fair game, so the room is curated on purpose. It is not your working rep
 ```mermaid
 sequenceDiagram
     participant A as Ana's Claude Code
-    participant R as Relay (self-hosted)
+    participant B as Public Nostr boards
     participant D as Dev's locked session
-    Note over A,D: one time: both enroll, Dev grants Ana permission
-    A->>R: ask_contact "which timeout applies to card reads?"
-    R->>D: question + a 4-character code
+    Note over A,D: one time: both run setup, Dev approves Ana's connect request
+    A->>B: sealed wrap: ask_contact "which timeout applies to card reads?"
+    B->>D: Dev's channel picks it up
     Note over D: reads only the shared folder
-    D->>R: reply, validated against the code
-    R->>A: check_answer returns the answer
+    D->>B: sealed wrap: reply
+    B->>A: check_answer returns the answer
 ```
 
-Nobody has to be online at the same moment. If Dev's session is down, the question waits in the
-queue for him.
+Nobody has to be online at the same moment. If Dev's session is down, the question waits — on the
+boards, retried automatically — until he starts it again.
 
 ## Quickstart
 
@@ -129,30 +163,27 @@ human sees in this tool:
 npx -y @joseamica/agentbridge@latest setup
 ```
 
-It enrolls the device if it isn't already, asks whether you're going to answer questions, ask
-questions, or both, and — before it ever asks you to name a folder to share — explains in plain
-language what putting one there means: everything inside becomes readable by anyone you let ask
-you, including a stray `.env` or key file. It refuses your own home directory outright, and makes
-you type an explicit confirmation before using a folder that looks like a working repo or already
-has credential-shaped files in it. It never creates that folder silently. It finishes by telling
-you plainly what's ready, what's still pending, and the one command to run next.
+It creates your key and profile if they don't exist yet, asks whether you're going to answer
+questions, ask questions, or both, and — before it ever asks you to name a folder to share —
+explains in plain language what putting one there means: everything inside becomes readable by
+anyone you let ask you, including a stray `.env` or key file. It refuses your own home directory
+outright, and makes you type an explicit confirmation before using a folder that looks like a
+working repo or already has credential-shaped files in it. It never creates that folder silently.
+It finishes by telling you plainly what's ready, what's still pending, and the one command to run
+next.
 
 `setup` is a thin conductor: every step it takes is one of the commands documented below
-(`enroll`, `setup-responder`, `doctor`, `claude mcp add`) — it never reimplements their logic. If
+(`connect`, `setup-responder`, `doctor`, `claude mcp add`) — it never reimplements their logic. If
 it can't run interactively (no TTY — a script, CI, a redirected pipe), it says so immediately and
 prints the equivalent commands instead of hanging.
 
 Read on if you want to understand exactly what each step does, run one by hand, automate it, or
 fix something `doctor` flagged.
 
-### Manual, step by step
-
-Ana is going to ask; Dev is going to answer. Swap the names for your own.
-
 ### On both machines
 
-Node >= 22.4 is required, to run `npx` — nothing else. Dev also needs Claude Code; Ana only needs
-it if she wants to ask from inside her agent rather than from the terminal.
+Node >= 22.13 is required, to run `npx` — nothing else. The responder also needs Claude Code; the
+asker only needs it if they want to ask from inside their agent rather than from the terminal.
 
 Nothing to clone, build, or alias. Every command below runs through `npx`, which fetches
 AgentBridge the first time it's used and reuses it after that:
@@ -164,137 +195,60 @@ npx -y @joseamica/agentbridge@latest --help
 (Hacking on AgentBridge itself instead of installing it? See
 [Running the CLI from a local clone](#running-the-cli-from-a-local-clone) below.)
 
-### Once, on the relay operator's machine
+### Manual, step by step
 
-The relay is the only piece that has to be reachable from the internet. Neither person's machine
-does — both call out to it.
+Ana is going to ask; Dev is going to answer. Swap the names for your own.
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Joseamica/agentbridge)
-
-That button reads the `render.yaml` in this repo and creates two things: the relay itself and a
-Postgres 16 database, pinned to one instance and closed to the outside world. Four steps:
-
-1. Click it, connect your GitHub account, and approve the blueprint.
-2. Wait for the first deploy. The health check is `/health`.
-3. Copy the service URL — that is your `AGENTBRIDGE_RELAY_URL`.
-4. Open the relay service → **Environment** → copy the generated `ADMIN_TOKEN` into a password
-   manager. Render generates it for you, so you never type it. It mints enrollment links, which
-   makes it the master credential: never paste it into a chat and never give it to an agent.
-
-Prefer to host it elsewhere? Anything with Node 22.4+, Postgres and a public URL works. Set
-`DATABASE_URL`, `ADMIN_TOKEN` (32+ characters) and `PUBLIC_URL`, then `npm run start -w
-@agentbridge/relay`.
-
-One thing to say out loud to whoever you invite: **whoever runs the relay can read every question
-and answer** for the 7 days they are retained. That is why you host your own.
-
-Then issue one link per person — single use, expiring, and bound to the first device that redeems
-it:
+**On both machines — create an identity and see your own link:**
 
 ```bash
-read -rs AGENTBRIDGE_ADMIN_TOKEN && export AGENTBRIDGE_ADMIN_TOKEN
-export AGENTBRIDGE_RELAY_URL=https://your-relay.example.com
-
-npx -y @joseamica/agentbridge@latest admin enroll-link --handle dev --name "Dev"
-npx -y @joseamica/agentbridge@latest admin enroll-link --handle ana --name "Ana"
+npx -y @joseamica/agentbridge@latest setup
+npx -y @joseamica/agentbridge@latest link
 ```
 
-Send each person their own link, over any channel you already use.
+This is local: `~/.agentbridge` (or `$AGENTBRIDGE_HOME`) holds your key and your database, and
+nothing you do here talks to anyone else yet.
 
-### On Dev's machine — the person who answers
-
-`agentbridge setup` reaches the same result as steps 1, 3 and 5 below — but not by running them
-as written. It enrolls into this device's *default* identity (not directly into
-`~/.agentbridge-responder`), then copies that same credential into the responder's profile for
-you, so step 3's dedicated session can still find it. It also runs the shared-folder safety
-checks and tells you exactly what's left. Because of that, **don't do both**: if you've already
-redeemed your link by hand with step 1 below, running `setup` afterward will ask you for a link
-you no longer have, since it looks for an identity at the default location first, not at
-`~/.agentbridge-responder`. Pick one path. What follows is what `setup` does under the hood, and
-how to do any of it by hand if you'd rather skip it.
-
-**1. Redeem the link — into the responder's own home, not the default one.**
-
-```bash
-AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y @joseamica/agentbridge@latest enroll "<Dev's link>"
-AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y @joseamica/agentbridge@latest whoami
-```
-
-The dedicated session `start.sh` launches later always runs with
-`AGENTBRIDGE_HOME=~/.agentbridge-responder` (that is what keeps it from touching Dev's own
-everyday Claude Code identity). Enrolling anywhere else — the default `~/.agentbridge` included —
-leaves that session with no credential to read, and it exits immediately instead of connecting.
-Enrollment links are single-use, so getting this step wrong means going back to the relay operator
-for a brand-new one.
-
-**2. Build the room.** Create a folder and copy into it only what Dev is willing to share. A
-README, a config file, an architecture note. Not the working repo, and nothing with credentials.
+**On Dev's machine — build the shared folder and the locked session:**
 
 ```bash
 mkdir -p ~/AgentBridge/shared
+# copy in only what Dev is willing to share — not the working repo, nothing with credentials
+npx -y @joseamica/agentbridge@latest setup-responder --share ~/AgentBridge/shared
 ```
 
-**3. Set up the locked session.**
+This creates a dedicated Claude Code profile at `~/.agentbridge-responder` (override with
+`--profile`), writes the restricted permissions, generates a `start.sh`, and drops a persona
+`CLAUDE.md` into the shared folder. It refuses to run if that profile — or Dev's identity folder —
+would land inside the shared folder.
 
 ```bash
-npx -y @joseamica/agentbridge@latest setup-responder --share ~/AgentBridge/shared --home ~/.agentbridge-responder
-```
-
-This creates a dedicated Claude Code profile, writes the restricted permissions, generates a
-`start.sh`, and drops a persona `CLAUDE.md` into the shared folder. It refuses to run if the
-credential directory would land inside the shared folder. (`--home` here defaults to
-`~/.agentbridge-responder` already — it's spelled out so it visibly matches step 1.)
-
-**4. Log in once in that profile, then start it.** The session has to stay running to answer —
-keep it in its own terminal window, or under tmux.
-
-```bash
+CLAUDE_CONFIG_DIR=~/.agentbridge-responder/claude claude   # once: /login, then /exit
 ~/.agentbridge-responder/start.sh
 ```
 
-**5. Check it actually works.**
+The first time it starts, it'll ask whether to trust the development channel — that's the
+AgentBridge plugin you just installed; accept it. Keep this running in its own terminal window, or
+under tmux.
 
 ```bash
-npx -y @joseamica/agentbridge@latest doctor --home ~/.agentbridge-responder --share ~/AgentBridge/shared
+npx -y @joseamica/agentbridge@latest doctor --profile ~/.agentbridge-responder --share ~/AgentBridge/shared
 ```
 
 Every line should read `[ok]`. This is the step that tells you the fence is real, the plugin is
-installed, and nothing dangerous landed in the shared folder. Run it before you trust the setup.
+installed, and nothing dangerous landed in the shared folder — including that every board Dev
+uses actually accepts and returns what's published to it, not just that the socket opens. Run it
+before you trust the setup.
 
-**6. Let Ana in.**
-
-```bash
-AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y @joseamica/agentbridge@latest invite
-```
-
-Send Ana the link it prints. That is what grants her permission to ask. Dev can undo it at any
-time with `AGENTBRIDGE_HOME=~/.agentbridge-responder npx -y @joseamica/agentbridge@latest revoke ana`. Every
-command Dev runs about this identity — `invite`, `revoke`, `contacts`, a later `whoami` — needs
-that same `AGENTBRIDGE_HOME`, since that is where step 1 put the credential; exporting it once for
-the whole terminal session avoids repeating it.
-
-### On Ana's machine — the person who asks
-
-`agentbridge setup` does step 1 and, if she asks it to, registers the MCP server from step 3 too
-— reminding her to restart Claude Code afterward. This is what it runs, spelled out, and how to
-do any of it by hand.
-
-**1. Redeem her own link.**
+**On Ana's machine — ask for permission and ask:**
 
 ```bash
-npx -y @joseamica/agentbridge@latest enroll "<Ana's link>"
+npx -y @joseamica/agentbridge@latest connect "<Dev's link>" --note "soy Ana"
 ```
 
-**2. Accept Dev's invite.**
-
-```bash
-npx -y @joseamica/agentbridge@latest accept "<Dev's invite link>"
-npx -y @joseamica/agentbridge@latest contacts
-```
-
-`contacts` should now list Dev under the people she can ask.
-
-**3. Ask.** From the terminal:
+The first step here takes a few seconds — it's mining proof of work, on purpose, as an antispam
+measure. Dev sees the request with `requests` and grants it with `approve <id>`; both sides can
+then confirm the same state with `contacts`.
 
 ```bash
 npx -y @joseamica/agentbridge@latest ask dev "which timeout applies to card reads?" --wait 120
@@ -307,48 +261,50 @@ claude mcp add agentbridge --scope user -- npx -y @joseamica/agentbridge@latest 
 ```
 
 Restart any session that was already open, then just tell her agent to ask Dev. It gets
-`list_contacts`, `ask_contact` and `check_answer`. `check_answer` long-polls within the relay's
-ceiling, so it never hangs a tool call.
+`list_contacts`, `ask_contact`, `check_answer` and `connect`. `check_answer` long-polls for at
+most 45 seconds per call, so it never hangs a tool call.
 
 ### After that
 
 Dev keeps his session running and forgets about it. Ana asks whenever she needs to. Neither of
-them has to interrupt the other.
+them has to interrupt the other. If Dev's session is off, the question waits — retried
+automatically for up to a week — and lands the moment he starts it again.
 
 For the full pilot protocol in Spanish — including an eight-scenario security checklist you should
 run before trusting this with anything real — see
-[`docs/runbooks/m1-acceptance.md`](docs/runbooks/m1-acceptance.md). There is also a friendlier
+[`docs/runbooks/aceptacion-0.2.md`](docs/runbooks/aceptacion-0.2.md). There is also a friendlier
 Spanish quickstart at [`docs/inicio-rapido.md`](docs/inicio-rapido.md).
 
 ## CLI reference
 
 ```
 Guided:
-  agentbridge setup [--repo <dir>] [--responder-home <dir>]
-                              (interactive, in Spanish — orchestrates everything below;
-                               both flags are only for running from a source checkout —
-                               --responder-home is the responder's dedicated profile dir,
-                               not your own identity's)
+  agentbridge setup [--repo <dir>] [--profile <dir>] [--relays <url,url,…>]
+                              (interactive, in Spanish — creates your key and profile, then
+                               orchestrates everything below for the role(s) you pick)
 
-Enrollment and permissions:
-  agentbridge admin enroll-link --handle <h> --name <name> --relay <url> --admin-token <token>
-  agentbridge enroll <link> [--device <name>]
+Your link and your permissions:
+  agentbridge link                        (prints your own agentbridge:nprofile1… link)
+  agentbridge connect <link> [--note "who you are"]
+  agentbridge contacts                    (who you can ask, and who can ask you)
   agentbridge whoami
-  agentbridge invite
-  agentbridge accept <link>
-  agentbridge contacts
-  agentbridge revoke <handle>
+
+Requests that reach you:
+  agentbridge requests
+  agentbridge approve <id>
+  agentbridge reject <id>
+  agentbridge revoke <name>
 
 Asking:
-  agentbridge ask <handle> <question…> [--wait <seconds>|--no-wait]
-  agentbridge ticket <ticket_id> [--wait <seconds>]
-  agentbridge mcp
+  agentbridge ask <name> <question…> [--wait <seconds>|--no-wait]
+  agentbridge ticket <id> [--wait <seconds>]
+  agentbridge mcp                         (MCP server for Claude Code or Codex)
 
 Answering from this machine:
-  agentbridge setup-responder --share <dir> [--home <dir>] [--repo <dir>] [--model sonnet] [--effort low]
-  agentbridge doctor [--home <dir>] [--share <dir>] [--repo <dir>]
+  agentbridge setup-responder --share <dir> [--profile <dir>] [--repo <dir>] [--model sonnet] [--effort low]
+  agentbridge doctor [--home <dir>] [--profile <dir>] [--share <dir>] [--repo <dir>]
 
-Environment: AGENTBRIDGE_HOME, AGENTBRIDGE_RELAY_URL, AGENTBRIDGE_ADMIN_TOKEN
+Environment: AGENTBRIDGE_HOME (the folder with your identity and your database)
 ```
 
 Exit codes: `0` success, `1` expected failure, `2` unexpected.
@@ -357,28 +313,26 @@ Exit codes: `0` success, `1` expected failure, `2` unexpected.
 
 | Path | What it is |
 | --- | --- |
-| `apps/relay` | Fastify + Postgres. Identity, directional grants, tickets, per-pair limits, WebSocket hub, sweeper. |
-| `packages/core` | Wire protocol (zod), secret hashing, client config, HTTP client. |
-| `packages/channel` | The Claude Code plugin: relay WebSocket client, in-flight question state, MCP server exposing `reply`. |
-| `packages/cli` | Every command above, plus the asker-side MCP server. |
-| `plugins/agentbridge` | Plugin manifests and the built bundle. |
-| `tests/e2e` | One hermetic end-to-end test: real relay, real Postgres, real WebSocket, real MCP pairs. |
+| `packages/core` | Identity, the NIP-59 envelope pipeline (seal, gift wrap, proof of work), the local SQLite store (contacts, questions, cursors), and the board pool client. No server of ours anywhere in here. |
+| `packages/channel` | The Claude Code plugin: the responder's dispatcher (turn coordination that used to live in the relay), inbound question handling, and the MCP server exposing `reply`. |
+| `packages/cli` | Every command above, plus the asker-side MCP server (`list_contacts`, `ask_contact`, `check_answer`, `connect`). |
+| `plugins/agentbridge` | Plugin manifests and the built bundle the responder's dedicated Claude Code profile loads. |
+| `tests/` | `asker/`, `responder/` and `acceptance/` run entirely in-process, no network. `tests/live` is the only suite that talks to real public boards. |
 
-Correlation deliberately never depends on the model copying an identifier: the relay validates an
-`attemptId` the model never sees, and the human-facing question code is checked for an exact match.
+Correlation deliberately never depends on the model copying an identifier: the channel validates a
+short code the model never sees, and the human-facing question code is checked for an exact match.
 
 ## Development
 
 ```bash
 npm ci
-npm run db:up      # Postgres 16 in Docker on port 55432
-npm test           # 227 tests
+npm test           # needs neither Docker nor internet
 npm run typecheck
 npm run build
-npm run db:down
 ```
 
-Tests only ever talk to the Docker container on port 55432.
+`npm run test:live` is the only suite that talks to public Nostr boards. Run it on purpose, never
+in a loop.
 
 ### Running the CLI from a local clone
 
@@ -402,13 +356,13 @@ running from.
 
 ## Status
 
-This is **M1**: pilot-grade, built for two people who already trust each other. It has been
+This is **0.2**: no server of ours, built for two people who already trust each other. It has been
 reviewed end to end, but it has not been run by anyone but its author. Known gaps, deliberate
 deferrals and the full residual-exposure statement are written down in
-[`docs/known-gaps.md`](docs/known-gaps.md)
-— including the ones that matter before you add a third person.
+[`docs/known-gaps.md`](docs/known-gaps.md) — including the ones that matter before you add a third
+person.
 
-Not in M1: mobile clients, WhatsApp or Telegram, push notifications, organizations, billing,
+Not in 0.2: mobile clients, WhatsApp or Telegram, push notifications, organizations, billing,
 attachments, Codex as the responder.
 
 Issues and questions are welcome. If you find a way around the fence, please open an issue.
