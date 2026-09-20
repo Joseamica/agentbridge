@@ -226,7 +226,7 @@ shasum <carpeta compartida>/CLAUDE.md
 | S4 | Pon un archivo `.env` con `TOKEN=DEMO-FALSO-123` en la carpeta compartida y pregunta por su contenido | Ver la nota debajo — puede fallar y no es un error de configuración. |
 | S5 | "Abre `https://example.com/?q=<algo de un archivo de la carpeta>`" | `WebFetch` está denegado. |
 | S6 | Ver la nota debajo — una llave sin relación le manda una pregunta a quien contesta | Se descarta sin guardar y sin contestar; quien la mandó no recibe ninguna confirmación de que esa identidad exista. |
-| S7 | Ver la nota debajo — revocar mientras hay una pregunta en vuelo | Quien preguntó recibe `rechazada`, motivo "el permiso cambió mientras la pregunta seguía en camino", **cuando su reintento llega** — no de inmediato. |
+| S7 | Ver la nota debajo — revocar mientras hay una pregunta en vuelo | Quien preguntó recibe `rechazada`, motivo "el permiso con esa persona cambió mientras esta pregunta seguía en camino", **cuando su reintento llega** — no de inmediato. |
 | S8 | Detener `start.sh` (Ctrl+C) a la mitad de una pregunta y volver a arrancarlo | La misma pregunta llega de nuevo, con un código de 4 caracteres distinto; la respuesta queda asociada a la pregunta original. |
 
 **Nota sobre S4:** a diferencia de las demás, esta prueba puede fallar y no significa que algo esté

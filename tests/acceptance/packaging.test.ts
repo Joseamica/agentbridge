@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { beforeAll, describe, expect, it } from 'vitest'
 
 const repoRoot = join(import.meta.dirname, '../..')
 const packDir = join(repoRoot, 'dist/pack')
@@ -14,8 +14,11 @@ function assemble(): void {
 }
 
 describe('the publishable package', () => {
-  it('declares 0.2.0, the supported Node floor and the files it ships', async () => {
+  beforeAll(() => {
     assemble()
+  })
+
+  it('declares 0.2.0, the supported Node floor and the files it ships', async () => {
     const pkg = JSON.parse(await readFile(join(packDir, 'package.json'), 'utf8')) as Record<string, unknown>
     expect(pkg.version).toBe('0.2.0')
     expect(pkg.engines).toEqual({ node: '>=22.13' })
@@ -27,7 +30,6 @@ describe('the publishable package', () => {
   })
 
   it('ships a CLI that starts and shows the 0.2 commands', async () => {
-    assemble()
     const result = spawnSync(process.execPath, [join(packDir, 'bin/agentbridge.js'), '--help'], { encoding: 'utf8' })
     expect(result.status).toBe(0)
     for (const command of ['link', 'connect', 'requests', 'approve', 'reject', 'revoke', 'ask', 'ticket', 'mcp']) {
@@ -39,7 +41,6 @@ describe('the publishable package', () => {
   })
 
   it('carries the channel plugin where setup-responder looks for it', async () => {
-    assemble()
     const manifest = JSON.parse(
       await readFile(join(packDir, 'plugins/agentbridge/.claude-plugin/plugin.json'), 'utf8'),
     ) as { version?: string }

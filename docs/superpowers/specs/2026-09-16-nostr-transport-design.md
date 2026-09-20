@@ -488,7 +488,7 @@ limpieza borra contenido a los 7 días y decisiones a los 9.
   de `reply` corregido.
 - **Servidor MCP de quien pregunta:** `AskerService`; herramientas `list_contacts` (sin presencia),
   `ask_contact`, `check_answer` (estados nuevos) y `connect`.
-- **Documentación:** README, `docs/inicio-rapido.md`, `docs/runbooks/m1-acceptance.md` y
+- **Documentación:** README, `docs/inicio-rapido.md`, `docs/runbooks/aceptacion-0.2.md` y
   `docs/known-gaps.md` reescritos para el flujo sin Render, con la sección de privacidad de este
   documento. El `CLAUDE.md` del proyecto deja de pedir Docker Postgres.
 - **Dependencias:** `nostr-tools` en versión exacta, empaquetada por esbuild en ambos bundles.

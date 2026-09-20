@@ -277,32 +277,36 @@ Spanish quickstart at [`docs/inicio-rapido.md`](docs/inicio-rapido.md).
 
 ## CLI reference
 
+Every command below is shown as `npx -y @joseamica/agentbridge@latest <command>`, the same form
+used throughout this README. If you installed the package globally, drop the `npx -y
+@joseamica/agentbridge@latest` prefix and run `agentbridge <command>` instead.
+
 ```
 Guided:
-  agentbridge setup [--repo <dir>] [--profile <dir>] [--relays <url,url,…>]
+  npx -y @joseamica/agentbridge@latest setup [--repo <dir>] [--profile <dir>] [--relays <url,url,…>]
                               (interactive, in Spanish — creates your key and profile, then
                                orchestrates everything below for the role(s) you pick)
 
 Your link and your permissions:
-  agentbridge link                        (prints your own agentbridge:nprofile1… link)
-  agentbridge connect <link> [--note "who you are"]
-  agentbridge contacts                    (who you can ask, and who can ask you)
-  agentbridge whoami
+  npx -y @joseamica/agentbridge@latest link                        (prints your own agentbridge:nprofile1… link)
+  npx -y @joseamica/agentbridge@latest connect <link> [--note "who you are"]
+  npx -y @joseamica/agentbridge@latest contacts                    (who you can ask, and who can ask you)
+  npx -y @joseamica/agentbridge@latest whoami
 
 Requests that reach you:
-  agentbridge requests
-  agentbridge approve <id>
-  agentbridge reject <id>
-  agentbridge revoke <name>
+  npx -y @joseamica/agentbridge@latest requests
+  npx -y @joseamica/agentbridge@latest approve <id>
+  npx -y @joseamica/agentbridge@latest reject <id>
+  npx -y @joseamica/agentbridge@latest revoke <name>
 
 Asking:
-  agentbridge ask <name> <question…> [--wait <seconds>|--no-wait]
-  agentbridge ticket <id> [--wait <seconds>]
-  agentbridge mcp                         (MCP server for Claude Code or Codex)
+  npx -y @joseamica/agentbridge@latest ask <name> <question…> [--wait <seconds>|--no-wait]
+  npx -y @joseamica/agentbridge@latest ticket <id> [--wait <seconds>]
+  npx -y @joseamica/agentbridge@latest mcp                         (MCP server for Claude Code or Codex)
 
 Answering from this machine:
-  agentbridge setup-responder --share <dir> [--profile <dir>] [--repo <dir>] [--model sonnet] [--effort low]
-  agentbridge doctor [--home <dir>] [--profile <dir>] [--share <dir>] [--repo <dir>]
+  npx -y @joseamica/agentbridge@latest setup-responder --share <dir> [--profile <dir>] [--repo <dir>] [--model sonnet] [--effort low]
+  npx -y @joseamica/agentbridge@latest doctor [--home <dir>] [--profile <dir>] [--share <dir>] [--repo <dir>]
 
 Environment: AGENTBRIDGE_HOME (the folder with your identity and your database)
 ```

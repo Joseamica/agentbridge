@@ -255,9 +255,9 @@ npx -y @joseamica/agentbridge@latest revoke <nombre>
 ```
 
 `<nombre>` es el que aparece en `contacts`. Si había una pregunta suya en camino cuando revocas,
-esa persona no recibe un "se canceló" al instante: recibe el rechazo (con motivo "el permiso
-cambió mientras la pregunta seguía en camino") **la próxima vez que su lado reintenta**, que puede
-tardar hasta unos minutos.
+esa persona no recibe un "se canceló" al instante: recibe el rechazo (con motivo "el permiso con
+esa persona cambió mientras esta pregunta seguía en camino") **la próxima vez que su lado
+reintenta**, que puede tardar hasta unos minutos.
 
 ## Antes de usarlo con algo que importe
 

@@ -138,7 +138,6 @@ export type CliContext = {
   home: string
   out: Output
   env: NodeJS.ProcessEnv
-  fetchImpl?: typeof fetch
   prompt?: Prompt
   // Both left undefined in production. A test passes them so a command can reach a local fake
   // board instead of the pinned, wss://-only defaults every real relay connection uses.
