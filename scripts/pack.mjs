@@ -86,7 +86,7 @@ const pkg = {
   repository: { type: 'git', url: 'git+https://github.com/Joseamica/agentbridge.git' },
   homepage: 'https://github.com/Joseamica/agentbridge#readme',
   bugs: { url: 'https://github.com/Joseamica/agentbridge/issues' },
-  keywords: ['agentbridge', 'claude-code', 'cli', 'mcp', 'agent', 'relay'],
+  keywords: ['agentbridge', 'claude-code', 'cli', 'mcp', 'agent', 'nostr'],
   engines: { node: '>=22.13' },
   type: 'module',
   bin: { agentbridge: 'bin/agentbridge.js' },
