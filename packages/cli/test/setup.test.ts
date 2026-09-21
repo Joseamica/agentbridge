@@ -185,9 +185,12 @@ describe('the answering side', () => {
     expect(text).toMatch(/dáselo|pásaselo|mándaselo/i)
   })
 
-  it('quotes a non-default profile path with a space so the printed responder command still runs (Minor 1)', async () => {
+  it('names a non-default profile plainly, with no POSIX quoting a Windows shell would misread (review round 1, Important 4)', async () => {
     // `responder` (not start.sh) is what gets printed now; a non-default --profile still has to
     // be named on that line, or the printed command would start the wrong (default) profile.
+    // It is printed unquoted on purpose: single quotes are not quotes to cmd.exe, so wrapping the
+    // path in them would be wrong on a whole platform — worse than a custom profile path with a
+    // space in it simply not needing escaping at all.
     await seedIdentityAndProfile()
     const spacedProfile = join(root, 'mi respondedor')
     const out = memoryOutput()
@@ -195,7 +198,8 @@ describe('the answering side', () => {
     await runSetup(context({ prompt, out, profileHome: spacedProfile }))
     expectDrained()
     const text = out.lines.join('\n')
-    expect(text).toContain(`${CLI_COMMAND} responder --profile '${spacedProfile}'`)
+    expect(text).toContain(`${CLI_COMMAND} responder --profile ${spacedProfile}`)
+    expect(text).not.toContain(`'${spacedProfile}'`)
   })
 
   it("lists doctor's failing checks as pending work instead of claiming it is done", async () => {

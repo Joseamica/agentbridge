@@ -1,0 +1,39 @@
+// The shape of the dedicated profile's saved configuration, its filename, and the two value
+// checks it needs — split out of `responder.ts` so that it and `setup-responder.ts` can both
+// import from here instead of from each other. An earlier version had `responder.ts` import
+// `ALLOWED_EFFORTS`/`SAFE_MODEL_PATTERN` from `setup-responder.ts` while `setup-responder.ts`
+// imported `RESPONDER_CONFIG_FILE`/`ResponderConfig` back from `responder.ts`. It worked —
+// verified: `tsc` clean, the bundle runs, every test passes — only because neither module reads
+// the other's bindings during module evaluation. That is fragile: one top-level `const` that
+// reads the other side's export would turn it into a TDZ crash that only shows up at runtime in
+// the bundle, not in a type-check. A third, dependency-free module removes the cycle entirely.
+
+export const RESPONDER_CONFIG_FILE = 'responder.json'
+
+// What `start.sh` used to carry inside a bash script. Kept as data, in the dedicated profile,
+// at 0600: the answering session is fenced out of this folder, so nothing it reads can rewrite
+// which folder it serves or which settings file locks it down.
+export type ResponderConfig = {
+  version: 1
+  shareDir: string
+  identityHome: string
+  model: string
+  effort: string
+}
+
+// These values used to land inside a hand-rolled bash script (`start.sh`), where an unvalidated
+// --model/--effort (typed by hand, or passed through automation) could break out of the line it
+// was interpolated into. They now live in responder.json instead and reach `claude` as one
+// element of an argv array — spawned without a shell, so there is no line to break out of. Both
+// are still validated at write time (setupResponder) and again on every read
+// (readResponderConfig, in responder.ts), because the file sits on disk between runs and nothing
+// stops it from being hand-edited in between.
+//
+// --effort has a small, fixed set of valid values, so it is an allowlist.
+export const ALLOWED_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+
+// --model does not: a full model id such as "claude-haiku-4-5-20251001" is just as valid as
+// the short aliases, so an allowlist would reject legitimate values. This validates the shape
+// (letters, digits, dot, underscore, hyphen) instead, which is enough to keep a stored value
+// from ever looking like a second flag once it reaches `claude`'s own argv.
+export const SAFE_MODEL_PATTERN = /^[A-Za-z0-9._-]+$/

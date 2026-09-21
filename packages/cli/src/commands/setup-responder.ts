@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { CliError, type CliContext, type Output } from '../context'
 import { isSameOrWithin, resolveComparablePath } from '../fs-paths'
-import { RESPONDER_CONFIG_FILE, type ResponderConfig } from './responder'
+import { ALLOWED_EFFORTS, RESPONDER_CONFIG_FILE, SAFE_MODEL_PATTERN, type ResponderConfig } from './responder-config'
 
 export const REPLY_TOOL_NAME = 'mcp__plugin_agentbridge_agentbridge__reply'
 
@@ -72,23 +72,6 @@ This folder is shared through AgentBridge. People your owner authorized send que
 // a profile at `/tmp/mi respondedor` or a home with an apostrophe in it must still produce a
 // line that runs.
 export const quote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`
-
-// These values used to land inside a hand-rolled bash script (`start.sh`), where an unvalidated
-// --model/--effort (typed by hand, or passed through automation) could break out of the line it
-// was interpolated into. They now live in responder.json instead (see responder.ts) and reach
-// `claude` as one element of an argv array — spawned without a shell, so there is no line to
-// break out of. Both are still validated here, and again on every read (readResponderConfig),
-// because the file sits on disk between a `setup` and a `responder` run and nothing stops it
-// from being hand-edited in between.
-//
-// --effort has a small, fixed set of valid values, so it is an allowlist.
-export const ALLOWED_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
-
-// --model does not: a full model id such as "claude-haiku-4-5-20251001" is just as valid as
-// the short aliases, so an allowlist would reject legitimate values. This validates the shape
-// (letters, digits, dot, underscore, hyphen) instead, which is enough to keep a stored value
-// from ever looking like a second flag once it reaches `claude`'s own argv.
-export const SAFE_MODEL_PATTERN = /^[A-Za-z0-9._-]+$/
 
 export type CommandRunner = (
   command: string,

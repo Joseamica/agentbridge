@@ -608,11 +608,15 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
 
     const alreadyLoggedIn = checks.some((c) => c.name === 'Sesión iniciada en el perfil dedicado' && c.ok)
     // Q2/D2: `responder` replaces start.sh, so there is no path to quote here any more — only a
-    // command. A non-default --profile still has to be named, or the printed instruction would
-    // start the wrong (default) profile; that one flag is still quoted, the same rule every
-    // other path-carrying argument in this command follows (Minor 1).
+    // command. On the default profile (the overwhelmingly common case) the line has no path at
+    // all. A non-default --profile still has to be named, or the printed instruction would start
+    // the wrong (default) profile — printed PLAIN, not quoted: `quote()` wraps in POSIX single
+    // quotes, which `cmd.exe` does not treat as quoting at all, so a Windows path with a space
+    // would paste as two broken arguments instead of one correct one. A custom profile whose path
+    // itself contains a space is an accepted edge here; a quoting style that is wrong on a whole
+    // platform is not (review round 1, Important 4). Task 5 owns this file next and can do better.
     const defaultProfileHome = join(homedir(), '.agentbridge-responder')
-    const responderCommandLine = profileHome === defaultProfileHome ? `${CLI_COMMAND} responder` : `${CLI_COMMAND} responder --profile ${quote(profileHome)}`
+    const responderCommandLine = profileHome === defaultProfileHome ? `${CLI_COMMAND} responder` : `${CLI_COMMAND} responder --profile ${profileHome}`
     const remainingSteps = [
       ...(alreadyLoggedIn ? [] : [`Inicia sesión una vez en el perfil dedicado:  CLAUDE_CONFIG_DIR=${quote(setupResult.claudeConfigDir)} claude   (usa /login y sal)`]),
       `Arráncalo:  ${responderCommandLine}`,

@@ -1,24 +1,14 @@
-import { readFile } from 'node:fs/promises'
+import { readFile, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 import { CLI_COMMAND } from '@agentbridge/core'
 import { CliError, type CliContext, type Output } from '../context'
+import { isSameOrWithin } from '../fs-paths'
 import { defaultInteractiveRunner, type InteractiveRunner } from '../interactive'
-import { ALLOWED_EFFORTS, SAFE_MODEL_PATTERN } from './setup-responder'
+import { ALLOWED_EFFORTS, RESPONDER_CONFIG_FILE, SAFE_MODEL_PATTERN, type ResponderConfig } from './responder-config'
 
-export const RESPONDER_CONFIG_FILE = 'responder.json'
-
-// What `start.sh` used to carry inside a bash script. Kept as data, in the dedicated profile,
-// at 0600: the answering session is fenced out of this folder, so nothing it reads can rewrite
-// which folder it serves or which settings file locks it down.
-export type ResponderConfig = {
-  version: 1
-  shareDir: string
-  identityHome: string
-  model: string
-  effort: string
-}
+export { RESPONDER_CONFIG_FILE, type ResponderConfig } from './responder-config'
 
 export async function readResponderConfig(profileHome: string): Promise<ResponderConfig> {
   const path = join(resolve(profileHome), RESPONDER_CONFIG_FILE)
@@ -45,6 +35,21 @@ export async function readResponderConfig(profileHome: string): Promise<Responde
   }
   if (typeof c.shareDir !== 'string' || !c.shareDir || typeof c.identityHome !== 'string' || !c.identityHome) {
     throw new CliError(`El archivo de configuración del respondedor está incompleto. Vuelve a correr: ${CLI_COMMAND} setup`)
+  }
+  // `setupResponder` only ever writes `resolve()`d, mutually-exclusive paths here — but this
+  // file sits on disk between runs, reachable by a hand-edit or a future version, and the two
+  // things it names are not interchangeable with a stray value: a relative `shareDir` would
+  // silently serve whatever folder the person happened to run `responder` from, and an
+  // `identityHome` that is the shared folder (or inside it) does not fail to protect the secret
+  // key — it fences the answering session INTO the folder that holds it, the opposite of what
+  // `blockReadsOutsideWorkingDirectories` is there for. Re-running the same guard
+  // `setupResponder` performs at write time (see setup-responder.ts), reused rather than
+  // re-written, so the two can never disagree.
+  if (!isAbsolute(c.shareDir) || !isAbsolute(c.identityHome)) {
+    throw new CliError(`El archivo de configuración del respondedor tiene una ruta que no es absoluta. Vuelve a correr: ${CLI_COMMAND} setup`)
+  }
+  if (isSameOrWithin(c.identityHome, c.shareDir)) {
+    throw new CliError(`La configuración guardada dejaría tu identidad dentro de la carpeta compartida. Vuelve a correr: ${CLI_COMMAND} setup`)
   }
   // Re-validated on the way IN, not only on the way out. setup validates what it writes, but this
   // file sits on disk between runs and reaches `claude` as argv: a model string with a space in it
@@ -81,6 +86,23 @@ export async function runResponder(o: {
 }): Promise<number> {
   const profileHome = resolve(o.profileHome)
   const config = await readResponderConfig(profileHome)
+
+  // Checked here, before spawning, rather than inferred from the spawn's own failure: `spawn`
+  // raises the same ENOENT for a `cwd` that does not exist as it does for a binary that is not
+  // installed, and the InteractiveRunner has no way to tell the two apart (it is one Node error
+  // event either way). Without this check, a shared folder that was moved, renamed, or sits on
+  // an unmounted drive would be reported as "Claude Code is not installed" — sending the person
+  // to reinstall a program that already works. The folder path is safe to show here: it is
+  // exactly what this person chose during setup and is looking at right now, in a sentence that
+  // is about that folder — the constraint against printing it is about errors and logs leaking
+  // it incidentally, not this.
+  const shareInfo = await stat(config.shareDir).catch(() => null)
+  if (!shareInfo?.isDirectory()) {
+    throw new CliError(
+      `No encuentro la carpeta que compartes para contestar (${config.shareDir}). Puede que se haya movido, se haya renombrado, o esté en una unidad que no está conectada. Vuelve a correr: ${CLI_COMMAND} setup y elige una carpeta que exista.`,
+    )
+  }
+
   const env = {
     ...o.env,
     // The person's own identity and database, shared with every command they type — not a second
@@ -97,7 +119,13 @@ export async function runResponder(o: {
     { env, cwd: config.shareDir },
   )
   if (result.spawnFailed) {
-    throw new CliError('No encontré Claude Code en esta computadora. Instálalo desde claude.com/claude-code y vuelve a intentarlo.')
+    // Never a bare "no está instalado": the shared folder is already known-good at this point
+    // (checked above), so a spawn failure here is really about `claude` itself — but "not
+    // installed" and "installed, just not on this terminal's PATH" produce the exact same Node
+    // error event, and only one of those is fixed by reinstalling.
+    throw new CliError(
+      'No pude ejecutar Claude Code. Puede que no esté instalado, o que sí lo esté pero no aparezca en el PATH de esta terminal: cierra y vuelve a abrir la terminal, o instala Claude Code con su propio instalador (no por npm), y vuelve a intentarlo.',
+    )
   }
   if (result.code === null) {
     // Killed by a signal — Ctrl+C, which is exactly how a person stops this. Reporting it as a

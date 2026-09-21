@@ -15,7 +15,7 @@ import {
   setupResponderCommand,
   type CommandRunner,
 } from '../src/commands/setup-responder'
-import { RESPONDER_CONFIG_FILE } from '../src/commands/responder'
+import { readResponderConfig, RESPONDER_CONFIG_FILE } from '../src/commands/responder'
 import { CliError, memoryOutput } from '../src/context'
 
 let root: string
@@ -326,7 +326,7 @@ describe('setupResponder', () => {
     ).resolves.toBeDefined()
   })
 
-  // The device token (config.json), settings.json and start.sh all land under --home.
+  // The device token (config.json), settings.json and responder.json all land under --home.
   // blockReadsOutsideWorkingDirectories only fences reads to the session's cwd (--share), and
   // the two Read(**/.env*) denies only cover --share too — so a --home that is --share, or
   // inside it, leaves the token readable by a crafted question. Refused before anything is
@@ -386,7 +386,7 @@ describe('setupResponder', () => {
     // home directory, while the actual directory creation below still used plain resolve() —
     // so from a cwd inside the share, a quoted `--profile '~/ab-responder'` had the guard compare
     // an outside path (the real $HOME) while the code went on to actually create
-    // settings.json/start.sh/claude/ under a literal "~" folder INSIDE the share, and doctor
+    // settings.json/responder.json/claude/ under a literal "~" folder INSIDE the share, and doctor
     // would then report the setup as fine. If the two sides ever diverge like that again, this
     // either resolves (should have refused) or leaves the literal "~" folder on disk.
     it('refuses a ~-spelled --profile from a cwd inside the share, matching how it is actually resolved on disk', async () => {
@@ -413,13 +413,13 @@ describe('setupResponder', () => {
   it('stores a profile path with a space or an apostrophe as plain data, no quoting needed', async () => {
     const spaced = join(root, 'mi respondedor')
     const result = await setupResponder({ shareDir, repoDir, profileHome: spaced, identityHome, run: runner, out: memoryOutput() })
-    const config = JSON.parse(await readFile(result.configPath, 'utf8'))
-    expect(config.identityHome).toBe(identityHome)
+    expect(result.configPath).toBe(join(spaced, RESPONDER_CONFIG_FILE))
+    await expect(readResponderConfig(spaced)).resolves.toEqual({ version: 1, shareDir, identityHome, model: 'sonnet', effort: 'low' })
 
     const withApostrophe = join(root, "o'brien")
     const result2 = await setupResponder({ shareDir, repoDir, profileHome: withApostrophe, identityHome, run: runner, out: memoryOutput() })
-    const config2 = JSON.parse(await readFile(result2.configPath, 'utf8'))
-    expect(config2.identityHome).toBe(identityHome)
+    expect(result2.configPath).toBe(join(withApostrophe, RESPONDER_CONFIG_FILE))
+    await expect(readResponderConfig(withApostrophe)).resolves.toEqual({ version: 1, shareDir, identityHome, model: 'sonnet', effort: 'low' })
   })
 })
 
