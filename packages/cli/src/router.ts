@@ -3,6 +3,7 @@ import { ask, ticket } from './commands/ask'
 import { connect, link } from './commands/connect'
 import { approve, contacts, reject, requests, revoke, whoami } from './commands/contacts'
 import { doctorCommand } from './commands/doctor'
+import { responderCommand } from './commands/responder'
 import { setupCommand } from './commands/setup'
 import { setupResponderCommand } from './commands/setup-responder'
 import { CliError, type CliContext } from './context'
@@ -33,6 +34,7 @@ Preguntar:
   ${CLI_COMMAND} mcp                         (servidor MCP para Claude Code o Codex)
 
 Responder desde esta computadora:
+  ${CLI_COMMAND} responder [--profile <carpeta>]
   ${CLI_COMMAND} setup-responder --share <carpeta> [--profile <carpeta>] [--repo <carpeta>] [--model sonnet] [--effort low]
   ${CLI_COMMAND} doctor [--home <carpeta>] [--profile <carpeta>] [--share <carpeta>] [--repo <carpeta>]
 
@@ -41,6 +43,7 @@ Variable: AGENTBRIDGE_HOME (la carpeta con tu identidad y tu base de datos)`
 const COMMANDS: Record<string, Command> = {
   setup: setupCommand,
   'setup-responder': setupResponderCommand,
+  responder: responderCommand,
   doctor: doctorCommand,
   link,
   connect,

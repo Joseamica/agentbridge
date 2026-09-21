@@ -17,11 +17,12 @@ import {
   type Store,
 } from '@agentbridge/core'
 import { randomUUID } from 'node:crypto'
-import { access, constants, lstat, readdir, readFile, readlink, realpath, stat } from 'node:fs/promises'
+import { access, lstat, readdir, readFile, readlink, realpath, stat } from 'node:fs/promises'
 import { dirname, join, resolve, sep } from 'node:path'
 import { parseArgs } from 'node:util'
 import { CliError, type CliContext } from '../context'
 import { isSameOrWithin, resolveComparablePath, resolveNonExisting } from '../fs-paths'
+import { readResponderConfig, RESPONDER_CONFIG_FILE } from './responder'
 import { defaultRunner, REPLY_TOOL_NAME, RESPONDER_DENY, type CommandRunner } from './setup-responder'
 
 export type Check = { name: string; ok: boolean; detail: string }
@@ -144,7 +145,7 @@ async function identityCheck(o: { identityHome: string; shareDir?: string }): Pr
   if (!identity) {
     const looksLikeProfile =
       (await access(join(o.identityHome, 'settings.json')).then(() => true, () => false)) &&
-      (await access(join(o.identityHome, 'start.sh')).then(() => true, () => false))
+      (await access(join(o.identityHome, RESPONDER_CONFIG_FILE)).then(() => true, () => false))
     const detail = looksLikeProfile
       ? `Esa carpeta parece el perfil dedicado de Claude, no tu carpeta de identidad: pásala con --profile y deja --home para la que tiene identity.json.`
       : `Todavía no tienes una llave en esta computadora. Créala con: ${CLI_COMMAND} setup`
@@ -325,7 +326,7 @@ async function addShareChecks(
   if (o.profileHome) {
     // `blockReadsOutsideWorkingDirectories` fences reads to the session's cwd — which IS
     // shareDir — and the two Read(**/.env*) denies only cover shareDir too. If `--profile`
-    // (where settings.json and start.sh live) is the same folder as --share, or anywhere
+    // (where settings.json and responder.json live) is the same folder as --share, or anywhere
     // underneath it, none of that protects those files: they simply sit inside the fence
     // instead of outside it, readable by any crafted question. Compare resolved paths (not the
     // raw strings) so a relative path, `~`, a trailing slash, a symlink, or macOS's
@@ -339,7 +340,7 @@ async function addShareChecks(
       profileOutsideShare,
       profileOutsideShare
         ? 'sí'
-        : `--profile es la misma carpeta que --share o está dentro de ella: la sesión puede leer ahí settings.json y start.sh — permissions.blockReadsOutsideWorkingDirectories y las reglas Read(**/.env*) no protegen nada dentro de la carpeta compartida. Vuelve a correr: ${CLI_COMMAND} setup-responder --share <tu carpeta compartida> --profile <otra carpeta, fuera de ella>`,
+        : `--profile es la misma carpeta que --share o está dentro de ella: la sesión puede leer ahí settings.json y responder.json — permissions.blockReadsOutsideWorkingDirectories y las reglas Read(**/.env*) no protegen nada dentro de la carpeta compartida. Vuelve a correr: ${CLI_COMMAND} setup-responder --share <tu carpeta compartida> --profile <otra carpeta, fuera de ella>`,
     )
   }
 }
@@ -399,11 +400,22 @@ async function addProfileChecks(
       : `Deniega ${deny.join(', ')}; permite solo ${allow.join(', ') || 'nada'}; lecturas limitadas a la carpeta de trabajo`,
   )
 
-  const startPath = join(o.profileHome, 'start.sh')
-  const executable = await access(startPath, constants.X_OK)
-    .then(() => true)
-    .catch(() => false)
-  add('Script de arranque', executable, executable ? startPath : `No existe o no es ejecutable: ${startPath}`)
+  // What `start.sh`'s own executable-bit check used to stand in for: proof that this profile
+  // was actually prepared by setup-responder, not just a folder someone pointed --profile at.
+  // readResponderConfig does more than check existence — it re-validates the same shape setup
+  // wrote (see the comment on SAFE_MODEL_PATTERN in setup-responder.ts) — so a hand-edited or
+  // half-written responder.json is reported here rather than only failing later, mid-`responder`.
+  const configPath = join(o.profileHome, RESPONDER_CONFIG_FILE)
+  let configProblem: string | null = null
+  let configDetail = configPath
+  try {
+    const config = await readResponderConfig(o.profileHome)
+    configDetail = `${configPath} (modelo ${config.model}, esfuerzo ${config.effort})`
+  } catch (err) {
+    // readResponderConfig's own messages never carry a path or raw output — safe to show as-is.
+    configProblem = err instanceof Error ? err.message : String(err)
+  }
+  add('Configuración del respondedor', configProblem === null, configProblem ?? configDetail)
 
   const claudeConfigDir = join(o.profileHome, 'claude')
   const installedPath = join(claudeConfigDir, 'plugins', 'installed_plugins.json')

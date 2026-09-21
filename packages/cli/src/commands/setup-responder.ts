@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { CliError, type CliContext, type Output } from '../context'
 import { isSameOrWithin, resolveComparablePath } from '../fs-paths'
+import { RESPONDER_CONFIG_FILE, type ResponderConfig } from './responder'
 
 export const REPLY_TOOL_NAME = 'mcp__plugin_agentbridge_agentbridge__reply'
 
@@ -67,47 +68,27 @@ This folder is shared through AgentBridge. People your owner authorized send que
 - Always answer with the reply tool: copy the code exactly, list the files you used in source, and set confidence to seguro, creo or no_se. If the files do not contain the answer, say so with confidence no_se.
 `
 
-// Exported so setup.ts prints paths with the same quoting rule this file's own start script
-// and next-steps output use — a profile at `/tmp/mi respondedor` or a home with an apostrophe
-// in it must still produce a line that runs.
+// Exported so setup.ts prints paths with the same quoting rule its own printed commands need —
+// a profile at `/tmp/mi respondedor` or a home with an apostrophe in it must still produce a
+// line that runs.
 export const quote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`
 
-// start.sh is a 0755 script the owner is told to run; an unvalidated --model/--effort value
-// (typed by hand, or passed through automation) would otherwise land in that script verbatim.
-// Both are also quoted below like every other interpolation in this function, so even a value
-// that somehow slipped past validation would reach `claude` as one literal argument rather
-// than being able to break out.
+// These values used to land inside a hand-rolled bash script (`start.sh`), where an unvalidated
+// --model/--effort (typed by hand, or passed through automation) could break out of the line it
+// was interpolated into. They now live in responder.json instead (see responder.ts) and reach
+// `claude` as one element of an argv array — spawned without a shell, so there is no line to
+// break out of. Both are still validated here, and again on every read (readResponderConfig),
+// because the file sits on disk between a `setup` and a `responder` run and nothing stops it
+// from being hand-edited in between.
 //
 // --effort has a small, fixed set of valid values, so it is an allowlist.
 export const ALLOWED_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
 
 // --model does not: a full model id such as "claude-haiku-4-5-20251001" is just as valid as
-// the short aliases, so an allowlist would reject legitimate values. What actually neutralizes
-// injection is quoting plus refusing dangerous characters, not knowing the valid set — so this
-// validates the shape (letters, digits, dot, underscore, hyphen) rather than the value.
-const SAFE_MODEL_PATTERN = /^[A-Za-z0-9._-]+$/
-
-export function startScript(o: { shareDir: string; profileHome: string; identityHome: string; model: string; effort: string }): string {
-  return [
-    '#!/bin/bash',
-    'set -euo pipefail',
-    `cd ${quote(o.shareDir)}`,
-    // The identity and the database are the person's own, shared with every command they type
-    // (the spec keeps identity and state in one folder). Pointing this at the dedicated profile
-    // would give the answering side a second key and a second database: their own `requests`,
-    // `approve`, `reject` and `revoke` would read a store the channel never writes to, and they
-    // would have two links without knowing it.
-    `export AGENTBRIDGE_HOME=${quote(o.identityHome)}`,
-    // Claude's own profile, on the other hand, IS dedicated: its own config directory and its own
-    // locked-down settings.json, so a login and a permission set here never touch the person's
-    // everyday Claude Code.
-    `export CLAUDE_CONFIG_DIR=${quote(join(o.profileHome, 'claude'))}`,
-    'exec claude --dangerously-load-development-channels plugin:agentbridge@agentbridge-local \\',
-    `  --permission-mode dontAsk --settings ${quote(join(o.profileHome, 'settings.json'))} \\`,
-    `  --model ${quote(o.model)} --effort ${quote(o.effort)}`,
-    '',
-  ].join('\n')
-}
+// the short aliases, so an allowlist would reject legitimate values. This validates the shape
+// (letters, digits, dot, underscore, hyphen) instead, which is enough to keep a stored value
+// from ever looking like a second flag once it reaches `claude`'s own argv.
+export const SAFE_MODEL_PATTERN = /^[A-Za-z0-9._-]+$/
 
 export type CommandRunner = (
   command: string,
@@ -192,8 +173,9 @@ async function ensureOwnedDir(path: string, mode: number): Promise<void> {
 export async function setupResponder(o: {
   shareDir: string
   repoDir: string
-  // Claude's dedicated profile: settings.json, CLAUDE_CONFIG_DIR and start.sh. Never AgentBridge's
-  // identity or database — those live in identityHome, which this function only reads.
+  // Claude's dedicated profile: settings.json, CLAUDE_CONFIG_DIR and responder.json. Never
+  // AgentBridge's identity or database — those live in identityHome, which this function only
+  // reads.
   profileHome: string
   identityHome: string
   model?: string
@@ -208,7 +190,7 @@ export async function setupResponder(o: {
   // would duplicate — or, once already logged in, contradict — that summary. Defaults to true so
   // every existing (standalone) caller is unaffected.
   printNextSteps?: boolean
-}): Promise<{ startScriptPath: string; claudeConfigDir: string; settingsPath: string }> {
+}): Promise<{ configPath: string; claudeConfigDir: string; settingsPath: string }> {
   const shareDir = resolve(o.shareDir)
   const repoDir = resolve(o.repoDir)
   const profileHome = resolve(o.profileHome)
@@ -216,8 +198,8 @@ export async function setupResponder(o: {
 
   // Two separate refusals, because they are two different dangers with two different fixes.
   // `blockReadsOutsideWorkingDirectories` fences reads to the shared folder, so anything INSIDE
-  // it is readable by a crafted question: settings.json and start.sh would let someone rewrite
-  // what the responder is allowed to do, and identity.json is the secret key itself.
+  // it is readable by a crafted question: settings.json and responder.json would let someone
+  // rewrite what the responder is allowed to do, and identity.json is the secret key itself.
   const [profileReal, identityReal, shareReal] = await Promise.all([
     resolveComparablePath(o.profileHome),
     resolveComparablePath(o.identityHome),
@@ -225,7 +207,7 @@ export async function setupResponder(o: {
   ])
   if (isSameOrWithin(profileReal, shareReal)) {
     throw new CliError(
-      'El perfil dedicado no puede ser la carpeta compartida ni estar dentro de ella: ahí la sesión que responde puede leer y reescribir settings.json y start.sh. Pasa otra carpeta con --profile, fuera de la compartida.',
+      'El perfil dedicado no puede ser la carpeta compartida ni estar dentro de ella: ahí la sesión que responde puede leer y reescribir settings.json y responder.json. Pasa otra carpeta con --profile, fuera de la compartida.',
     )
   }
   if (isSameOrWithin(identityReal, shareReal)) {
@@ -268,9 +250,10 @@ export async function setupResponder(o: {
     await writeFile(personaPath, RESPONDER_PERSONA)
   }
 
-  const startScriptPath = join(profileHome, 'start.sh')
-  await writeFile(startScriptPath, startScript({ shareDir, profileHome, identityHome, model, effort }), { mode: 0o755 })
-  await chmod(startScriptPath, 0o755)
+  const configPath = join(profileHome, RESPONDER_CONFIG_FILE)
+  const config: ResponderConfig = { version: 1, shareDir, identityHome, model, effort }
+  await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 })
+  await chmod(configPath, 0o600)
 
   const env = { ...process.env, CLAUDE_CONFIG_DIR: claudeConfigDir }
   const steps: { args: string[]; target: string }[] = [
@@ -291,15 +274,15 @@ export async function setupResponder(o: {
 
   o.out.log(`Perfil del respondedor preparado en ${profileHome}`)
   if (o.printNextSteps ?? true) {
-    // Every path that goes into a command a person will paste is quoted with the same helper the
-    // start script uses: a profile at `/tmp/mi respondedor` or a home with an apostrophe in it must
-    // still produce a line that runs.
+    // No shell syntax and no path here: `responder` and `doctor` are real commands now, not a
+    // script to locate and a line to quote correctly for whatever shell the person happens to
+    // be using — see D2 in the plan this task implements.
     o.out.log('Siguientes pasos:')
-    o.out.log(`  1. Inicia sesión una vez en el perfil dedicado:  CLAUDE_CONFIG_DIR=${quote(claudeConfigDir)} claude   (usa /login y sal)`)
-    o.out.log(`  2. Arranca el respondedor:  ${quote(startScriptPath)}   (acepta la confirmación del canal de desarrollo)`)
-    o.out.log(`  3. Verifica:  ${CLI_COMMAND} doctor --home ${quote(identityHome)} --profile ${quote(profileHome)} --share ${quote(shareDir)} --repo ${quote(repoDir)}`)
+    o.out.log(`  1. Inicia sesión una vez en el perfil dedicado:  ${CLI_COMMAND} setup   (lo hace por ti)`)
+    o.out.log(`  2. Ponte a contestar:  ${CLI_COMMAND} responder`)
+    o.out.log(`  3. Verifica:  ${CLI_COMMAND} doctor`)
   }
-  return { startScriptPath, claudeConfigDir, settingsPath }
+  return { configPath, claudeConfigDir, settingsPath }
 }
 
 // Where the plugin bundle actually lives, relative to whatever is currently running this

@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { plainSocketFactory, startFakeBoard, type FakeBoard } from '../../core/test/support/fake-board'
 import { runDoctor } from '../src/commands/doctor'
+import { RESPONDER_CONFIG_FILE } from '../src/commands/responder'
 
 // The production policy only accepts wss://, and the fake board speaks ws:// on loopback. This is
 // the same three-line policy every other suite uses; importing it across the tests/ tree would tie
@@ -69,7 +70,7 @@ describe('runDoctor without an identity', () => {
   it('says a dedicated profile was mistaken for the identity home', async () => {
     await mkdir(profileHome, { recursive: true })
     await writeFile(join(profileHome, 'settings.json'), '{}')
-    await writeFile(join(profileHome, 'start.sh'), '#!/bin/bash\n')
+    await writeFile(join(profileHome, RESPONDER_CONFIG_FILE), '{}')
     const checks = await runDoctor({ ...doctorOptions(), identityHome: profileHome })
     expect(check(checks, 'Llave de AgentBridge').detail).toContain('--profile')
   })

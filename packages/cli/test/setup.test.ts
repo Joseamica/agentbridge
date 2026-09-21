@@ -1,9 +1,10 @@
-import { decodeLink, getProfile, loadIdentity, loadOrCreateIdentity, openStore, sanitizeRelayList, setProfile } from '@agentbridge/core'
+import { CLI_COMMAND, decodeLink, getProfile, loadIdentity, loadOrCreateIdentity, openStore, sanitizeRelayList, setProfile } from '@agentbridge/core'
 import { access, mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { plainSocketFactory, startFakeBoard, type FakeBoard } from '../../core/test/support/fake-board'
+import { RESPONDER_CONFIG_FILE } from '../src/commands/responder'
 import { applyRelays, runSetup, setupCommand, type SetupContext } from '../src/commands/setup'
 import { memoryOutput, PromptEOF } from '../src/context'
 
@@ -158,12 +159,13 @@ describe('the answering side', () => {
     const { prompt, expectDrained } = scripted(['1', shareDir, ''])
     await runSetup(context({ prompt }))
     expectDrained()
-    await expect(access(join(profileHome, 'start.sh'))).resolves.toBeUndefined()
+    await expect(access(join(profileHome, RESPONDER_CONFIG_FILE))).resolves.toBeUndefined()
     await expect(access(join(shareDir, 'CLAUDE.md'))).resolves.toBeUndefined()
     // Q1: the dedicated folder is Claude's profile, not a second AgentBridge home.
     await expect(access(join(profileHome, 'identity.json'))).rejects.toThrow()
     await expect(access(join(profileHome, 'agentbridge.db'))).rejects.toThrow()
-    expect(await readFile(join(profileHome, 'start.sh'), 'utf8')).toContain(`export AGENTBRIDGE_HOME='${identityHome}'`)
+    const config = JSON.parse(await readFile(join(profileHome, RESPONDER_CONFIG_FILE), 'utf8'))
+    expect(config.identityHome).toBe(identityHome)
   })
 
   it('refuses a shared folder that would contain the identity', async () => {
@@ -183,10 +185,9 @@ describe('the answering side', () => {
     expect(text).toMatch(/dáselo|pásaselo|mándaselo/i)
   })
 
-  it('quotes a profile path with a space so the printed next steps still run (Minor 1)', async () => {
-    // setup-responder.ts's own next-steps output already quotes every path this way; setup.ts
-    // hand-wrote its own unquoted version of the same lines, which a profile at a path with a
-    // space (or an apostrophe) would break when pasted.
+  it('quotes a non-default profile path with a space so the printed responder command still runs (Minor 1)', async () => {
+    // `responder` (not start.sh) is what gets printed now; a non-default --profile still has to
+    // be named on that line, or the printed command would start the wrong (default) profile.
     await seedIdentityAndProfile()
     const spacedProfile = join(root, 'mi respondedor')
     const out = memoryOutput()
@@ -194,7 +195,7 @@ describe('the answering side', () => {
     await runSetup(context({ prompt, out, profileHome: spacedProfile }))
     expectDrained()
     const text = out.lines.join('\n')
-    expect(text).toContain(`'${join(spacedProfile, 'start.sh')}'`)
+    expect(text).toContain(`${CLI_COMMAND} responder --profile '${spacedProfile}'`)
   })
 
   it("lists doctor's failing checks as pending work instead of claiming it is done", async () => {
@@ -282,7 +283,7 @@ describe('the shared-folder protection', () => {
     await expect(runSetup(context({ prompt }))).rejects.toThrow(/llave/i)
   })
 
-  it('refuses a folder that would contain the dedicated profile, naming settings/start.sh — not the key — as the stake', async () => {
+  it('refuses a folder that would contain the dedicated profile, naming settings/responder.json — not the key — as the stake', async () => {
     await seedIdentityAndProfile()
     // A folder that contains only the (custom) profile home, not the identity home: root also
     // holds identityHome as a sibling, so the conflict must be scoped to a fresh subtree.
@@ -292,7 +293,7 @@ describe('the shared-folder protection', () => {
     const err: unknown = await runSetup(context({ prompt, profileHome: conflictProfileHome })).catch((e) => e)
     expect(err).toBeInstanceOf(Error)
     expect((err as Error).message).toMatch(/settings\.json/)
-    expect((err as Error).message).toMatch(/start\.sh/)
+    expect((err as Error).message).toMatch(/responder\.json/)
     // The overclaim this replaces: the profile branch holds no key, so it must not say so.
     expect((err as Error).message).not.toMatch(/llave secreta es tu identidad entera/)
   })
@@ -373,16 +374,18 @@ describe('--relays', () => {
     store.close()
   })
 
-  it('never touches the dedicated profile or start.sh (I5)', async () => {
+  it('never touches the dedicated profile or its saved configuration (I5)', async () => {
     // The bug this closes: following doctor's own remediation line used to fall through into the
     // whole guided interview, and pressing Enter at its folder prompt — the quick start's own
-    // worked example for that exact prompt — silently repointed start.sh at a brand-new, empty
-    // folder. Proving --relays never touches either file is the regression test for that.
+    // worked example for that exact prompt — silently repointed the profile's saved config at a
+    // brand-new, empty folder. Proving --relays never touches it is the regression test for that.
     await seedIdentityAndProfile()
     await mkdir(profileHome, { recursive: true })
-    const startPath = join(profileHome, 'start.sh')
-    await writeFile(startPath, '#!/bin/bash\necho el original\n', { mode: 0o755 })
-    const before = await readFile(startPath, 'utf8')
+    const configPath = join(profileHome, RESPONDER_CONFIG_FILE)
+    await writeFile(configPath, '{"version":1,"shareDir":"/original","identityHome":"/original-id","model":"sonnet","effort":"low"}\n', {
+      mode: 0o600,
+    })
+    const before = await readFile(configPath, 'utf8')
     const beforeEntries = new Set(await import('node:fs/promises').then((fs) => fs.readdir(profileHome)))
 
     await setupCommand(['--relays', 'wss://nuevo.example'], {
@@ -393,7 +396,7 @@ describe('--relays', () => {
       createSocket: plainSocketFactory,
     })
 
-    expect(await readFile(startPath, 'utf8')).toBe(before)
+    expect(await readFile(configPath, 'utf8')).toBe(before)
     const afterEntries = new Set(await import('node:fs/promises').then((fs) => fs.readdir(profileHome)))
     expect(afterEntries).toEqual(beforeEntries)
   })

@@ -363,7 +363,7 @@ export type ShareDirAssessment = {
   credentialConflict: string | null
   // What is actually at stake in `credentialConflict`, since it is not the same thing for the two
   // branches: the identity folder holds the secret key itself, but the dedicated profile (Q1 of
-  // this plan) holds no key or database at all — only settings.json and start.sh, which control
+  // this plan) holds no key or database at all — only settings.json and responder.json, which control
   // what the answering session is allowed to do. A caller that prints one message for both would
   // overclaim for the profile branch.
   credentialConflictKind: 'identity' | 'profile' | null
@@ -552,7 +552,7 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
       const stake =
         assessment.credentialConflictKind === 'identity'
           ? 'Tu llave secreta es tu identidad entera: quien la lea puede hacerse pasar por ti en cualquier tablero, para siempre, y no hay forma de revocarla.'
-          : 'Ahí viven settings.json y start.sh, que controlan qué puede hacer la sesión que contesta preguntas: quien los lea o los reescriba podría aflojar sus permisos o cambiar qué corre.'
+          : 'Ahí viven settings.json y responder.json, que controlan qué puede hacer la sesión que contesta preguntas: quien los lea o los reescriba podría aflojar sus permisos o cambiar qué corre.'
       throw new CliError(`Ahí dentro está ${assessment.credentialConflict}. ${stake} Vuelve a correr "${CLI_COMMAND} setup" con otra carpeta.`)
     }
     if (assessment.reasons.length > 0) {
@@ -607,9 +607,15 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     out.log('')
 
     const alreadyLoggedIn = checks.some((c) => c.name === 'Sesión iniciada en el perfil dedicado' && c.ok)
+    // Q2/D2: `responder` replaces start.sh, so there is no path to quote here any more — only a
+    // command. A non-default --profile still has to be named, or the printed instruction would
+    // start the wrong (default) profile; that one flag is still quoted, the same rule every
+    // other path-carrying argument in this command follows (Minor 1).
+    const defaultProfileHome = join(homedir(), '.agentbridge-responder')
+    const responderCommandLine = profileHome === defaultProfileHome ? `${CLI_COMMAND} responder` : `${CLI_COMMAND} responder --profile ${quote(profileHome)}`
     const remainingSteps = [
       ...(alreadyLoggedIn ? [] : [`Inicia sesión una vez en el perfil dedicado:  CLAUDE_CONFIG_DIR=${quote(setupResult.claudeConfigDir)} claude   (usa /login y sal)`]),
-      `Arráncalo:  ${quote(setupResult.startScriptPath)}`,
+      `Arráncalo:  ${responderCommandLine}`,
       'Dale tu enlace a quien vaya a preguntarte.',
     ]
     out.log('Para terminar de dejarlo contestando, en este orden:')
@@ -620,10 +626,7 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     for (const c of checks) {
       if (!c.ok) pending.push(`${c.name}: ${c.detail}`)
     }
-    // Quoted like every other printed path in this command (Minor 1): a profile at
-    // `/tmp/mi respondedor`, or a home with an apostrophe in it, must still be a line that runs
-    // when pasted, not just when the default path happens to have neither.
-    pending.push(`Arranca el respondedor: ${quote(setupResult.startScriptPath)}`)
+    pending.push(`Arranca el respondedor: ${responderCommandLine}`)
     pending.push('Dale tu enlace a quien vaya a preguntarte.')
   }
 
