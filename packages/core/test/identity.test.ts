@@ -49,6 +49,20 @@ describe('local identity', () => {
     expect((await stat(join(home, IDENTITY_FILE))).mode & 0o777).toBe(0o600)
   })
 
+  it('leaves a key that is already stricter than 0600 exactly as it is, and never widens it', async () => {
+    // The repair above only ever removes bits. Someone who deliberately made their key read-only
+    // to its owner (0400), or who keeps the home at 0500, must not have that undone by a tool
+    // whose entire justification is protecting the key — a "repair" that loosens permissions on a
+    // secret is worse than no repair at all, and it would be invisible: nothing would report it.
+    const home = await newHome()
+    await loadOrCreateIdentity(home)
+    await chmod(join(home, IDENTITY_FILE), 0o400)
+    await chmod(home, 0o500)
+    await loadOrCreateIdentity(home)
+    expect((await stat(home)).mode & 0o777).toBe(0o500)
+    expect((await stat(join(home, IDENTITY_FILE))).mode & 0o777).toBe(0o400)
+  })
+
   it('never produces two identities when several callers race in one process, and leaves no temp files', async () => {
     const home = await newHome()
     const results = await Promise.all(Array.from({ length: 6 }, () => loadOrCreateIdentity(home)))
