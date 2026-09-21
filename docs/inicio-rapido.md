@@ -76,11 +76,11 @@ Eso es todo lo que hay que escribir para dejarlo instalado. Lo demás son pregun
   tenga tu permiso puede leer todo lo que esté ahí dentro**, así que pon copias de lo que quieras
   compartir, nunca tu carpeta de trabajo. Te propone una carpeta nueva (`AgentBridge/compartido`,
   dentro de tu carpeta de usuario): con Enter la aceptas, y antes de crear nada te muestra la ruta
-  completa y te pide confirmarla. Si eliges una que se ve peligrosa te
-  dice exactamente por qué y te hace escribir `CONFIRMAR` para seguir, o de plano se niega. Lo que
-  cuenta como peligrosa: tu carpeta de usuario, un repositorio con `.git`, archivos con pinta de
-  credenciales, enlaces simbólicos (no mira qué hay del otro lado), un `node_modules` que no
-  revisó por dentro, y una carpeta tan grande o tan anidada que no alcanzó a revisarla completa.
+  completa y te pide confirmarla. Si eliges una que se ve peligrosa te dice exactamente por qué y
+  te hace escribir `CONFIRMAR` para seguir, o de plano se niega. Lo que cuenta como peligrosa: tu
+  carpeta de usuario, un repositorio con `.git`, archivos con pinta de credenciales, enlaces
+  simbólicos (no mira qué hay del otro lado), un `node_modules` que no revisó por dentro, y una
+  carpeta tan grande o tan anidada que no alcanzó a revisarla completa.
 
 Si vas a preguntar, también te pregunta si ya tienes el enlace de la otra persona (y, si lo tienes,
 te lo pide y se conecta ahí mismo) y si quieres que registre la herramienta dentro de tu Claude
@@ -95,8 +95,8 @@ Sin que tú ejecutes nada aparte. Si dijiste que vas a **contestar**:
   vuelves a la terminal. Después comprueba solo si la sesión de verdad quedó iniciada.
 - **Deja la carpeta lista**, con los permisos que impiden que esa sesión corra comandos, edite
   archivos o salga a internet.
-- **Revisa que todo esté bien** y te dice **solo** lo que te impide contestar. El reporte completo
-  es de `doctor`, no de este momento.
+- **Revisa que todo esté bien** y te dice **solo** lo que necesitas atender. El reporte completo es
+  de `doctor`, no de este momento.
 - **Te copia tu enlace al portapapeles**, para que se lo pases a quien quieras que pueda
   preguntarte.
 - Y al final, **si le dices que sí, te pone a contestar** ahí mismo. Esa terminal se queda

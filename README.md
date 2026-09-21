@@ -177,8 +177,8 @@ never creates that folder silently.
 Then it *performs* the rest instead of printing it. It opens Claude's login in the dedicated
 profile — the browser opens, you type your password, you come back — and afterwards checks for
 itself whether a session actually exists. It copies your link to the clipboard. It registers the
-MCP server if you say yes. It runs every `doctor` check and tells you only the ones that stop you
-from answering, not the full diagnostic. It ends with a short verdict — what's ready, what's still
+MCP server if you say yes. It runs every `doctor` check and speaks up only about the ones that
+need you to do something, not the full diagnostic. It ends with a short verdict — what's ready, what's still
 pending — and then, if nothing is blocking, offers to start answering right there: say yes and that
 terminal becomes the responder.
 
