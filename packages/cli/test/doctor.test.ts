@@ -1,4 +1,4 @@
-import { loadOrCreateIdentity, openStore, recordIncomingRequest, setProfile } from '@agentbridge/core'
+import { CLI_COMMAND, loadOrCreateIdentity, openStore, recordIncomingRequest, setProfile } from '@agentbridge/core'
 import { chmod, mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -364,7 +364,9 @@ describe('runDoctor login remediation text', () => {
     const perfil = check(checks, 'Sesión iniciada en el perfil dedicado')
     expect(perfil.ok).toBe(false)
     expect(perfil.detail).not.toMatch(/CLAUDE_CONFIG_DIR=/)
-    expect(perfil.detail).toContain('setup')
+    // Not just the word "setup" — a regression back to a bare `corre setup` (the exact defect
+    // this test exists to kill) would still contain the word "setup" and pass a looser assertion.
+    expect(perfil.detail).toContain(CLI_COMMAND)
   })
 })
 
@@ -382,6 +384,21 @@ describe('cloudSyncedPath', () => {
     expect(cloudSyncedPath('/home/j/Google Drive/ab')).toBe('Google Drive')
   })
 
+  // I1: since macOS 12.3, OneDrive/Dropbox/Google Drive all mount under
+  // ~/Library/CloudStorage with NO spaces around the hyphen — "OneDrive-Contoso", not
+  // "OneDrive - Contoso" — and Dropbox Business has always used "Dropbox (Company)". A macOS
+  // user in any of these gets no warning at all if only the Windows spelling is recognised,
+  // which is exactly the silent-upload failure this check exists to prevent.
+  it('spots the real macOS CloudStorage spellings, with no spaces around the hyphen', () => {
+    expect(cloudSyncedPath('/Users/ana/Library/CloudStorage/OneDrive-Contoso/ab')).toBe('OneDrive')
+    expect(cloudSyncedPath('/Users/ana/Library/CloudStorage/GoogleDrive-ana@gmail.com/Shared drives/x/ab')).toBe('Google Drive')
+  })
+
+  it('spots Dropbox Business, spelled "Dropbox (Company)"', () => {
+    expect(cloudSyncedPath('/home/j/Dropbox (Contoso)/ab')).toBe('Dropbox')
+    expect(cloudSyncedPath('/home/j/Dropbox (Personal)/ab')).toBe('Dropbox')
+  })
+
   it('does not fire on a folder that merely contains the word', () => {
     // "mi-onedrive-notas" is not OneDrive, and a false alarm about a secret key is a sentence
     // that makes a person distrust every other line doctor prints.
@@ -395,8 +412,14 @@ describe('doctor on Windows', () => {
     const home = join(root, 'win')
     await seedIdentity(home)
     await chmod(join(home, 'identity.json'), 0o666)
+    // I5: the directory too, not only the file. loadOrCreateIdentity creates the home at 0700, so
+    // an implementation that skipped only the file-mode comparison (and left the directory one
+    // running) would still land on the success branch and this test would not have caught it —
+    // the person's actual reported message had both halves: "la llave está en 666 ... · su
+    // carpeta está en 666".
+    await chmod(home, 0o755)
     const checks = await runDoctor(doctorOptions({ identityHome: home, platform: 'win32' }))
-    expect(check(checks, 'Llave de AgentBridge').detail).not.toMatch(/0600|0700|666/)
+    expect(check(checks, 'Llave de AgentBridge').detail).not.toMatch(/0600|0700|666|755/)
   })
 
   it('still asks for them on macOS and Linux', async () => {
@@ -419,6 +442,10 @@ describe('doctor on Windows', () => {
     // does not un-upload it; telling them what happened and how to move it does.
     expect(warning.blocking).toBe(false)
     expect(warning.detail).toMatch(/OneDrive/)
+    // M4: the temp home literally contains "OneDrive" as a path segment, so a detail that printed
+    // the whole path would also match /OneDrive/ above. This is the assertion that actually pins
+    // "name the provider, never the path".
+    expect(warning.detail).not.toContain(home)
   })
 
   it('says nothing about the cloud when the folder is an ordinary one', async () => {
@@ -429,11 +456,35 @@ describe('doctor on Windows', () => {
   })
 })
 
+describe('the cloud warning fires on every platform, not only Windows', () => {
+  // I4: the push is deliberately not gated on `platform` — iCloud Drive syncs macOS home folders
+  // too — but the only cloud-shaped test above runs on win32. Wrapping the push in
+  // `if (platform === 'win32')` would keep every other test green while silently deleting this
+  // half of the feature, including the `iCloud` entry, which can only ever match on macOS.
+  it('warns about a cloud-synced folder on macOS too', async () => {
+    const home = join(root, 'OneDrive', '.agentbridge')
+    await seedIdentity(home)
+    const checks = await runDoctor(doctorOptions({ identityHome: home, platform: 'darwin' }))
+    const warning = check(checks, 'Carpeta sincronizada con la nube')
+    expect(warning.ok).toBe(false)
+    expect(warning.blocking).toBe(false)
+    expect(warning.detail).toMatch(/OneDrive/)
+  })
+})
+
 describe('what blocks and what does not', () => {
-  it('marks a missing key as blocking and a single unreachable board as not', async () => {
+  it('marks a missing key as blocking; the board loop below is vacuous by construction', async () => {
+    // M5: with no identity, runDoctor never enters the board loop at all (it is gated on
+    // `identityResult.identity`), so the filter below is `[]` and the `for` body never runs — it
+    // proves nothing about per-board blocking. That is covered for real by 'marks the aggregate
+    // board check as blocking only when every board fails' and the mixed-board test below.
     const checks = await runDoctor(doctorOptions({ identityHome: join(root, 'vacia'), platform: 'darwin' }))
     expect(check(checks, 'Llave de AgentBridge').blocking).toBe(true)
     for (const c of checks.filter((c) => c.name.startsWith('Tablero '))) expect(c.blocking).toBe(false)
+    // I3: `[].every(...)` is `true`, so a missing `boardChecks.length > 0` guard would fire the
+    // aggregate on every run where the board loop never executed at all — telling a brand-new
+    // person with no key to check their internet connection instead of to create one.
+    expect(checks.find((c) => c.name === 'Tableros públicos')).toBeUndefined()
   })
 
   it('marks the aggregate board check as blocking only when every board fails', async () => {
@@ -456,9 +507,49 @@ describe('what blocks and what does not', () => {
     expect(aggregate.blocking).toBe(true)
   })
 
+  it('does not fire the aggregate check when boards are mixed: one works, one does not', async () => {
+    // I2: with one board down and one up, `every(c => !c.ok)` is false and `some(c => !c.ok)` is
+    // true. The other two tests here use all-fail and all-pass relay lists, so both give the
+    // identical answer under `every` or `some` — only a genuinely mixed case tells them apart.
+    await seedIdentity()
+    const store = await openStore(identityHome, { relayPolicy: allowAnyRelay })
+    setProfile(store, { relays: [board.url, 'ws://127.0.0.1:1'], now: 1_700_000_003 })
+    store.close()
+    const checks = await runDoctor(doctorOptions())
+    const boardChecks = checks.filter((c) => c.name.startsWith('Tablero '))
+    expect(boardChecks.some((c) => c.ok)).toBe(true)
+    expect(boardChecks.some((c) => !c.ok)).toBe(true)
+    expect(checks.find((c) => c.name === 'Tableros públicos')).toBeUndefined()
+  })
+
   it('does not add the aggregate board check when at least one board works', async () => {
     await seedIdentity()
     const checks = await runDoctor(doctorOptions())
     expect(checks.find((c) => c.name === 'Tableros públicos')).toBeUndefined()
+  })
+})
+
+describe('Llave de AgentBridge: blocking follows the risk, not the check', () => {
+  // I6: a permission bit is hygiene — the key still works, and loadOrCreateIdentity now
+  // self-repairs it on its next load (see identity.test.ts) — so it must not stop a working
+  // install. Only the key actually sitting inside the shared folder, where any incoming question
+  // can read it, blocks.
+  it('does not block on a permission bit alone', async () => {
+    await seedIdentity()
+    await chmod(join(identityHome, 'identity.json'), 0o644)
+    const key = check(await runDoctor(doctorOptions()), 'Llave de AgentBridge')
+    expect(key.ok).toBe(false)
+    expect(key.blocking).toBe(false)
+    // The remedy has to name a real command now that it exists: re-running setup tightens the
+    // mode automatically instead of asking for a chmod we are not allowed to print.
+    expect(key.detail).toContain(CLI_COMMAND)
+  })
+
+  it('blocks when the key sits inside the shared folder', async () => {
+    const inside = join(shareDir, 'identidad')
+    await seedIdentity(inside)
+    const key = check(await runDoctor({ ...doctorOptions(), identityHome: inside, shareDir }), 'Llave de AgentBridge')
+    expect(key.ok).toBe(false)
+    expect(key.blocking).toBe(true)
   })
 })

@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { chmod, link, mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
+import { chmod, link, mkdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { decode, nprofileEncode } from 'nostr-tools/nip19'
 import { generateSecretKey, getPublicKey } from 'nostr-tools/pure'
@@ -47,13 +47,33 @@ export async function loadIdentity(home: string): Promise<Identity | null> {
   return parseIdentityFile(raw, file)
 }
 
+// Windows has no POSIX permission bits — `stat().mode` reports 666/777 there regardless of what
+// chmod would do — so this only ever runs on POSIX. It only ever tightens: a mode that already
+// has no bits outside `target` (0600 itself, or something stricter like 0400) is left exactly as
+// it is, so a person who deliberately locked a file down further never gets it loosened back.
+async function tightenIfTooOpen(path: string, target: number): Promise<void> {
+  if (process.platform === 'win32') return
+  const info = await stat(path).catch(() => null)
+  if (!info) return
+  const mode = info.mode & 0o777
+  if ((mode & ~target) !== 0) await chmod(path, target)
+}
+
 // The key is written completely to a private temporary file first and then hard-linked into
 // place. link() fails with EEXIST when identity.json already exists, so concurrent creators —
 // threads or separate processes — can never leave two identities or a half-written file: the
 // loser reads the winner's key.
 export async function loadOrCreateIdentity(home: string): Promise<{ identity: Identity; created: boolean }> {
   const existing = await loadIdentity(home)
-  if (existing) return { identity: existing, created: false }
+  if (existing) {
+    // An identity created before this repair existed, or loosened by a sync client, a backup
+    // restore, or a hand-edit, is tightened on the very next load rather than left to fail
+    // `doctor`'s permission check forever. This is what lets that check's own remedy text
+    // truthfully say "re-run setup" instead of naming a chmod command we are not allowed to print.
+    await tightenIfTooOpen(home, 0o700)
+    await tightenIfTooOpen(join(home, IDENTITY_FILE), 0o600)
+    return { identity: existing, created: false }
+  }
   await mkdir(home, { recursive: true, mode: 0o700 })
   await chmod(home, 0o700)
   const file = join(home, IDENTITY_FILE)

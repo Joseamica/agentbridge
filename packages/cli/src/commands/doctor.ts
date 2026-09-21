@@ -153,9 +153,15 @@ export function cloudSyncedPath(path: string): string | null {
   // a macOS test asks it, or the Windows behaviour would only ever be exercised on Windows.
   const parts = path.split(/[\\/]+/).map((p) => p.trim().toLowerCase())
   for (const folder of CLOUD_FOLDERS) {
-    // `startsWith` on the segment, not on the path: OneDrive's business variant is a real folder
-    // called "OneDrive - Contoso", and that one syncs exactly like the personal one.
-    if (parts.some((p) => folder.segments.some((s) => p === s || p.startsWith(`${s} -`)))) return folder.label
+    // Three separators after the name, not just " -": the classic Windows/personal mount is
+    // "OneDrive - Contoso" (space-hyphen-space), but since macOS 12.3 the same three clients
+    // mount under ~/Library/CloudStorage as "OneDrive-Contoso" (no spaces at all — space would
+    // break the macOS filesystem's own folder-picker autocomplete), and Dropbox Business has
+    // always used "Dropbox (Company)". All three are real, current folder names for the same
+    // syncing clients this check exists to catch — never `${s} -` alone, or the macOS spelling
+    // (which is the one macOS users actually have) silently passes with no warning.
+    if (parts.some((p) => folder.segments.some((s) => p === s || p.startsWith(`${s} -`) || p.startsWith(`${s}-`) || p.startsWith(`${s} (`))))
+      return folder.label
   }
   return null
 }
@@ -193,6 +199,11 @@ async function identityCheck(o: {
   }
 
   const problems: string[] = []
+  // Tracked separately from `problems` because it alone decides `blocking` below: a permission
+  // bit is hygiene (loadOrCreateIdentity now self-repairs it — see tightenIfTooOpen in
+  // @agentbridge/core — so re-running setup truly fixes it), but a key inside the shared folder
+  // is already readable by anyone who can ask a question, which is what `blocking` means.
+  let insideShare = false
   // Windows has no POSIX permission bits: `stat().mode` reports 666 on every single file, so
   // this check can only ever produce a demand nobody can satisfy. What protects the key there is
   // the user profile's own ACL, which we do not weaken. The real risk on Windows is the folder
@@ -212,9 +223,17 @@ async function identityCheck(o: {
       resolveComparablePath(o.shareDir),
     ])
     if (isSameOrWithin(keyReal, shareReal)) {
-      problems.push('tu llave está dentro de la carpeta compartida, donde cualquier pregunta puede leerla: muévela fuera y vuelve a correr setup')
+      insideShare = true
+      // Every remediation line names a command a person can paste, with CLI_COMMAND — never a
+      // bare "vuelve a correr setup".
+      problems.push(`tu llave está dentro de la carpeta compartida, donde cualquier pregunta puede leerla: muévela fuera y vuelve a correr ${CLI_COMMAND} setup`)
     }
   }
+  // A permission-bit problem alone is not named as its own remedy above (unlike the share-escape
+  // line), so it needs one here — and it can honestly point at `setup`, because loadOrCreateIdentity
+  // now tightens an over-open home or key on its very next load rather than leaving doctor's
+  // complaint permanent.
+  if (problems.length > 0 && !insideShare) problems.push(`lo arregla: ${CLI_COMMAND} setup`)
   return {
     // Only claims what was actually checked: an ordinary `doctor` run has no --share, so saying
     // "outside the shared folder" there would be a verdict nobody reached. On Windows, 0600 is
@@ -222,7 +241,11 @@ async function identityCheck(o: {
     check: {
       name: 'Llave de AgentBridge',
       ok: problems.length === 0,
-      blocking: true,
+      // A wrong permission bit does not stop anyone from answering a question — the key still
+      // works — so only the key actually sitting inside the shared folder blocks. Success is
+      // still `true`: nothing here failed, so there is nothing "worth knowing but not fatal" to
+      // distinguish it from.
+      blocking: problems.length === 0 ? true : insideShare,
       detail: problems.length
         ? problems.join(' · ')
         : o.platform === 'win32'
@@ -231,7 +254,7 @@ async function identityCheck(o: {
             : 'presente'
           : o.shareDir
             ? 'presente, en 0600, y fuera de la carpeta compartida'
-            : 'presente y en 0600 (para revisar que esté fuera de la carpeta compartida, corre doctor con --share)',
+            : `presente y en 0600 (para revisar que esté fuera de la carpeta compartida, corre ${CLI_COMMAND} doctor --share <carpeta>)`,
     },
     identity,
   }

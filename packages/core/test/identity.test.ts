@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { mkdtemp, readdir, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readdir, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { promisify } from 'node:util'
@@ -33,6 +33,20 @@ describe('local identity', () => {
 
   it('returns null when no identity exists yet', async () => {
     expect(await loadIdentity(await newHome())).toBeNull()
+  })
+
+  it('tightens an existing home and key it finds too open, so doctor\'s remedy text (re-run setup) is true', async () => {
+    const home = await newHome()
+    const { identity } = await loadOrCreateIdentity(home)
+    // Simulates a sync client, a backup restore, or a hand-edit loosening things after creation —
+    // not this function's own doing, which already writes 0700/0600 from the start (proven above).
+    await chmod(home, 0o755)
+    await chmod(join(home, IDENTITY_FILE), 0o644)
+    const second = await loadOrCreateIdentity(home)
+    expect(second.created).toBe(false)
+    expect(second.identity.publicKey).toBe(identity.publicKey)
+    expect((await stat(home)).mode & 0o777).toBe(0o700)
+    expect((await stat(join(home, IDENTITY_FILE))).mode & 0o777).toBe(0o600)
   })
 
   it('never produces two identities when several callers race in one process, and leaves no temp files', async () => {
