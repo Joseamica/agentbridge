@@ -1,7 +1,7 @@
 # Inicio rápido
 
-Guía para las dos personas que van a probarlo. Si buscas la explicación técnica del proyecto,
-está en el [README](../README.md) (en inglés).
+Guía para las dos personas que van a usarlo. Si buscas la explicación técnica del proyecto, está
+en el [README](../README.md) (en inglés).
 
 ## La idea, en una frase
 
@@ -43,220 +43,161 @@ tener los dos a la vez.
 El permiso va **en una sola dirección**. Que Ana pueda preguntarle a Dev no le permite a Dev
 preguntarle a Ana. Si quieren las dos direcciones, hacen el paso del permiso dos veces, una en
 cada sentido. `revoke` también va en una sola dirección: solo quien dio el permiso (quien
-contesta) puede quitarlo, al instante, con `revoke <nombre>`. Quien pregunta simplemente deja de
-preguntar — no hay un `revoke` para ese lado.
+contesta) puede quitarlo, al instante. Quien pregunta simplemente deja de preguntar — no hay un
+`revoke` para ese lado.
 
 En esta guía **Ana pregunta** y **Dev contesta**. Cambia los nombres por los de ustedes.
 
-## 1. Antes de empezar
+## 1. Qué necesitas
 
-En **las dos** computadoras:
+En **las dos** computadoras, y nada más que esto:
 
-- Node 22.13 o más nuevo, solo para correr `npx` — nada que clonar, compilar ni instalar aparte.
-- Claude Code instalado. Dev (quien va a contestar) necesita además haber iniciado sesión ahí.
-  Ana (quien va a preguntar) solo lo necesita si quiere preguntar desde dentro de su agente en vez
-  de desde la terminal.
+- **Node 22.13 o más nuevo.** No hay que clonar, compilar ni instalar AgentBridge: el comando de
+  abajo lo descarga solo la primera vez y lo reutiliza después.
+- **Claude Code instalado.** Quien contesta lo necesita sí o sí. Quien pregunta solo lo necesita si
+  quiere preguntar desde dentro de su agente, en vez de desde la terminal.
 
-Para comprobar que todo corre, en cualquiera de las dos:
+## 2. Un comando
 
-```bash
-npx -y @joseamica/agentbridge@latest --help
+En cada computadora, una vez:
+
 ```
-
-La primera vez tarda un poco porque descarga AgentBridge; después lo reutiliza.
-
-(¿Vas a modificar el código de AgentBridge en vez de solo usarlo? Mira
-[Correr el CLI desde el código fuente](#correr-el-cli-desde-el-código-fuente) al final de esta
-guía.)
-
-## 2. El comando guiado: `setup`
-
-En cada computadora corres el mismo comando, una vez:
-
-```bash
 npx -y @joseamica/agentbridge@latest setup
 ```
 
-Te va haciendo preguntas, en español. Esto es lo que vas a ver y un ejemplo de respuesta para
-cada una:
+Eso es todo lo que hay que escribir para dejarlo instalado. Lo demás son preguntas que contestas.
 
-| Te pregunta | Respuesta de ejemplo |
-| --- | --- |
-| `¿Cómo quieres que te vean las personas a las que te conectes? (tu nombre o apodo):` | `Dev` |
-| `¿Qué vas a hacer desde esta computadora? 1) Contestar preguntas … 2) Hacer preguntas … 3) Las dos cosas — Escribe 1, 2 o 3:` | `1` (Dev contesta; Ana escribiría `2`) |
-| *(solo si vas a contestar)* `Carpeta a compartir (Enter para usar ~/AgentBridge/compartido):` | Enter, para aceptar la que propone |
-| *(solo si vas a contestar)* `¿Está bien? [S/n]:` | `s` |
-| *(solo si la carpeta se ve peligrosa)* `Escribe CONFIRMAR para continuar:` | Solo si de verdad quieres usar esa carpeta a pesar del aviso |
-| *(solo si vas a preguntar)* `¿Ya tienes su enlace? [s/n]:` | `n` la primera vez, si todavía no te lo han pasado |
-| *(solo si vas a preguntar y dijiste que sí)* `Pega su enlace:` | el enlace que te compartió la otra persona |
-| *(solo si vas a preguntar)* `¿Lo registro ahora? [s/n]:` | `s`, para que la herramienta aparezca dentro de tu Claude Code |
+## 3. Qué te va a preguntar
 
-Antes de pedirte la carpeta, `setup` te explica — en el momento en que importa, no antes — lo
-mismo que dice la sección de arriba: todo lo que pongas ahí queda visible para quien te pueda
-preguntar. Si la carpeta que elijas se ve peligrosa — tu carpeta de usuario, un repositorio de
-trabajo (tiene `.git`), o archivos con pinta de credenciales — te lo dice y te pide escribir
-`CONFIRMAR` para seguir, o de plano se niega. Nunca crea la carpeta sin avisarte primero.
+- **Tu nombre o apodo.** Es como te van a ver las personas a las que te conectes.
+- **Qué vas a hacer desde esta computadora**: contestar preguntas, hacer preguntas, o las dos
+  cosas. Se responde con `1`, `2` o `3`.
+- **Si vas a contestar, qué carpeta compartes.** Compartir una carpeta significa esto: **quien
+  tenga tu permiso puede leer todo lo que esté ahí dentro**, así que pon copias de lo que quieras
+  compartir, nunca tu carpeta de trabajo. Te propone una carpeta nueva (`AgentBridge/compartido`,
+  dentro de tu carpeta de usuario) y con Enter la aceptas. Si eliges una que se ve peligrosa te
+  dice exactamente por qué y te hace escribir `CONFIRMAR` para seguir, o de plano se niega. Lo que
+  cuenta como peligrosa: tu carpeta de usuario, un repositorio con `.git`, archivos con pinta de
+  credenciales, enlaces simbólicos (no mira qué hay del otro lado), un `node_modules` que no
+  revisó por dentro, y una carpeta tan grande o tan anidada que no alcanzó a revisarla completa.
 
-Al final te dice, sin rodeos, qué quedó listo, qué falta, y cuál es el siguiente comando a correr.
-`setup` no reinventa nada: cada paso que da es uno de los comandos de esta misma guía (`connect`,
-`setup-responder`, `doctor`, `claude mcp add`), nomás que encadenados y con las preguntas
-correctas. Si lo corres sin una terminal interactiva — por ejemplo dentro de un script — te lo dice
-de inmediato y te imprime los comandos equivalentes, en vez de quedarse esperando.
+Si vas a preguntar, también te pregunta si ya tienes el enlace de la otra persona (y, si lo tienes,
+te lo pide y se conecta ahí mismo) y si quieres que registre la herramienta dentro de tu Claude
+Code.
 
-El resto de esta guía explica qué hace cada paso por dentro, por si quieres entenderlo, hacer
-alguno a mano, o algo te truena y necesitas saber dónde mirar.
+## 4. Qué va a hacer solo
 
-## 3. Para quien contesta (Dev)
+Sin que tú ejecutes nada aparte:
 
-### Elegir la carpeta compartida
+- **Te abre el inicio de sesión de Claude** en un perfil aparte, dedicado a contestar preguntas —
+  tu Claude de todos los días no se toca. Se abre tu navegador, escribes tu contraseña ahí, y
+  vuelves a la terminal. Después comprueba solo si la sesión de verdad quedó iniciada.
+- **Deja la carpeta lista**, con los permisos que impiden que esa sesión corra comandos, edite
+  archivos o salga a internet.
+- **Te copia tu enlace al portapapeles**, para que se lo pases a quien quieras que pueda
+  preguntarte.
+- Y al final, **si le dices que sí, te pone a contestar** ahí mismo. Esa terminal se queda
+  ocupada esperando preguntas; para parar, Ctrl+C.
 
-Es el paso más importante de todos. Crea una carpeta nueva, dedicada solo a esto, y copia ahí
-**solo** lo que de verdad estés dispuesto a compartir: un README, una nota de arquitectura, una
-configuración. No tu repositorio de trabajo, y nada con credenciales.
+Si algo quedó a medias, te lo dice en un resumen corto al final: qué quedó listo y qué te falta.
 
-```bash
-mkdir -p ~/AgentBridge/compartido
+## 5. Los comandos del día a día
+
+Estos dos son los que vas a usar de verdad, y se escriben completos:
+
+```
+npx -y @joseamica/agentbridge@latest responder
 ```
 
-El aviso completo, para que quede clarísimo: todo lo que haya en esa carpeta lo puede leer
-cualquier persona a la que le des permiso de preguntarte, incluido un `.env` o un archivo de
-llaves, aunque le digas a tu agente que no lo lea. Eso no depende de que el modelo se porte bien:
-está impuesto por configuración, y esa configuración solo protege lo que está **dentro** de la
-carpeta que elijas.
+Ponerte a contestar. Es lo que corres mañana, y pasado, cuando quieras volver a dejar tu agente
+disponible. Ocupa la terminal hasta que lo pares con Ctrl+C.
 
-### Lo que crea el perfil dedicado
-
-```bash
-npx -y @joseamica/agentbridge@latest setup-responder --share ~/AgentBridge/compartido
 ```
-
-Esto crea, en `~/.agentbridge-responder` (puedes cambiarlo con `--profile`): un perfil de Claude
-Code aparte —para no mezclarlo con el que usas todos los días—, los permisos restringidos que le
-impiden correr comandos, editar archivos o salir a internet, un script `start.sh` para arrancarlo,
-y un `CLAUDE.md` con las reglas del respondedor, dentro de la carpeta compartida. Se niega a
-continuar si ese perfil quedaría dentro de la carpeta compartida.
-
-### Iniciar sesión y arrancar
-
-```bash
-CLAUDE_CONFIG_DIR=~/.agentbridge-responder/claude claude
-```
-
-Adentro, escribe `/login`, inicia sesión, y `/exit`. Esto se hace una sola vez.
-
-```bash
-~/.agentbridge-responder/start.sh
-```
-
-La primera vez te va a preguntar si confías en cargar el "canal de desarrollo" — contesta que sí;
-es justo el plugin de AgentBridge que acabas de instalar. `start.sh` se queda ocupando esta
-terminal (termina entregándole el control a Claude Code) — déjala así, es la sesión que se queda
-esperando preguntas, y abre una terminal **nueva** para lo que sigue.
-
-### Qué ves cuando llega una pregunta
-
-En esa misma terminal vas a ver actividad: Claude Code mostrando que recibió algo por el canal de
-AgentBridge y, más abajo, que llamó su herramienta `reply` con la respuesta que decidió mandar. No
-memorices un texto exacto — lo importante es que veas movimiento ahí, no una terminal inmóvil.
-
-### Comprobar que quedó bien
-
-```bash
-npx -y @joseamica/agentbridge@latest doctor --profile ~/.agentbridge-responder --share ~/AgentBridge/compartido
-```
-
-Todas las líneas deben decir `[ok]`. Corre esto antes de confiar en la instalación, y de nuevo si
-algo se siente raro.
-
-### Darle tu enlace a quien va a preguntarte
-
-```bash
-npx -y @joseamica/agentbridge@latest link
-```
-
-Mándale ese enlace por donde ya se escriban normalmente. Cuando te llegue su solicitud (sección
-siguiente), ahí está el comando completo para verla y aprobarla.
-
-## 4. Para quien pregunta (Ana)
-
-### Conseguir el enlace y pedir permiso
-
-Pídele a Dev su enlace (lo saca con el comando de la sección 3, "Darle tu enlace a quien va a
-preguntarte"). Con él en la mano:
-
-```bash
-npx -y @joseamica/agentbridge@latest connect "<el enlace de Dev>" --note "soy Ana"
-```
-
-El primer paso tarda unos segundos — tu computadora resuelve una prueba de trabajo, a propósito,
-como medida contra el abuso. Del lado de Dev, él revisa y decide:
-
-```bash
 npx -y @joseamica/agentbridge@latest requests
-npx -y @joseamica/agentbridge@latest approve <id>
 ```
 
-El `<id>` es el que le muestra `requests` junto al nombre de quien pidió permiso (si se
-equivocara de persona, `reject <id>` la rechaza en vez de aprobarla). Después de eso, los dos
-pueden confirmar el mismo estado con:
+Ver quién te pidió permiso para preguntarte. Te muestra un identificador corto junto a cada
+nombre; con él apruebas (`approve <id>`) o rechazas (`reject <id>`).
 
-```bash
-npx -y @joseamica/agentbridge@latest contacts
-```
+El resto, cuando lo necesites:
 
-### Preguntar desde la terminal
+| Para | Comando |
+| --- | --- |
+| Ver tu enlace otra vez | `npx -y @joseamica/agentbridge@latest link` |
+| Pedirle permiso a alguien | `npx -y @joseamica/agentbridge@latest connect "<su enlace>" --note "soy Ana"` |
+| Ver a quién puedes preguntarle y quién puede preguntarte | `npx -y @joseamica/agentbridge@latest contacts` |
+| Aprobar una solicitud | `npx -y @joseamica/agentbridge@latest approve <id>` |
+| Preguntar desde la terminal | `npx -y @joseamica/agentbridge@latest ask dev "¿qué timeout aplica?" --wait 120` |
+| Recoger después una respuesta que no esperaste | `npx -y @joseamica/agentbridge@latest ticket <identificador> --wait 60` |
+| Quitarle el permiso a alguien | `npx -y @joseamica/agentbridge@latest revoke <nombre>` |
 
-```bash
-npx -y @joseamica/agentbridge@latest ask dev "¿qué timeout aplica para la lectura de tarjeta?" --wait 120
-```
+Dos notas sobre preguntar:
 
-Si no quieres esperar en la misma terminal, usa `--no-wait` y consulta después con el identificador
-que te da:
+- `ask` con `--no-wait` regresa de inmediato con un identificador, y la respuesta la recoges
+  después con `ticket`.
+- Para preguntar **desde dentro de tu Claude Code** —que es el chiste de todo esto— basta con que
+  `setup` haya registrado la herramienta. Después de eso hay que **cerrar y volver a abrir** Claude
+  Code: las herramientas nuevas (`list_contacts`, `ask_contact`, `check_answer` y `connect`) no
+  aparecen hasta que reinicias la sesión. Ya adentro, solo le dices a tu agente que le pregunte a
+  Dev.
 
-```bash
-npx -y @joseamica/agentbridge@latest ticket <identificador> --wait 60
-```
-
-### Preguntar desde dentro de Claude Code
-
-Que es el chiste de todo esto:
-
-```bash
-claude mcp add agentbridge --scope user -- npx -y @joseamica/agentbridge@latest mcp
-```
-
-Después de eso hay que **abrir Claude Code**, o reiniciar la sesión que ya estuviera abierta, para
-que aparezcan las herramientas nuevas: `list_contacts`, `ask_contact`, `check_answer` y `connect`.
-Ya adentro, Ana solo le dice a su agente que le pregunte a Dev.
-
-## 5. Si algo no jala
+## 6. Si algo falla
 
 Lo primero, siempre:
 
-```bash
+```
 npx -y @joseamica/agentbridge@latest doctor
 ```
 
-(Agrega `--profile` y `--share` con las mismas rutas del paso 3 si estás revisando el lado que
-contesta.) Cada línea dice `[ok]` o `[falla]`, y el detalle explica exactamente qué falta —
-incluyendo, para cada tablero que usas, si aceptó publicar y devolver lo que se le mandó, no solo
-si el socket abrió. Es seguro compartir su salida porque no imprime credenciales.
+Cada renglón empieza con `[ok]` o `[falla]`, sigue con el nombre de lo que revisó, y termina con
+el detalle — que, cuando algo está mal, dice exactamente qué hacer. Es seguro compartir esa salida
+con alguien que te ayude: no imprime tu llave ni ninguna contraseña.
 
-Algo que confunde la primera vez:
+Lo que revisa siempre:
 
-- **La herramienta no aparece en Claude Code.** Falta abrir o reiniciar la sesión después del
-  `claude mcp add`.
+- **Llave de AgentBridge** — que exista tu llave en esta computadora.
+- **Base de datos** — que tu archivo de contactos y preguntas abra y responda.
+- **Candado del canal** — si hay una sesión contestando ahora mismo.
+- **Solicitudes pendientes** — cuántas personas están esperando que las apruebes.
+- **Tablero `<dirección>`**, uno por cada tablero público que usas — y no solo que conecte: que
+  acepte publicar un sobre de prueba y te lo devuelva. Que **uno** salga en `[falla]` es normal, es
+  el clima de internet; lo grave es que fallen todos, y en ese caso aparece un renglón aparte,
+  **Tableros públicos**, diciéndolo.
+- **Carpeta sincronizada con la nube** — solo aparece si tu llave quedó dentro de OneDrive,
+  Dropbox, Google Drive o iCloud. Avisa, no bloquea.
+
+Si eres quien contesta y quieres la revisión completa, pásale las dos carpetas que elegiste
+durante `setup`:
+
+```
+npx -y @joseamica/agentbridge@latest doctor --profile <carpeta del perfil dedicado> --share <tu carpeta compartida>
+```
+
+Con esas dos revisa además: que los permisos de la sesión que contesta sigan siendo los
+restringidos, que su configuración esté completa, que el plugin esté instalado, que la sesión de
+Claude esté iniciada, y —del lado de la carpeta compartida— que tenga su `CLAUDE.md`, que no haya
+enlaces simbólicos que salgan de ella, y que no haya llegado ahí configuración de proyecto que el
+agente cargaría sola al arrancar.
+
+Volver a correr `setup` también sirve: nunca recrea tu llave ni cambia tu enlace, y de paso repara
+los permisos de tu carpeta de identidad si algo los había aflojado. Si eliges contestar, hace esa
+revisión completa por su cuenta y te dice solo lo que te impide contestar — eso sí, te vuelve a
+preguntar qué carpeta compartes, así que si no usas la que propone, escríbela otra vez en vez de
+aceptar con Enter.
+
+Dos cosas que confunden la primera vez:
+
+- **La herramienta no aparece en Claude Code.** Falta cerrar y volver a abrir la sesión.
 - **Una solicitud o una pregunta no llegan de inmediato.** No hace falta que hagas nada especial:
   se reintentan solas cada vez que corres un comando de AgentBridge (`ask`, `contacts`, `doctor`,
-  el servidor MCP mientras esté abierto…), hasta por una semana. Si quien responde tiene la
-  computadora apagada, la pregunta simplemente espera.
+  la herramienta dentro de Claude Code mientras esté abierta…), hasta por una semana. Si quien
+  responde tiene la computadora apagada, la pregunta simplemente espera.
 
-## 6. Quitar el permiso
+## Quitar el permiso
 
-Esto lo hace quien contesta, sobre alguien a quien le dio permiso de preguntarle — no al revés:
-quien pregunta no tiene un `revoke`, simplemente deja de preguntar.
+Lo hace quien contesta, sobre alguien a quien le dio permiso de preguntarle:
 
-```bash
+```
 npx -y @joseamica/agentbridge@latest revoke <nombre>
 ```
 
@@ -268,27 +209,10 @@ camino") **la próxima vez que su lado reintenta**, que puede tardar hasta unos 
 ## Antes de usarlo con algo que importe
 
 Corre el protocolo completo de aceptación:
-[`runbooks/aceptacion-0.2.md`](runbooks/aceptacion-0.2.md). Incluye la prueba de que una pregunta
-mandada de noche, con quien contesta apagado, llega y se contesta al día siguiente, y ocho
+[`runbooks/aceptacion-0.3.md`](runbooks/aceptacion-0.3.md). Incluye la prueba de que una pregunta
+mandada de noche, con quien contesta apagado, llega y se contesta al día siguiente, y los
 escenarios de seguridad — entre ellos, intentos de que el agente lea cosas que no debe. Las
 limitaciones conocidas, sin adornos, están en [`known-gaps.md`](known-gaps.md).
 
-## Correr el CLI desde el código fuente
-
-La guía de arriba no instala nada: todo corre con `npx`. Si en cambio vas a modificar el código de
-AgentBridge, córrelo directamente desde tu copia local, ya compilada:
-
-```bash
-git clone https://github.com/Joseamica/agentbridge.git
-cd agentbridge
-npm ci
-npm run build
-alias ab="node $PWD/packages/cli/dist/main.js"
-```
-
-Ojo con ese `alias`: en Mac, `ab` ya es otro programa (ApacheBench). En una terminal nueva donde no
-hayas vuelto a definir el alias, `ab` no te va a decir "comando no encontrado" — te va a salir la
-ayuda de una herramienta que no tiene nada que ver. Ese choque, y el alias mismo, solo existen en
-este camino desde el código fuente; el comando publicado `agentbridge` no lo tiene. Aquí
-`setup-responder` y `doctor` también siguen aceptando `--repo <carpeta>` si alguna vez quieres
-apuntarlos a una copia distinta de la que los está ejecutando.
+¿Vas a modificar el código de AgentBridge en vez de solo usarlo? Eso está en el README, en
+[Running the CLI from a local clone](../README.md#running-the-cli-from-a-local-clone).

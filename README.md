@@ -74,11 +74,12 @@ fence holds. So the boundary is enforced by configuration, not by asking the mod
   point it at a working repo.
 - **Project configuration that lands in that folder later** — `.claude/settings.json` hooks,
   `.mcp.json`, `.claude/agents`, `.claude/skills`, `.claude/commands`, `CLAUDE.local.md`,
-  `AGENTS.md` — takes effect at the next session start. `agentbridge doctor` flags all of them;
+  `AGENTS.md` — takes effect at the next session start. The `doctor` command flags all of them;
   nothing prevents a sync client or a `git pull` from placing them.
 
-`agentbridge doctor` is how you verify all of this on a real install, including that every board
-you use actually accepts and returns what you publish. Run it before you trust it.
+`npx -y @joseamica/agentbridge@latest doctor` is how you verify all of this on a real install,
+including that every board you use actually accepts and returns what you publish. Run it before
+you trust it.
 
 ## Privacy: what's guaranteed and what isn't
 
@@ -169,14 +170,27 @@ questions, ask questions, or both, and — before it ever asks you to name a fol
 explains in plain language what putting one there means: everything inside becomes readable by
 anyone you let ask you, including a stray `.env` or key file. It refuses your own home directory
 outright, and makes you type an explicit confirmation before using a folder that looks like a
-working repo or already has credential-shaped files in it. It never creates that folder silently.
-It finishes by telling you plainly what's ready, what's still pending, and the one command to run
-next.
+working repo, already has credential-shaped files in it, contains symlinks it did not follow or a
+`node_modules` it did not read, or is too large or too deeply nested to have been fully scanned. It
+never creates that folder silently.
+
+Then it *performs* the rest instead of printing it. It opens Claude's login in the dedicated
+profile — the browser opens, you type your password, you come back — and afterwards checks for
+itself whether a session actually exists. It copies your link to the clipboard. It registers the
+MCP server if you say yes. It runs every `doctor` check and tells you only the ones that stop you
+from answering, not the full diagnostic. And at the end, if nothing is blocking, it offers to start
+answering right there: say yes and that terminal becomes the responder.
 
 `setup` is a thin conductor: every step it takes is one of the commands documented below
-(`connect`, `setup-responder`, `doctor`, `claude mcp add`) — it never reimplements their logic. If
-it can't run interactively (no TTY — a script, CI, a redirected pipe), it says so immediately and
-prints the equivalent commands instead of hanging.
+(`connect`, `setup-responder`, `doctor`, `responder`, `claude mcp add`, `claude auth login`) — it
+never reimplements their logic. If it can't run interactively (no TTY — a script, CI, a redirected
+pipe), it says so immediately and prints the equivalent commands instead of hanging.
+
+Nothing it prints is a line you have to paste to finish installing, on any platform, and
+`tests/acceptance/docs.test.ts` holds these docs to the same rule. The first real Windows install
+of 0.2 ended in seven pending items, two of which were bash — an inline environment-variable
+assignment in front of `claude`, and a path to a shell script — on a machine where neither could
+run.
 
 Read on if you want to understand exactly what each step does, run one by hand, automate it, or
 fix something `doctor` flagged.
@@ -213,28 +227,32 @@ nothing you do here talks to anyone else yet.
 **On Dev's machine — build the shared folder and the locked session:**
 
 ```bash
-mkdir -p ~/AgentBridge/shared
-# copy in only what Dev is willing to share — not the working repo, nothing with credentials
-npx -y @joseamica/agentbridge@latest setup-responder --share ~/AgentBridge/shared
+npx -y @joseamica/agentbridge@latest setup-responder --share <a folder Dev is willing to share>
 ```
 
-This creates a dedicated Claude Code profile at `~/.agentbridge-responder` (override with
-`--profile`), writes the restricted permissions, generates a `start.sh`, and drops a persona
-`CLAUDE.md` into the shared folder. It refuses to run if that profile — or Dev's identity folder —
-would land inside the shared folder.
+This creates the shared folder if it isn't there, creates a dedicated Claude Code profile at
+`~/.agentbridge-responder` (override with `--profile`), writes the restricted permissions, writes
+a `responder.json` recording the folder, the model and the effort, installs the plugin into that
+profile, and drops a persona `CLAUDE.md` into the shared folder. It refuses to run if that
+profile — or Dev's identity folder — would land inside the shared folder. Copy into that folder
+only what Dev is willing to share: not the working repo, nothing with credentials.
+
+Logging that dedicated profile in is a browser and a password, so it is `setup`'s job, not a line
+to paste — see the guided way above. Once there is a session, this is how Dev starts answering:
 
 ```bash
-CLAUDE_CONFIG_DIR=~/.agentbridge-responder/claude claude   # once: /login, then /exit
-~/.agentbridge-responder/start.sh
+npx -y @joseamica/agentbridge@latest responder
 ```
 
-The first time it starts, it'll ask whether to trust the development channel — that's the
-AgentBridge plugin you just installed; accept it. `start.sh` takes over this terminal (it ends by
-handing control to Claude Code) — keep it running there, or under tmux, and open a **new** terminal
-window for the next command.
+It reads `responder.json` from the dedicated profile, sets that profile's `CLAUDE_CONFIG_DIR`
+itself, and hands the terminal to Claude Code with the shared folder as its working directory.
+The first time, it'll ask whether to trust the development channel — that's the AgentBridge plugin
+`setup-responder` just installed; accept it. It takes over this terminal until Ctrl+C, so keep it
+running there, or under tmux, and open a **new** terminal window for the next command. Pass the
+same `--profile` you gave `setup-responder` if it wasn't the default.
 
 ```bash
-npx -y @joseamica/agentbridge@latest doctor --profile ~/.agentbridge-responder --share ~/AgentBridge/shared
+npx -y @joseamica/agentbridge@latest doctor --profile ~/.agentbridge-responder --share <the shared folder>
 ```
 
 Every line should read `[ok]`. This is the step that tells you the fence is real, the plugin is
@@ -272,9 +290,9 @@ Dev keeps his session running and forgets about it. Ana asks whenever she needs 
 them has to interrupt the other. If Dev's session is off, the question waits — retried
 automatically for up to a week — and lands the moment he starts it again.
 
-For the full pilot protocol in Spanish — including an eight-scenario security checklist you should
-run before trusting this with anything real — see
-[`docs/runbooks/aceptacion-0.2.md`](docs/runbooks/aceptacion-0.2.md). There is also a friendlier
+For the full pilot protocol in Spanish — including the security checklist you should run before
+trusting this with anything real — see
+[`docs/runbooks/aceptacion-0.3.md`](docs/runbooks/aceptacion-0.3.md). There is also a friendlier
 Spanish quickstart at [`docs/inicio-rapido.md`](docs/inicio-rapido.md).
 
 ## CLI reference
@@ -286,8 +304,10 @@ used throughout this README. If you installed the package globally, drop the `np
 ```
 Guided:
   npx -y @joseamica/agentbridge@latest setup [--repo <dir>] [--profile <dir>] [--relays <url,url,…>]
-                              (interactive, in Spanish — creates your key and profile, then
-                               orchestrates everything below for the role(s) you pick)
+                              (interactive, in Spanish — creates your key and profile, then runs
+                               everything below for the role(s) you pick: the login, the shared
+                               folder, the checks, the MCP registration, and the responder itself)
+                              (--relays alone rewrites your board list and exits; it asks nothing)
 
 Your link and your permissions:
   npx -y @joseamica/agentbridge@latest link                        (prints your own agentbridge:nprofile1… link)
@@ -307,6 +327,9 @@ Asking:
   npx -y @joseamica/agentbridge@latest mcp                         (MCP server for Claude Code or Codex)
 
 Answering from this machine:
+  npx -y @joseamica/agentbridge@latest responder [--profile <dir>]
+                              (start answering — reads responder.json from the dedicated profile
+                               and hands the terminal to Claude Code until Ctrl+C)
   npx -y @joseamica/agentbridge@latest setup-responder --share <dir> [--profile <dir>] [--repo <dir>] [--model sonnet] [--effort low]
   npx -y @joseamica/agentbridge@latest doctor [--home <dir>] [--profile <dir>] [--share <dir>] [--repo <dir>]
 
@@ -365,14 +388,16 @@ running from.
 
 ## Status
 
-This is **0.2**: no server of ours, built for two people who already trust each other. It has been
-reviewed end to end, but it has not been run by anyone but its author. Known gaps, deliberate
-deferrals and the full residual-exposure statement are written down in
+This is **0.3**: no server of ours, built for two people who already trust each other. 0.2 was
+installed for the first time by someone who does not program, on Windows, and the install is what
+broke — not the transport. 0.3 is the answer to that: `setup` performs the steps it used to print,
+and no instruction a person reads depends on which shell they happen to have. Known gaps,
+deliberate deferrals and the full residual-exposure statement are written down in
 [`docs/known-gaps.md`](docs/known-gaps.md) — including the ones that matter before you add a third
-person.
+person, and the platforms that are reasoned about rather than tested.
 
-Not in 0.2: mobile clients, WhatsApp or Telegram, push notifications, organizations, billing,
-attachments, Codex as the responder.
+Not in 0.3: mobile clients, WhatsApp or Telegram, push notifications, organizations, billing,
+attachments, Codex as the responder, and a global binary on your PATH.
 
 Issues and questions are welcome. If you find a way around the fence, please open an issue.
 

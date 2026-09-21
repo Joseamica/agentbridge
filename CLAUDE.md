@@ -3,7 +3,7 @@
 Claude Code channel plugin + CLI that lets one person ask another person's agent a question, over
 public Nostr boards. No server of ours: no relay, no account, nothing to host.
 
-- Runbook (Spanish, step by step): docs/runbooks/aceptacion-0.2.md
+- Runbook (Spanish, step by step): docs/runbooks/aceptacion-0.3.md
 - Known gaps and deliberate deferrals: docs/known-gaps.md
 - `npm test` needs no internet. `npm run test:live` is the only suite that talks to public Nostr
   boards; run it on purpose, never in a loop.
@@ -18,8 +18,15 @@ public Nostr boards. No server of ours: no relay, no account, nothing to host.
   fields) or `forTerminalBlock` (multi-line prose) before it reaches a terminal.
 - `~/.agentbridge` (or `$AGENTBRIDGE_HOME`) holds identity and state — the key and the SQLite
   database — for every role. The responder's dedicated Claude Code profile (`~/.agentbridge-responder`
-  by default, or `--profile`) holds only Claude's own files: `settings.json`, `start.sh`,
-  `CLAUDE_CONFIG_DIR`. Never identity, never the database.
+  by default, or `--profile`) holds only Claude's own files: `settings.json`, `responder.json`,
+  and its `claude` directory (the one `CLAUDE_CONFIG_DIR` points at). Never identity, never the
+  database.
+- The responder is started by `npx -y @joseamica/agentbridge@latest responder`, which reads
+  `responder.json` from the dedicated profile. There is no shell script: one would work on two of
+  the three platforms, and that was exactly the failure that broke the first Windows install.
+- Nothing a person reads may contain shell syntax — no `VAR='x' command`, no path to a `.sh`, no
+  quoting that depends on which shell they have. If something needs to happen, the program does it.
+  `tests/acceptance/docs.test.ts` watches the docs; keep it passing.
 
 ## Skill routing
 

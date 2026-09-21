@@ -1,12 +1,55 @@
-# AgentBridge 0.2 — decisiones tomadas durante la implementación y trabajo pendiente
+# AgentBridge — decisiones tomadas durante la implementación y trabajo pendiente
 
-Es la lista de las decisiones que se tomaron apartándose del plan durante la implementación de 0.2,
-y de lo que quedó deliberadamente sin arreglar. (Hasta 0.1.x, AgentBridge corría sobre un relé
+Es la lista de las decisiones que se tomaron apartándose del plan durante la implementación —0.2
+primero, 0.3 después— y de lo que quedó deliberadamente sin arreglar. Lo más reciente va arriba.
+(Hasta 0.1.x, AgentBridge corría sobre un relé
 propio en Render cuyo operador podía leer todo el contenido; 0.2 lo reemplaza por completo con
 tableros públicos de Nostr — ver
 `docs/superpowers/specs/2026-09-16-nostr-transport-design.md` y la sección de privacidad del
 README. Los pendientes que solo existían por ese relé desaparecieron con él y no están en esta
 lista.)
+
+## 0.3 — el setup interactivo: lo que queda fuera a propósito
+
+Esta versión existe porque una persona que no programa instaló la 0.2.0 en Windows y la instalación
+—no el transporte— fue lo que se rompió. `setup` pasó de imprimir instrucciones a ejecutarlas. Esto
+es lo que **no** hace, y por qué.
+
+- **El inicio de sesión de Claude lo hace la persona.** El asistente abre la ventana correcta, en el
+  perfil correcto, y comprueba después si quedó iniciada; escribir la contraseña es de ella. No hay
+  forma de automatizarlo y no debería haberla.
+- **El portapapeles puede no existir.** En un Linux sin `wl-copy`, `xclip` ni `xsel`, el enlace se
+  imprime y ya. Es una comodidad; nada depende de ella.
+- **Windows no se prueba en CI.** Las dos correcciones de esta versión que dependen de la
+  plataforma (los permisos POSIX que ya no se exigen ahí, y el aviso de carpetas sincronizadas)
+  están probadas inyectando la plataforma, no corriendo en Windows. Por eso el runbook de
+  aceptación pide que, si se puede, una de las dos máquinas sea Windows.
+- **Windows con Claude Code instalado por npm.** Todos los `spawn` de este proyecto corren sin
+  shell —a propósito: es lo que hace que una ruta con espacios o un apóstrofo no se reinterprete—,
+  y un `spawn` sin shell no puede lanzar un `claude.cmd`, que es justo lo que produce
+  `npm i -g @anthropic-ai/claude-code` en Windows. La evidencia dice que ese no es el camino común:
+  la instalación real de Windows que originó este plan ejecutó `claude plugin install` y
+  `claude auth status --json` por ese mismo `spawn` sin problema. Pero quien haya instalado Claude
+  Code por npm en Windows va a ver "no pude ejecutar Claude Code", y el arreglo es instalarlo con
+  su propio instalador, o cerrar y volver a abrir la terminal. No construimos un rodeo porque no se
+  puede probar en esta máquina, justo en la plataforma donde equivocarse cuesta más caro.
+- **El aviso de carpeta sincronizada mira solo la carpeta de la identidad, y solo su nombre
+  literal.** No revisa el perfil dedicado de Claude (que es donde queda la credencial del inicio de
+  sesión) y no resuelve enlaces simbólicos, así que un `~/.agentbridge` que sea un enlace hacia
+  OneDrive se le pasa. En Windows, el "Known Folder Move" de OneDrive mueve Documentos, Escritorio
+  e Imágenes, pero no la raíz del perfil de usuario, así que la ubicación predeterminada casi nunca
+  va a coincidir — este chequeo se gana el sueldo sobre todo cuando alguien elige la carpeta él
+  mismo.
+- **El comando de todos los días es largo.** No instalamos nada en el PATH, así que ponerse a
+  contestar al día siguiente se escribe `npx -y @joseamica/agentbridge@latest responder`. `setup` lo
+  arranca por ti la primera vez, y eso cubre el peor momento; el resto de los días sigue siendo una
+  línea larga. Acortarla querría decir instalar un binario global, que es una decisión de producto,
+  no una corrección de este plan.
+- **La reparación de permisos de la identidad solo ocurre en `setup`.** `loadOrCreateIdentity` es
+  quien aprieta un `~/.agentbridge` en 0755 o un `identity.json` en 0644, y el único comando que lo
+  llama es `setup`. Los demás cargan la identidad en modo lectura y no la tocan, así que `doctor`
+  puede seguir marcando el permiso hasta que se vuelva a correr `setup` — que es exactamente lo que
+  su remedio dice.
 
 ## Decisiones que se apartaron del plan
 
@@ -78,9 +121,11 @@ Todo esto es preexistente o cosmético, verificado y acotado. Ninguno bloquea el
   termina la corrida en vez de volver a preguntar; `askWithRetries` solo reintenta cuando la
   respuesta viene vacía, y nada envuelve la llamada a `connectWith` en un `try/catch` que la
   convierta en un reintento.
-- El README y la guía en español describen los disparadores del candado como carpeta personal,
-  repositorio git y archivos con pinta de credenciales. Ahora también disparan los enlaces
-  simbólicos y un `node_modules` que no se pudo revisar.
+- El candado de la carpeta compartida dispara con más cosas de las que su nombre sugiere: además
+  de la carpeta personal, un repositorio git y los archivos con pinta de credenciales, también con
+  los enlaces simbólicos, con un `node_modules` que no se revisó por dentro, y con un árbol
+  demasiado grande o demasiado anidado para recorrerlo completo. El README y la guía en español ya
+  los enumeran todos (0.3); si se añade otro disparador, hay que actualizarlos.
 - El candado avisa de cualquier enlace simbólico, incluso de los que `doctor` considera
   inofensivos por no salir de la carpeta. Es a propósito: prefiere errar del lado seguro.
 
