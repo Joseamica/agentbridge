@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { plainSocketFactory, startFakeBoard, type FakeBoard } from '../../core/test/support/fake-board'
-import { runDoctor } from '../src/commands/doctor'
+import { cloudSyncedPath, runDoctor } from '../src/commands/doctor'
 import { RESPONDER_CONFIG_FILE } from '../src/commands/responder'
 
 // The production policy only accepts wss://, and the fake board speaks ws:// on loopback. This is
@@ -20,7 +20,7 @@ let board: FakeBoard
 const cleanups: Array<() => Promise<void> | void> = []
 
 // Looked up by name so a reordering of the checks is a refactor, not a failure.
-function check(checks: Array<{ name: string; ok: boolean; detail: string }>, name: string) {
+function check(checks: Array<{ name: string; ok: boolean; detail: string; blocking: boolean }>, name: string) {
   const found = checks.find((c) => c.name === name)
   if (!found) throw new Error(`doctor never reported a check called ${name}: ${checks.map((c) => c.name).join(', ')}`)
   return found
@@ -343,5 +343,122 @@ describe('runDoctor with --share and --profile together', () => {
     const crossCheck = check(checks, 'El perfil dedicado está fuera de la carpeta compartida')
     expect(crossCheck.ok).toBe(false)
     expect(crossCheck.detail).toContain('setup-responder')
+  })
+})
+
+describe('runDoctor login remediation text', () => {
+  // The old text told a person to paste `CLAUDE_CONFIG_DIR='…' claude` themselves — the exact
+  // shell-syntax defect this plan fixes in `setup` (I5), which survived here untouched. This
+  // proves doctor's own copy of it is gone, and names the program that does it instead.
+  it('never asks a person to paste CLAUDE_CONFIG_DIR=... claude', async () => {
+    await mkdir(profileHome, { recursive: true })
+    const { responderSettings } = await import('../src/commands/setup-responder')
+    await writeFile(join(profileHome, 'settings.json'), `${JSON.stringify(responderSettings(), null, 2)}\n`, { mode: 0o600 })
+    await mkdir(join(profileHome, 'claude'), { recursive: true })
+    const notLoggedIn = async (_command: string, _args: string[], _opts: { env: NodeJS.ProcessEnv; signal?: AbortSignal }) => ({
+      code: 0,
+      stdout: JSON.stringify({ loggedIn: false }),
+      stderr: '',
+    })
+    const checks = await runDoctor(doctorOptions({ profileHome, run: notLoggedIn }))
+    const perfil = check(checks, 'Sesión iniciada en el perfil dedicado')
+    expect(perfil.ok).toBe(false)
+    expect(perfil.detail).not.toMatch(/CLAUDE_CONFIG_DIR=/)
+    expect(perfil.detail).toContain('setup')
+  })
+})
+
+describe('cloudSyncedPath', () => {
+  it('spots OneDrive, which is where a Windows home folder usually lives', () => {
+    expect(cloudSyncedPath('C:\\Users\\dani\\OneDrive\\Documentos\\.agentbridge')).toBe('OneDrive')
+  })
+
+  it('spots iCloud Drive on macOS', () => {
+    expect(cloudSyncedPath('/Users/ana/Library/Mobile Documents/com~apple~CloudDocs/ab')).toBe('iCloud')
+  })
+
+  it('spots Dropbox and Google Drive', () => {
+    expect(cloudSyncedPath('/home/j/Dropbox/ab')).toBe('Dropbox')
+    expect(cloudSyncedPath('/home/j/Google Drive/ab')).toBe('Google Drive')
+  })
+
+  it('does not fire on a folder that merely contains the word', () => {
+    // "mi-onedrive-notas" is not OneDrive, and a false alarm about a secret key is a sentence
+    // that makes a person distrust every other line doctor prints.
+    expect(cloudSyncedPath('/home/j/mi-onedrive-notas/ab')).toBeNull()
+    expect(cloudSyncedPath('/home/j/proyectos/ab')).toBeNull()
+  })
+})
+
+describe('doctor on Windows', () => {
+  it('does not ask for POSIX permissions that cannot exist there', async () => {
+    const home = join(root, 'win')
+    await seedIdentity(home)
+    await chmod(join(home, 'identity.json'), 0o666)
+    const checks = await runDoctor(doctorOptions({ identityHome: home, platform: 'win32' }))
+    expect(check(checks, 'Llave de AgentBridge').detail).not.toMatch(/0600|0700|666/)
+  })
+
+  it('still asks for them on macOS and Linux', async () => {
+    const home = join(root, 'posix')
+    await seedIdentity(home)
+    await chmod(join(home, 'identity.json'), 0o644)
+    const checks = await runDoctor(doctorOptions({ identityHome: home, platform: 'darwin' }))
+    const key = check(checks, 'Llave de AgentBridge')
+    expect(key.ok).toBe(false)
+    expect(key.detail).toMatch(/0600/)
+  })
+
+  it('warns about a key in a cloud-synced folder, without blocking', async () => {
+    const home = join(root, 'OneDrive', '.agentbridge')
+    await seedIdentity(home)
+    const checks = await runDoctor(doctorOptions({ identityHome: home, platform: 'win32' }))
+    const warning = check(checks, 'Carpeta sincronizada con la nube')
+    expect(warning.ok).toBe(false)
+    // A key that is already in OneDrive is already uploaded. Telling someone to stop everything
+    // does not un-upload it; telling them what happened and how to move it does.
+    expect(warning.blocking).toBe(false)
+    expect(warning.detail).toMatch(/OneDrive/)
+  })
+
+  it('says nothing about the cloud when the folder is an ordinary one', async () => {
+    const home = join(root, 'normal')
+    await seedIdentity(home)
+    const checks = await runDoctor(doctorOptions({ identityHome: home, platform: 'darwin' }))
+    expect(checks.find((c) => c.name === 'Carpeta sincronizada con la nube')).toBeUndefined()
+  })
+})
+
+describe('what blocks and what does not', () => {
+  it('marks a missing key as blocking and a single unreachable board as not', async () => {
+    const checks = await runDoctor(doctorOptions({ identityHome: join(root, 'vacia'), platform: 'darwin' }))
+    expect(check(checks, 'Llave de AgentBridge').blocking).toBe(true)
+    for (const c of checks.filter((c) => c.name.startsWith('Tablero '))) expect(c.blocking).toBe(false)
+  })
+
+  it('marks the aggregate board check as blocking only when every board fails', async () => {
+    // The regression this guards against: a per-board `blocking: false` copied onto the
+    // aggregate check too, which would make a total outage look like "worth knowing" instead of
+    // "you cannot answer anyone right now" — see the brief's Q2/D2-shaped failure history.
+    await seedIdentity()
+    const store = await openStore(identityHome, { relayPolicy: allowAnyRelay })
+    setProfile(store, { relays: ['ws://127.0.0.1:1'], now: 1_700_000_002 })
+    store.close()
+    const checks = await runDoctor(doctorOptions())
+    const boardChecks = checks.filter((c) => c.name.startsWith('Tablero '))
+    expect(boardChecks.length).toBeGreaterThan(0)
+    for (const c of boardChecks) {
+      expect(c.ok).toBe(false)
+      expect(c.blocking).toBe(false)
+    }
+    const aggregate = check(checks, 'Tableros públicos')
+    expect(aggregate.ok).toBe(false)
+    expect(aggregate.blocking).toBe(true)
+  })
+
+  it('does not add the aggregate board check when at least one board works', async () => {
+    await seedIdentity()
+    const checks = await runDoctor(doctorOptions())
+    expect(checks.find((c) => c.name === 'Tableros públicos')).toBeUndefined()
   })
 })
