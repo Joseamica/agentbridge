@@ -31,8 +31,18 @@ export type Check = {
   detail: string
   // True when this stops the person from answering questions at all. False for something worth
   // knowing that does not stop anything — one board down out of five, a key sitting in a synced
-  // folder. `setup` speaks only about the blocking ones; `doctor` prints every one.
+  // folder. `doctor` prints every one either way.
   blocking: boolean
+  // True when a FAILURE here is about the safety of the secret key or of the shared folder —
+  // whoever could read what, and with what consequences. Independent of `blocking` on purpose:
+  // the two most dangerous things this program can report are not blocking at all. A key sitting
+  // inside OneDrive is already uploaded, and a key in mode 0666 still works perfectly; neither
+  // stops a single question from being answered, and both are exactly what the person installing
+  // needs to hear, at the one moment they are still choosing folders. `setup` must never hide
+  // these behind `blocking` — it shows `blocking || security` — which is why this is a flag on
+  // the check itself rather than a list of names kept somewhere else, where it would drift the
+  // first time a check is renamed.
+  security: boolean
 }
 
 type WalkResult = { escaping: string[]; unreadable: string[]; skipped: string[] }
@@ -182,7 +192,7 @@ async function identityCheck(o: {
     identity = await loadIdentity(o.identityHome)
   } catch (err) {
     return {
-      check: { name: 'Llave de AgentBridge', ok: false, blocking: true, detail: `No se pudo leer la identidad: ${describeError(err)}` },
+      check: { name: 'Llave de AgentBridge', ok: false, blocking: true, security: true, detail: `No se pudo leer la identidad: ${describeError(err)}` },
       identity: null,
     }
   }
@@ -195,7 +205,7 @@ async function identityCheck(o: {
       : `Todavía no tienes una llave en esta computadora. Créala con: ${CLI_COMMAND} setup`
     // Every remediation line names a command a person can paste, with CLI_COMMAND — never a bare
     // "vuelve a correr setup".
-    return { check: { name: 'Llave de AgentBridge', ok: false, blocking: true, detail }, identity: null }
+    return { check: { name: 'Llave de AgentBridge', ok: false, blocking: true, security: true, detail }, identity: null }
   }
 
   const problems: string[] = []
@@ -246,6 +256,11 @@ async function identityCheck(o: {
       // still `true`: nothing here failed, so there is nothing "worth knowing but not fatal" to
       // distinguish it from.
       blocking: problems.length === 0 ? true : insideShare,
+      // Both failures this check can report are about who can read the secret key: a mode that
+      // lets anyone on the machine read it, or the key sitting inside the folder every authorized
+      // question can read. Only the second one blocks (the first still answers questions fine) —
+      // which is exactly why `blocking` alone must not decide whether `setup` says it out loud.
+      security: true,
       detail: problems.length
         ? problems.join(' · ')
         : o.platform === 'win32'
@@ -270,6 +285,7 @@ async function storeCheck(o: { identityHome: string; relayPolicy?: RelayPolicy }
         name: 'Base de datos',
         ok: false,
         blocking: true,
+        security: false,
         detail: `Todavía no existe. Se crea la primera vez que corres: ${CLI_COMMAND} setup`,
       },
       store: null,
@@ -277,9 +293,9 @@ async function storeCheck(o: { identityHome: string; relayPolicy?: RelayPolicy }
   }
   try {
     const store = await openStore(o.identityHome, o.relayPolicy ? { relayPolicy: o.relayPolicy } : {})
-    return { check: { name: 'Base de datos', ok: true, blocking: true, detail: 'abre y responde' }, store }
+    return { check: { name: 'Base de datos', ok: true, blocking: true, security: false, detail: 'abre y responde' }, store }
   } catch (err) {
-    return { check: { name: 'Base de datos', ok: false, blocking: true, detail: `No se pudo abrir: ${describeError(err)}` }, store: null }
+    return { check: { name: 'Base de datos', ok: false, blocking: true, security: false, detail: `No se pudo abrir: ${describeError(err)}` }, store: null }
   }
 }
 
@@ -357,7 +373,7 @@ export async function probeBoard(o: {
 // `addProfileChecks` (gated on `--profile`) is what let an `AGENTS.md` sitting in the shared
 // folder go unreported when nobody happened to also pass `--profile`.
 async function addShareChecks(
-  add: (name: string, ok: boolean, detail: string, blocking: boolean) => void,
+  add: (name: string, ok: boolean, detail: string, blocking: boolean, security?: boolean) => void,
   o: { shareDir: string; profileHome?: string },
 ): Promise<void> {
   const shareDir = resolve(o.shareDir)
@@ -366,9 +382,11 @@ async function addShareChecks(
     .catch(() => false)
   // Neither branch names the shared folder or a path inside it — CLAUDE.md is a fixed name
   // this check always looks for, not information about this person's own folder layout. Every
-  // check in this function is about the shared folder's own safety, so all of them block: a
-  // hole here is readable by whoever sends the next question, not just something worth knowing.
-  add('Carpeta compartida', persona, persona ? 'CLAUDE.md presente' : 'Falta CLAUDE.md en la carpeta compartida', true)
+  // check in this function is about the shared folder's own safety, so all of them block AND all
+  // of them carry `security`: a hole here is readable by whoever sends the next question, not
+  // just something worth knowing. (`blocking` alone would be enough to get them printed today;
+  // `security` is what keeps them printed if any of them is ever judged non-fatal.)
+  add('Carpeta compartida', persona, persona ? 'CLAUDE.md presente' : 'Falta CLAUDE.md en la carpeta compartida', true, true)
 
   // Walk regardless of whether the persona file is there — a shared folder missing
   // CLAUDE.md can still contain files (and escaping symlinks); "no persona" is not the
@@ -385,7 +403,7 @@ async function addShareChecks(
   if (walk.escaping.length) linkBits.push(`${walk.escaping.length} enlace(s) apuntan fuera de la carpeta`)
   if (walk.unreadable.length) linkBits.push(`${walk.unreadable.length} ruta(s) no se pudieron revisar (sin permiso de lectura)`)
   if (walk.skipped.length) linkBits.push(`${walk.skipped.length} carpeta(s) no se revisaron por dentro (.git o node_modules)`)
-  add('Sin enlaces que salgan de la carpeta', linksOk, linkBits.length ? linkBits.join(' · ') : 'Ninguno', true)
+  add('Sin enlaces que salgan de la carpeta', linksOk, linkBits.length ? linkBits.join(' · ') : 'Ninguno', true, true)
 
   const projectConfig = await projectConfigArtifacts(shareDir)
   const execRisk = projectConfig.filter((rel) => PROJECT_CONFIG_EXEC_RISK.has(rel))
@@ -399,6 +417,7 @@ async function addShareChecks(
     'Sin configuración de proyecto en la carpeta compartida',
     projectConfig.length === 0,
     projectConfigBits.length ? `Encontrado — ${projectConfigBits.join(' · ')}` : 'Ninguna',
+    true,
     true,
   )
 
@@ -422,6 +441,7 @@ async function addShareChecks(
       profileOutsideShare
         ? 'sí'
         : `--profile es la misma carpeta que --share o está dentro de ella: la sesión puede leer ahí settings.json y responder.json — permissions.blockReadsOutsideWorkingDirectories y las reglas Read(**/.env*) no protegen nada dentro de la carpeta compartida. Vuelve a correr: ${CLI_COMMAND} setup-responder --share <tu carpeta compartida> --profile <otra carpeta, fuera de ella>`,
+      true,
       true,
     )
   }
@@ -480,6 +500,7 @@ async function addProfileChecks(
     permissionProblems.length
       ? permissionProblems.join(' · ')
       : `Deniega ${deny.join(', ')}; permite solo ${allow.join(', ') || 'nada'}; lecturas limitadas a la carpeta de trabajo`,
+    true,
     true,
   )
 
@@ -591,7 +612,11 @@ export async function runDoctor(o: {
   platform?: NodeJS.Platform
 }): Promise<Check[]> {
   const checks: Check[] = []
-  const add = (name: string, ok: boolean, detail: string, blocking: boolean) => checks.push({ name, ok, detail, blocking })
+  // `security` defaults to false so the only calls that carry it are the ones whose failure is
+  // about who can read the key or the shared folder — a default of true would make the flag mean
+  // nothing.
+  const add = (name: string, ok: boolean, detail: string, blocking: boolean, security = false) =>
+    checks.push({ name, ok, detail, blocking, security })
   const run = o.run ?? defaultRunner
   const now = o.now ?? (() => Math.floor(Date.now() / 1000))
   const boardTimeoutMs = o.boardTimeoutMs ?? 10_000
@@ -611,6 +636,10 @@ export async function runDoctor(o: {
       name: 'Carpeta sincronizada con la nube',
       ok: false,
       blocking: false,
+      // Not blocking — stopping the install does not un-upload a key that is already in somebody
+      // else's datacenter — and the single most serious thing this program can tell anyone. It is
+      // the check that made `security` exist.
+      security: true,
       detail: `Tu llave está dentro de ${synced}, así que se sube sola a la nube. Muévela a una carpeta que no se sincronice y vuelve a correr ${CLI_COMMAND} setup con esa carpeta.`,
     })
   }
@@ -664,6 +693,7 @@ export async function runDoctor(o: {
       name: 'Tableros públicos',
       ok: false,
       blocking: true,
+      security: false,
       detail: 'Ningún tablero te dejó publicar y leer. Revisa tu conexión a internet; si estás en una red del trabajo o de una escuela, puede estar bloqueando las conexiones que AgentBridge usa.',
     })
   }

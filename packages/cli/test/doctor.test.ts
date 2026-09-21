@@ -20,7 +20,7 @@ let board: FakeBoard
 const cleanups: Array<() => Promise<void> | void> = []
 
 // Looked up by name so a reordering of the checks is a refactor, not a failure.
-function check(checks: Array<{ name: string; ok: boolean; detail: string; blocking: boolean }>, name: string) {
+function check(checks: Array<{ name: string; ok: boolean; detail: string; blocking: boolean; security: boolean }>, name: string) {
   const found = checks.find((c) => c.name === name)
   if (!found) throw new Error(`doctor never reported a check called ${name}: ${checks.map((c) => c.name).join(', ')}`)
   return found
@@ -551,5 +551,52 @@ describe('Llave de AgentBridge: blocking follows the risk, not the check', () =>
     const key = check(await runDoctor({ ...doctorOptions(), identityHome: inside, shareDir }), 'Llave de AgentBridge')
     expect(key.ok).toBe(false)
     expect(key.blocking).toBe(true)
+  })
+})
+
+// Task 5 review, I4: `blocking` answers "can this person answer questions at all", which is the
+// wrong question to ask about the key's safety — the two most serious things doctor can report
+// (a key in somebody's cloud folder, a key anyone on the machine can read) do not stop a single
+// question from being answered. `security` is what keeps `setup` from hiding them, so the flag
+// has to be on the checks whose subject really is who can read the key or the shared folder,
+// and off everywhere else — a flag set everywhere means nothing.
+describe('the security flag', () => {
+  it('marks the cloud-synced key warning, which does not block', async () => {
+    const home = join(root, 'OneDrive', '.agentbridge')
+    await seedIdentity(home)
+    const warning = check(await runDoctor(doctorOptions({ identityHome: home })), 'Carpeta sincronizada con la nube')
+    expect(warning.blocking).toBe(false)
+    expect(warning.security).toBe(true)
+  })
+
+  it('marks the key check even when a permission bit alone does not block', async () => {
+    await seedIdentity()
+    await chmod(join(identityHome, 'identity.json'), 0o644)
+    const key = check(await runDoctor(doctorOptions()), 'Llave de AgentBridge')
+    expect(key.ok).toBe(false)
+    expect(key.blocking).toBe(false)
+    expect(key.security).toBe(true)
+  })
+
+  it('marks every check about the shared folder and the responder fence', async () => {
+    const checks = await runDoctor(doctorOptions({ shareDir, profileHome }))
+    for (const name of [
+      'Carpeta compartida',
+      'Sin enlaces que salgan de la carpeta',
+      'Sin configuración de proyecto en la carpeta compartida',
+      'El perfil dedicado está fuera de la carpeta compartida',
+      'Permisos del respondedor',
+    ]) {
+      expect(check(checks, name).security, name).toBe(true)
+    }
+  })
+
+  it('leaves it off the checks that are about working, not about safety', async () => {
+    await seedIdentity()
+    const checks = await runDoctor(doctorOptions({ shareDir, profileHome }))
+    for (const name of ['Base de datos', 'Candado del canal', 'Solicitudes pendientes', 'Configuración del respondedor', 'Plugin instalado en el perfil dedicado', 'Sesión iniciada en el perfil dedicado']) {
+      expect(check(checks, name).security, name).toBe(false)
+    }
+    for (const c of checks.filter((c) => c.name.startsWith('Tablero '))) expect(c.security, c.name).toBe(false)
   })
 })
