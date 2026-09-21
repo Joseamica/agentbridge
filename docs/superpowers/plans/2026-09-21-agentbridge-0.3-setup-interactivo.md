@@ -205,7 +205,7 @@ describe('defaultInteractiveRunner', () => {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `npm test -w @agentbridge/cli -- interactive`
+Run: `npm test -- interactive`
 Expected: FAIL — `Failed to resolve import "../src/interactive"`.
 
 - [ ] **Step 3: Write the implementation**
@@ -283,7 +283,7 @@ export function resumePrompt(): void {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `npm test -w @agentbridge/cli -- interactive`
+Run: `npm test -- interactive`
 Expected: PASS (5 tests).
 
 Run: `npm run typecheck`
@@ -461,7 +461,7 @@ describe('runResponder', () => {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `npm test -w @agentbridge/cli -- responder`
+Run: `npm test -- responder`
 Expected: FAIL — `Failed to resolve import "../src/commands/responder"`.
 
 - [ ] **Step 3: Write the implementation**
@@ -630,7 +630,7 @@ inválidos antes de escribir nada. Borra los imports de `startScript`.
 
 - [ ] **Step 5: Run the tests**
 
-Run: `npm test -w @agentbridge/cli`
+Run: `npm test`
 Expected: PASS.
 
 Run: `npm run typecheck`
@@ -742,7 +742,7 @@ describe('copyToClipboard', () => {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `npm test -w @agentbridge/cli -- clipboard`
+Run: `npm test -- clipboard`
 Expected: FAIL — `Failed to resolve import "../src/clipboard"`.
 
 - [ ] **Step 3: Write the implementation**
@@ -806,7 +806,7 @@ export async function copyToClipboard(text: string, o?: { platform?: NodeJS.Plat
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `npm test -w @agentbridge/cli -- clipboard`
+Run: `npm test -- clipboard`
 Expected: PASS (9 tests).
 
 - [ ] **Step 5: Commit**
@@ -930,7 +930,7 @@ escriben entonces como `runDoctor(doctorOptions({ identityHome: home, platform }
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `npm test -w @agentbridge/cli -- doctor`
+Run: `npm test -- doctor`
 Expected: FAIL — `cloudSyncedPath` no existe y `runDoctor` no acepta `platform`.
 
 - [ ] **Step 3: Write the implementation**
@@ -1044,7 +1044,7 @@ cuando **ninguno** sirve:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `npm test -w @agentbridge/cli -- doctor`
+Run: `npm test -- doctor`
 Expected: PASS.
 
 Run: `npm test && npm run typecheck`
@@ -1260,7 +1260,7 @@ registrando llamadas en `ctx.interactiveCalls`, y `copyLink` devolviendo `true` 
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `npm test -w @agentbridge/cli -- setup`
+Run: `npm test -- setup`
 Expected: FAIL — `loginStep` y `blockers` no existen.
 
 - [ ] **Step 3: Write the implementation**
@@ -1457,7 +1457,7 @@ exactamente como está: cambiarla aquí sería alcance que este plan no pidió.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `npm test -w @agentbridge/cli -- setup`
+Run: `npm test -- setup`
 Expected: PASS.
 
 Run: `npm test && npm run typecheck`
