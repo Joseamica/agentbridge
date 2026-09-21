@@ -452,7 +452,7 @@ async function addShareChecks(
 // login check all live under `profileHome` regardless of whether a shared folder is in the
 // picture at all.
 async function addProfileChecks(
-  add: (name: string, ok: boolean, detail: string, blocking: boolean) => void,
+  add: (name: string, ok: boolean, detail: string, blocking: boolean, security?: boolean) => void,
   o: { profileHome: string; repoDir?: string; run: CommandRunner },
 ): Promise<void> {
   // Everything below lives under `profileHome`, independent of whether a shared folder was given —

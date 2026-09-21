@@ -178,8 +178,9 @@ Then it *performs* the rest instead of printing it. It opens Claude's login in t
 profile — the browser opens, you type your password, you come back — and afterwards checks for
 itself whether a session actually exists. It copies your link to the clipboard. It registers the
 MCP server if you say yes. It runs every `doctor` check and tells you only the ones that stop you
-from answering, not the full diagnostic. And at the end, if nothing is blocking, it offers to start
-answering right there: say yes and that terminal becomes the responder.
+from answering, not the full diagnostic. It ends with a short verdict — what's ready, what's still
+pending — and then, if nothing is blocking, offers to start answering right there: say yes and that
+terminal becomes the responder.
 
 `setup` is a thin conductor: every step it takes is one of the commands documented below
 (`connect`, `setup-responder`, `doctor`, `responder`, `claude mcp add`, `claude auth login`) — it
