@@ -38,7 +38,10 @@ const noopRunner = async () => ({ code: 0, stdout: '', stderr: '' })
 // Every handover of the terminal `setup` performs — Claude's login, and the responder itself.
 // Recorded rather than performed: a test that actually spawned `claude` would need one installed,
 // and would hand it this suite's own stdin.
-type InteractiveCall = { command: string; args: string[]; env: NodeJS.ProcessEnv; cwd?: string }
+// `at` is how many lines had been printed when the handover happened — the only ordering
+// evidence available, and what makes "the responder starts last" a real assertion instead of a
+// claim about a set with no order in it.
+type InteractiveCall = { command: string; args: string[]; env: NodeJS.ProcessEnv; cwd?: string; at?: number }
 
 function context(o: Partial<SetupContext> & { prompt: SetupContext['prompt'] }): SetupContext {
   return {
@@ -88,6 +91,9 @@ async function seedIdentityAndProfile(): Promise<void> {
 async function responderSetupContext(o: {
   answers: string[]
   loggedIn?: boolean
+  // The first-install case, and the only one where the two answers differ: doctor asks before the
+  // login and is told no, the login runs, and the check right after it is told yes.
+  logsInDuringSetup?: boolean
   copyLink?: (text: string) => Promise<boolean>
   relays?: string[]
 }): Promise<SetupContext & { out: ReturnType<typeof memoryOutput>; interactiveCalls: InteractiveCall[]; expectDrained: () => void }> {
@@ -102,6 +108,7 @@ async function responderSetupContext(o: {
   const interactiveCalls: InteractiveCall[] = []
   const { prompt, expectDrained } = scripted(o.answers)
   const loggedIn = o.loggedIn ?? true
+  let authAsked = 0
   const ctx = context({
     prompt,
     out,
@@ -110,7 +117,11 @@ async function responderSetupContext(o: {
       // the parsed field, never the code. A fake that returned only `code: 0` would let an
       // implementation that reads the exit code pass while being wrong about the one thing here
       // that matters.
-      if (args[0] === 'auth' && args[1] === 'status') return { code: 0, stdout: JSON.stringify({ loggedIn }), stderr: '' }
+      if (args[0] === 'auth' && args[1] === 'status') {
+        authAsked += 1
+        // Doctor's question is the first; the one after the login is the second.
+        return { code: 0, stdout: JSON.stringify({ loggedIn: o.logsInDuringSetup ? authAsked > 1 : loggedIn }), stderr: '' }
+      }
       // The real `claude plugin install` leaves this behind, and doctor's "Plugin instalado"
       // check (blocking) reads exactly this file. Without it, every flow test would run against
       // a blocked install and never reach the branches it claims to test.
@@ -124,7 +135,7 @@ async function responderSetupContext(o: {
       return { code: 0, stdout: '', stderr: '' }
     },
     runInteractive: async (command, args, opts) => {
-      interactiveCalls.push({ command, args, env: opts.env, cwd: opts.cwd })
+      interactiveCalls.push({ command, args, env: opts.env, cwd: opts.cwd, at: out.lines.length })
       return { code: 0, spawnFailed: false }
     },
     copyLink: o.copyLink ?? (async () => true),
@@ -280,6 +291,215 @@ describe('the answering side', () => {
     // And it must not tell them they are ready to answer while a blocking check is failing.
     expect(text).not.toMatch(/Listo para contestar/)
     expect(text).toMatch(/Cuando esté resuelto, empieza a contestar con/)
+  })
+})
+
+describe('the login step', () => {
+  it('does nothing and asks nothing when the profile is already logged in', async () => {
+    const out = memoryOutput()
+    const calls: string[] = []
+    const ok = await loginStep({
+      claudeConfigDir: '/perfil/claude',
+      env: {},
+      out,
+      prompt: async () => {
+        calls.push('asked')
+        return ''
+      },
+      run: async () => {
+        calls.push('ran')
+        return { code: 0, stdout: '{"loggedIn":true}', stderr: '' }
+      },
+      runInteractive: async (command) => {
+        calls.push(command)
+        return { code: 0, spawnFailed: false }
+      },
+      alreadyLoggedIn: true,
+    })
+    expect(ok).toBe(true)
+    expect(calls).toEqual([])
+    expect(out.lines).toEqual([])
+  })
+
+  it('opens Claude in the dedicated profile and confirms afterwards', async () => {
+    const out = memoryOutput()
+    const spawned: { command: string; args: string[]; env: NodeJS.ProcessEnv }[] = []
+    const ok = await loginStep({
+      claudeConfigDir: '/perfil/claude',
+      env: { PATH: '/usr/bin' },
+      out,
+      prompt: async () => '',
+      // The check that runs AFTER the person comes back. `claude auth status --json` exits 0
+      // either way, so the verdict is the parsed field — a fake that returned only `code: 0`
+      // would let a broken implementation pass.
+      run: async () => ({ code: 0, stdout: '{"loggedIn":true}', stderr: '' }),
+      runInteractive: async (command, args, opts) => {
+        spawned.push({ command, args, env: opts.env })
+        return { code: 0, spawnFailed: false }
+      },
+      alreadyLoggedIn: false,
+    })
+    expect(ok).toBe(true)
+    expect(spawned).toHaveLength(1)
+    expect(spawned[0]?.command).toBe('claude')
+    // The dedicated subcommand, not the whole interface: nothing for the person to type inside.
+    expect(spawned[0]?.args).toEqual(['auth', 'login'])
+    // The whole point of the dedicated profile: this login must not touch their everyday one.
+    expect(spawned[0]?.env.CLAUDE_CONFIG_DIR).toBe('/perfil/claude')
+    // And the rest of the environment survives — a login spawned with only CLAUDE_CONFIG_DIR
+    // would not find `claude` on PATH in the first place.
+    expect(spawned[0]?.env.PATH).toBe('/usr/bin')
+    // Never a shell line for them to paste.
+    expect(out.lines.join('\n')).not.toMatch(/CLAUDE_CONFIG_DIR=/)
+  })
+
+  it('says plainly that the session is still not started, without blaming them', async () => {
+    const out = memoryOutput()
+    const ok = await loginStep({
+      claudeConfigDir: '/perfil/claude',
+      env: {},
+      out,
+      prompt: async () => '',
+      // Exit 0 with loggedIn:false — what really happens when someone opens Claude and closes it
+      // without logging in. A test that used a non-zero code here would pass against an
+      // implementation that only checks the exit code, which is the bug this pins.
+      run: async () => ({ code: 0, stdout: '{"loggedIn":false}', stderr: '' }),
+      runInteractive: async () => ({ code: 0, spawnFailed: false }),
+      alreadyLoggedIn: false,
+    })
+    expect(ok).toBe(false)
+    expect(out.lines.join('\n')).toMatch(/no quedó iniciada/i)
+    expect(out.lines.join('\n')).toContain(`${CLI_COMMAND} setup`)
+  })
+
+  it('does not call a session started when the status output is not JSON at all', async () => {
+    // A `claude` that printed a banner, or an error, or nothing: unparseable is not a session.
+    const out = memoryOutput()
+    const ok = await loginStep({
+      claudeConfigDir: '/perfil/claude',
+      env: {},
+      out,
+      prompt: async () => '',
+      run: async () => ({ code: 0, stdout: 'Welcome to Claude Code', stderr: '' }),
+      runInteractive: async () => ({ code: 0, spawnFailed: false }),
+      alreadyLoggedIn: false,
+    })
+    expect(ok).toBe(false)
+  })
+
+  it('explains that Claude Code is missing instead of pretending it opened', async () => {
+    const out = memoryOutput()
+    const ok = await loginStep({
+      claudeConfigDir: '/perfil/claude',
+      env: {},
+      out,
+      prompt: async () => '',
+      run: async () => ({ code: 0, stdout: '{"loggedIn":false}', stderr: '' }),
+      runInteractive: async () => ({ code: null, spawnFailed: true }),
+      alreadyLoggedIn: false,
+    })
+    expect(ok).toBe(false)
+    expect(out.lines.join('\n')).toMatch(/claude\.com\/claude-code/)
+  })
+})
+
+describe('blockers', () => {
+  it('keeps only the failing checks that stop the person from answering', () => {
+    const checks = [
+      { name: 'Base de datos', ok: true, detail: 'ok', blocking: true },
+      { name: 'Tablero wss://uno', ok: false, detail: 'no', blocking: false },
+      { name: 'Llave de AgentBridge', ok: false, detail: 'falta', blocking: true },
+    ]
+    expect(blockers(checks).map((c) => c.name)).toEqual(['Llave de AgentBridge'])
+  })
+})
+
+describe('the guided flow as a whole', () => {
+  it('prints no shell syntax and no technical check list when everything works', async () => {
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', '', '', 'n'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const text = ctx.out.lines.join('\n')
+    expect(text).not.toMatch(/CLAUDE_CONFIG_DIR=/)
+    expect(text).not.toMatch(/start\.sh/)
+    expect(text).not.toMatch(/\[ok\]/)
+    expect(text).not.toMatch(/\[falta\]/)
+    expect(text).toContain('agentbridge:nprofile1')
+    expect(text).toMatch(/portapapeles/)
+    // Nothing blocks, so the offer to start is the last thing asked — and "n" ends it with the
+    // one command that starts it later, not with a diagnosis.
+    expect(text).toMatch(/Cuando quieras empezar a contestar/)
+  })
+
+  it('names the one thing that blocks, and nothing else', async () => {
+    // A run where one board is unreachable (not blocking — the other one works) and the login
+    // never happened (blocking). Port 9 on loopback refuses immediately: nothing here needs a
+    // network, and nothing waits on a timeout.
+    const ctx = await responderSetupContext({
+      answers: ['Dani', '1', '', '', ''],
+      loggedIn: false,
+      relays: [board.url, 'wss://127.0.0.1:9/'],
+    })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const text = ctx.out.lines.join('\n')
+    expect(text).toMatch(/no quedó iniciada/i)
+    // The dead board is real — doctor saw it fail — and this command still says nothing about it.
+    expect(text).not.toMatch(/Tablero/)
+    // It did open the login rather than telling them to open it.
+    expect(ctx.interactiveCalls.map((c) => c.args.join(' '))).toContain('auth login')
+    // And with no session there is nothing to start, so it never offers.
+    expect(text).not.toMatch(/¿Empiezo a contestar ahora\?/)
+    expect(ctx.interactiveCalls.some((c) => c.args.includes('plugin:agentbridge@agentbridge-local'))).toBe(false)
+  })
+
+  it('starts answering when asked to', async () => {
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', '', '', 's'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    expect(ctx.interactiveCalls.map((c) => c.args.join(' ')).join('\n')).toContain('plugin:agentbridge@agentbridge-local')
+  })
+
+  it('offers to start after a login that happened during this very run', async () => {
+    // The first install, which is the ONLY way most people will ever see this command: doctor ran
+    // before the login and recorded "no session". Deciding whether the responder can start from
+    // that recorded answer — instead of from what the login itself reported — refuses to start a
+    // responder that works perfectly, on the single most common path through this flow.
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', '', '', '', 's'], logsInDuringSetup: true })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const text = ctx.out.lines.join('\n')
+    expect(text).toMatch(/la sesión quedó iniciada/i)
+    expect(text).not.toMatch(/no quedó iniciada/i)
+    // It did offer, and it did start.
+    expect(text).not.toMatch(/Cuando esté resuelto/)
+    expect(ctx.interactiveCalls.map((c) => c.args.join(' ')).join('\n')).toContain('plugin:agentbridge@agentbridge-local')
+  })
+
+  it('does not skip the asking side when the person chose both roles', async () => {
+    // The ordering bug this plan nearly shipped: starting the responder from inside the answering
+    // branch would return before `connect` and the MCP registration ever ran, and the person would
+    // have no way to know what they did not get.
+    const ctx = await responderSetupContext({ answers: ['Dani', '3', '', '', 'n', 'n', 's'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const text = ctx.out.lines.join('\n')
+    expect(text).toMatch(/servidor MCP/i)
+    // And the responder still starts, AFTER everything else — not merely at some point during
+    // the run. `at` is the line count when the handover happened.
+    const mcpLine = ctx.out.lines.findIndex((line) => /servidor MCP/i.test(line))
+    const responderCall = ctx.interactiveCalls.find((c) => c.args.includes('plugin:agentbridge@agentbridge-local'))
+    expect(mcpLine).toBeGreaterThanOrEqual(0)
+    expect(responderCall?.at).toBeGreaterThan(mcpLine)
+  })
+
+  it('still prints the link when no clipboard tool exists', async () => {
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', '', '', 'n'], copyLink: async () => false })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const text = ctx.out.lines.join('\n')
+    expect(text).toContain('agentbridge:nprofile1')
+    expect(text).not.toMatch(/portapapeles/)
   })
 })
 
