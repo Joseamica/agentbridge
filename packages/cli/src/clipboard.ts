@@ -8,6 +8,7 @@ export type ClipboardWriter = (command: string, args: string[], text: string) =>
 export const defaultClipboardWriter: ClipboardWriter = (command, args, text) =>
   new Promise((resolvePromise) => {
     let settled = false
+    let aborted = false
     const finish = (ok: boolean) => {
       if (settled) return
       settled = true
@@ -17,12 +18,30 @@ export const defaultClipboardWriter: ClipboardWriter = (command, args, text) =>
     try {
       // No `shell: true`, like every other spawn in this codebase: the text being copied is the
       // person's own link, but it reaches the tool through stdin, never through a command line.
-      child = spawn(command, args, { stdio: ['pipe', 'ignore', 'ignore'] })
+      // Bounded the same way `defaultRunner` (setup-responder.ts) bounds its own spawn: Node's
+      // own kill-on-abort, not a `Promise.race` layered on top that would leave the real child —
+      // and our stdin pipe — alive underneath a promise that has already resolved. A bound
+      // matters more here than it looks: `pbcopy` and `clip` read stdin and exit, but `xclip` and
+      // `wl-copy` fork to keep owning the X/Wayland selection after the copy, so their process
+      // lifetime is not "read stdin, exit" at all. Without a deadline, a tool that never settles
+      // hangs `copyToClipboard` — and therefore `setup` — forever on its very last step. Three
+      // seconds is generous for a program whose entire job is to read one line.
+      child = spawn(command, args, { stdio: ['pipe', 'ignore', 'ignore'], signal: AbortSignal.timeout(3000) })
     } catch {
       return finish(false)
     }
-    child.on('error', () => finish(false))
-    child.on('exit', (code) => finish(code === 0))
+    child.on('error', (err) => {
+      const isAbort = (err as NodeJS.ErrnoException).code === 'ABORT_ERR' || err.name === 'AbortError'
+      // As in defaultRunner: once the child has a real pid, defer to `close` — which only fires
+      // once the killed process is truly gone — instead of resolving here and racing a stdin
+      // pipe that may still be technically open underneath it.
+      if (isAbort && child.pid !== undefined) {
+        aborted = true
+        return
+      }
+      finish(false)
+    })
+    child.on('close', (code) => finish(aborted ? false : code === 0))
     child.stdin.on('error', () => finish(false))
     child.stdin.end(text)
   })

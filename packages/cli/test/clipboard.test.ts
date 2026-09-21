@@ -67,4 +67,22 @@ describe('copyToClipboard', () => {
     await expect(defaultClipboardWriter('cat', [], 'hola')).resolves.toBe(true)
     await expect(defaultClipboardWriter('agentbridge-no-existe-jamas', [], 'hola')).resolves.toBe(false)
   })
+
+  it(
+    'resolves false instead of hanging forever when a tool holds stdin open and never exits',
+    async () => {
+      // A real child, not a mock: `setInterval` keeps its event loop alive on its own, so it
+      // takes our stdin and then never exits by itself, the same shape `xclip`/`wl-copy` have in
+      // practice (see the comment on defaultClipboardWriter). `process.stdin.resume()` was tried
+      // first, since it reads as the more obviously stdin-shaped hang, but on this Node version
+      // it turned out to exit at EOF instead of hanging — verified with `timeout 4 node -e
+      // "setInterval(() => {}, 1000)"`, which only the interval-based script actually blocks past.
+      // Using a script confirmed to hang, rather than one that merely sounds like it should,
+      // is what makes this a deterministic proof of the deadline instead of a coin flip. Test
+      // timeout (10s) sits comfortably above the spawn's own 3s deadline so a slow machine fails
+      // loudly instead of flaking.
+      await expect(defaultClipboardWriter('node', ['-e', 'setInterval(() => {}, 1000)'], 'hola')).resolves.toBe(false)
+    },
+    10_000,
+  )
 })
