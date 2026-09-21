@@ -81,7 +81,10 @@ describe('copyToClipboard', () => {
       // is what makes this a deterministic proof of the deadline instead of a coin flip. Test
       // timeout (10s) sits comfortably above the spawn's own 3s deadline so a slow machine fails
       // loudly instead of flaking.
-      await expect(defaultClipboardWriter('node', ['-e', 'setInterval(() => {}, 1000)'], 'hola')).resolves.toBe(false)
+      // `process.execPath`, never the bare name `node`: on a machine where node is not on PATH,
+      // spawning it by name fails with ENOENT and this test would resolve false for the wrong
+      // reason — passing green while exercising nothing of the deadline it exists to prove.
+      await expect(defaultClipboardWriter(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], 'hola')).resolves.toBe(false)
     },
     10_000,
   )
