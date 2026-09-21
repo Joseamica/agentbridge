@@ -1528,7 +1528,10 @@ describe('the docs do not ask a person to paste shell', () => {
   })
 
   it('tells people about the responder command', async () => {
-    expect(await readFile(join(ROOT, 'docs/inicio-rapido.md'), 'utf8')).toMatch(/agentbridge responder/)
+    // The npx form, not a bare `agentbridge`: nothing installs a binary on PATH, so a printed
+    // `agentbridge responder` is a step nobody can actually run. `CLI_COMMAND` is
+    // `npx -y @joseamica/agentbridge@latest`, which is why this matches `@latest responder`.
+    expect(await readFile(join(ROOT, 'docs/inicio-rapido.md'), 'utf8')).toMatch(/@latest responder/)
   })
 
   it('left no copy of the 0.2 acceptance runbook behind', async () => {
@@ -1556,8 +1559,11 @@ corto. Escríbela así, en este orden:
    trabajo*.
 4. **Qué va a hacer solo**: abrir Claude para que inicies sesión, dejar la carpeta lista, copiarte el
    enlace al portapapeles y —si le dices que sí— ponerte a contestar.
-5. **Los dos comandos del día a día**: `agentbridge responder` para ponerte a contestar, y
-   `agentbridge requests` para ver quién te pidió permiso.
+5. **Los dos comandos del día a día**, escritos completos, en su forma real con `npx` —
+   `npx -y @joseamica/agentbridge@latest responder` para ponerte a contestar y
+   `npx -y @joseamica/agentbridge@latest requests` para ver quién te pidió permiso. **No escribas
+   `agentbridge responder` a secas en ningún lado**: no hay binario con ese nombre en el PATH de
+   nadie, y una instrucción que no se puede ejecutar es peor que ninguna.
 6. **Si algo falla**: `agentbridge doctor`, y qué significan sus renglones.
 
 No incluyas ninguna ruta a un script, ninguna variable de entorno y ninguna diferencia entre sistemas
@@ -1588,6 +1594,11 @@ Quita la mención a exportar `CLAUDE_CONFIG_DIR`: eso ahora lo hace `responder`.
   imprime y ya. Es una comodidad; nada depende de ella.
 - **Windows no se prueba en CI.** Las dos correcciones de esta versión (permisos POSIX y carpetas
   sincronizadas) están probadas inyectando la plataforma, no corriendo en Windows.
+- **El comando de todos los días es largo.** No instalamos nada en el PATH, así que ponerse a
+  contestar al día siguiente se escribe `npx -y @joseamica/agentbridge@latest responder`. `setup` lo
+  arranca por ti la primera vez, y eso cubre el peor momento; el resto de los días sigue siendo una
+  línea larga. Acortarla querría decir instalar un binario global, que es una decisión de producto,
+  no una corrección de este plan.
 ```
 
 `docs/runbooks/aceptacion-0.2.md` → `docs/runbooks/aceptacion-0.3.md` con `git mv`. Reescribe §0: ya no
@@ -1648,7 +1659,9 @@ it('exposes the responder command from the packaged bundle', () => {
   // sources is a command that does not exist.
   const result = spawnSync(process.execPath, [join(packDir, 'bin/agentbridge.js'), '--help'], { encoding: 'utf8' })
   expect(result.status).toBe(0)
-  expect(result.stdout).toMatch(/agentbridge responder/)
+  // `CLI_COMMAND` is `npx -y @joseamica/agentbridge@latest`, so the usage line reads
+  // "npx -y @joseamica/agentbridge@latest responder" — never a bare "agentbridge responder".
+  expect(result.stdout).toMatch(/@latest responder/)
 })
 
 it('runs the responder command from the packaged bundle without a profile', () => {
@@ -1658,7 +1671,7 @@ it('runs the responder command from the packaged bundle without a profile', () =
     encoding: 'utf8',
   })
   expect(result.status).toBe(1)
-  expect(result.stderr).toMatch(/agentbridge setup/)
+  expect(result.stderr).toMatch(/@latest setup/)
 })
 ```
 
