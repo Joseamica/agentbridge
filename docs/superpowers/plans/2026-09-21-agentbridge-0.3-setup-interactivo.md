@@ -1232,6 +1232,18 @@ describe('the guided flow as a whole', () => {
     expect(ctx.interactiveCalls.map((c) => c.args.join(' ')).join('\n')).toContain('plugin:agentbridge@agentbridge-local')
   })
 
+  it('does not skip the asking side when the person chose both roles', async () => {
+    // The ordering bug this plan nearly shipped: starting the responder from inside the answering
+    // branch would return before `connect` and the MCP registration ever ran, and the person would
+    // have no way to know what they did not get.
+    const ctx = responderSetupContext({ answers: ['Dani', '3', '', '', 'n', 'n', 's'] })
+    await runSetup(ctx)
+    const text = ctx.out.lines.join('\n')
+    expect(text).toMatch(/servidor MCP/i)
+    // And the responder still starts, after everything else.
+    expect(ctx.interactiveCalls.map((c) => c.args.join(' ')).join('\n')).toContain('plugin:agentbridge@agentbridge-local')
+  })
+
   it('still prints the link when no clipboard tool exists', async () => {
     const ctx = responderSetupContext({ answers: ['Dani', '1', '', '', 'n'], copyLink: async () => false })
     await runSetup(ctx)
@@ -1369,29 +1381,25 @@ respondedor por:
     out.log('')
 
     done.push('Listo para contestar desde esta computadora.')
-    // Offered, not ordered — and only when it can actually work. Asking someone to start a
-    // responder with no session would hand them a failure as the last thing they see.
-    if (loggedIn && blockers(checks).length === 0) {
-      const startNow = await askWithRetries(
-        prompt,
-        out,
-        '¿Empiezo a contestar ahora? [s/n]: ',
-        parseYesNo,
-        'Escribe s (sí) o n (no).',
-        `No entendí tu respuesta. Cuando quieras empezar: ${CLI_COMMAND} responder`,
-      ).catch(() => false)
-      if (startNow) {
-        // Last thing this command does on purpose: it occupies the terminal until Ctrl+C, so the
-        // closing summary is printed BEFORE it, not after.
-        out.log('')
-        out.log(SUMMARY_BEFORE_START_ES)
-        await runResponder({ profileHome, env: ctx.env, out, runInteractive: ctx.runInteractive })
-        return
-      }
-      pending.push(`Cuando quieras empezar a contestar: ${CLI_COMMAND} responder`)
-    } else {
-      pending.push(`Cuando esté resuelto, empieza a contestar con: ${CLI_COMMAND} responder`)
-    }
+    // NOT started here. Starting the responder occupies the terminal until Ctrl+C, and this is
+    // section 3 of five: someone who answered "3" (both sides) still has the asking side ahead of
+    // them — the link they paste, `connect`, the MCP registration. Starting here would silently
+    // skip all of it and they would never know what they did not get. The offer happens after the
+    // verdict, as the very last thing this command does.
+    canStartResponder = loggedIn && blockers(checks).length === 0
+    responderProfileHome = profileHome
+    if (!canStartResponder) pending.push(`Cuando esté resuelto, empieza a contestar con: ${CLI_COMMAND} responder`)
+```
+
+Declara las dos variables junto a `done` y `pending`, al principio de `runGuidedSetup`:
+
+```ts
+  const done: string[] = [`Identidad lista como ${profile.name}.`]
+  const pending: string[] = []
+  // Filled in by the answering branch; read after the verdict, which is the only place from which
+  // starting the responder cannot swallow a step that has not run yet.
+  let canStartResponder = false
+  let responderProfileHome: string | null = null
 ```
 
 donde `SUMMARY_BEFORE_START_ES` es una constante del módulo:
@@ -1417,6 +1425,28 @@ a `doctor` una sola vez:
   }
   out.log('')
   out.log(`Si algo no funciona, esto te dice qué es: ${CLI_COMMAND} doctor`)
+
+  // The last thing, after every branch has run and the verdict has been printed. Offered, not
+  // ordered, and only when it can actually work: asking someone to start a responder with no
+  // session would hand them a failure as the last thing they see.
+  if (canStartResponder && responderProfileHome) {
+    const startNow = await askWithRetries(
+      prompt,
+      out,
+      '¿Empiezo a contestar ahora? [s/n]: ',
+      parseYesNo,
+      'Escribe s (sí) o n (no).',
+      `No entendí tu respuesta. Cuando quieras empezar: ${CLI_COMMAND} responder`,
+    ).catch(() => false)
+    if (!startNow) {
+      out.log(`Cuando quieras empezar a contestar: ${CLI_COMMAND} responder`)
+      return
+    }
+    out.log('')
+    out.log(SUMMARY_BEFORE_START_ES)
+    // Occupies the terminal until Ctrl+C. Nothing may follow it.
+    await runResponder({ profileHome: responderProfileHome, env: ctx.env, out, runInteractive: ctx.runInteractive })
+  }
 ```
 
 **La rama de quien pregunta no se toca.** Sus tres pasos —pedir el enlace, `connect`, registrar el
