@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { plainSocketFactory, startFakeBoard, type FakeBoard } from '../../core/test/support/fake-board'
 import { RESPONDER_CONFIG_FILE } from '../src/commands/responder'
-import { applyRelays, runSetup, setupCommand, type SetupContext } from '../src/commands/setup'
+import { applyRelays, blockers, loginStep, runSetup, setupCommand, type SetupContext } from '../src/commands/setup'
 import { memoryOutput, PromptEOF } from '../src/context'
 
 const allowAnyRelay = (inputs: readonly unknown[]): string[] => inputs.filter((x): x is string => typeof x === 'string').slice(0, 5)
@@ -35,6 +35,11 @@ function scripted(answers: string[]) {
 
 const noopRunner = async () => ({ code: 0, stdout: '', stderr: '' })
 
+// Every handover of the terminal `setup` performs — Claude's login, and the responder itself.
+// Recorded rather than performed: a test that actually spawned `claude` would need one installed,
+// and would hand it this suite's own stdin.
+type InteractiveCall = { command: string; args: string[]; env: NodeJS.ProcessEnv; cwd?: string }
+
 function context(o: Partial<SetupContext> & { prompt: SetupContext['prompt'] }): SetupContext {
   return {
     home: identityHome,
@@ -45,6 +50,10 @@ function context(o: Partial<SetupContext> & { prompt: SetupContext['prompt'] }):
     createSocket: plainSocketFactory,
     repoDir,
     profileHome,
+    runInteractive: async () => ({ code: 0, spawnFailed: false }),
+    // Never the real clipboard: this suite must not overwrite whatever the person running it
+    // has copied, and on a headless CI box there is nothing to write to anyway.
+    copyLink: async () => true,
     ...o,
   } as SetupContext
 }
@@ -70,6 +79,57 @@ async function seedIdentityAndProfile(): Promise<void> {
   const store = await openStore(identityHome, { relayPolicy: allowAnyRelay })
   setProfile(store, { name: 'Ana', relays: [board.url], now: 1_700_000_000 })
   store.close()
+}
+
+// A whole guided run on temp directories, with every subprocess faked the way the real programs
+// behave — so a flow test exercises the real branching (doctor's verdict included) instead of a
+// stub of it. `run` stands in for `claude`; `runInteractive` records the handovers; `copyLink`
+// answers true unless a test says otherwise.
+async function responderSetupContext(o: {
+  answers: string[]
+  loggedIn?: boolean
+  copyLink?: (text: string) => Promise<boolean>
+  relays?: string[]
+}): Promise<SetupContext & { out: ReturnType<typeof memoryOutput>; interactiveCalls: InteractiveCall[]; expectDrained: () => void }> {
+  await loadOrCreateIdentity(identityHome)
+  const store = await openStore(identityHome, { relayPolicy: allowAnyRelay })
+  // Relays but no name: the name is the first question the guided flow asks, and seeding it
+  // would shift every scripted answer below by one without any test failing for the right reason.
+  setProfile(store, { relays: o.relays ?? [board.url], now: 1_700_000_000 })
+  store.close()
+
+  const out = memoryOutput()
+  const interactiveCalls: InteractiveCall[] = []
+  const { prompt, expectDrained } = scripted(o.answers)
+  const loggedIn = o.loggedIn ?? true
+  const ctx = context({
+    prompt,
+    out,
+    run: async (_command, args) => {
+      // `claude auth status --json` exits 0 whether or not there is a session — the verdict is
+      // the parsed field, never the code. A fake that returned only `code: 0` would let an
+      // implementation that reads the exit code pass while being wrong about the one thing here
+      // that matters.
+      if (args[0] === 'auth' && args[1] === 'status') return { code: 0, stdout: JSON.stringify({ loggedIn }), stderr: '' }
+      // The real `claude plugin install` leaves this behind, and doctor's "Plugin instalado"
+      // check (blocking) reads exactly this file. Without it, every flow test would run against
+      // a blocked install and never reach the branches it claims to test.
+      if (args[0] === 'plugin' && args[1] === 'install') {
+        await mkdir(join(profileHome, 'claude', 'plugins'), { recursive: true })
+        await writeFile(
+          join(profileHome, 'claude', 'plugins', 'installed_plugins.json'),
+          JSON.stringify({ plugins: { 'agentbridge@agentbridge-local': [{ version: '0.3.0' }] } }),
+        )
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    },
+    runInteractive: async (command, args, opts) => {
+      interactiveCalls.push({ command, args, env: opts.env, cwd: opts.cwd })
+      return { code: 0, spawnFailed: false }
+    },
+    copyLink: o.copyLink ?? (async () => true),
+  })
+  return Object.assign(ctx, { out, interactiveCalls, expectDrained })
 }
 
 describe('the identity step', () => {
@@ -156,7 +216,7 @@ describe('the asking side', () => {
 describe('the answering side', () => {
   it('prepares the shared folder and the dedicated profile, and never writes AgentBridge state into it', async () => {
     await seedIdentityAndProfile()
-    const { prompt, expectDrained } = scripted(['1', shareDir, ''])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', ''])
     await runSetup(context({ prompt }))
     expectDrained()
     await expect(access(join(profileHome, RESPONDER_CONFIG_FILE))).resolves.toBeUndefined()
@@ -177,7 +237,7 @@ describe('the answering side', () => {
   it("tells the person to give their link to whoever will ask them", async () => {
     await seedIdentityAndProfile()
     const out = memoryOutput()
-    const { prompt, expectDrained } = scripted(['1', shareDir, ''])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', ''])
     await runSetup(context({ prompt, out }))
     expectDrained()
     const text = out.lines.join('\n')
@@ -194,7 +254,7 @@ describe('the answering side', () => {
     await seedIdentityAndProfile()
     const spacedProfile = join(root, 'mi respondedor')
     const out = memoryOutput()
-    const { prompt, expectDrained } = scripted(['1', shareDir, ''])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', ''])
     await runSetup(context({ prompt, out, profileHome: spacedProfile }))
     expectDrained()
     const text = out.lines.join('\n')
@@ -202,21 +262,24 @@ describe('the answering side', () => {
     expect(text).not.toContain(`'${spacedProfile}'`)
   })
 
-  it("lists doctor's failing checks as pending work instead of claiming it is done", async () => {
+  it('says the blocking thing in its own words, and never claims it is ready to answer', async () => {
     await seedIdentityAndProfile()
     const out = memoryOutput()
     // A real diagnostic failure, not a crash: the bundle exists (so setupResponder completes) and
-    // the board refuses reads, so doctor's own board check fails and the summary has to say so.
+    // the only board refuses reads, so every board fails and doctor's aggregate "Tableros
+    // públicos" check — the blocking one — fires.
     board.options = { ...board.options, rejectReads: true }
-    const { prompt, expectDrained } = scripted(['1', shareDir, ''])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', ''])
     await runSetup(context({ prompt, out }))
     expectDrained()
     const text = out.lines.join('\n')
-    // Searching the whole output would pass on the "[falta] Tablero …" line doctor prints on its
-    // own. What this test is about is the summary: the failing check has to be repeated under
-    // "Pendiente:", where the person looks for what is left to do.
-    const summary = text.slice(text.indexOf('Pendiente:'))
-    expect(summary).toMatch(/Tablero/)
+    expect(text).toMatch(/Falta algo: Ningún tablero te dejó publicar y leer/)
+    // The per-board line is doctor's business, not this command's: it is the kind of detail that
+    // turned 0.2's ending into seventeen lines nobody could act on.
+    expect(text).not.toMatch(/Tablero wss:/)
+    // And it must not tell them they are ready to answer while a blocking check is failing.
+    expect(text).not.toMatch(/Listo para contestar/)
+    expect(text).toMatch(/Cuando esté resuelto, empieza a contestar con/)
   })
 })
 
@@ -231,7 +294,7 @@ describe('the shared-folder protection', () => {
     await mkdir(join(shareDir, '.git'), { recursive: true })
     await writeFile(join(shareDir, '.env'), 'SECRET=x')
     const out = memoryOutput()
-    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR'])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR', ''])
     await runSetup(context({ prompt, out }))
     expectDrained()
     const text = out.lines.join('\n')
@@ -256,7 +319,7 @@ describe('the shared-folder protection', () => {
     await mkdir(shareDir, { recursive: true })
     await symlink(root, join(shareDir, 'enlace'))
     const out = memoryOutput()
-    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR'])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR', ''])
     await runSetup(context({ prompt, out }))
     expectDrained()
     expect(out.lines.join('\n')).toMatch(/enlaces simbólicos/)
@@ -267,7 +330,7 @@ describe('the shared-folder protection', () => {
     await mkdir(join(shareDir, 'node_modules', 'algun-paquete'), { recursive: true })
     await writeFile(join(shareDir, 'node_modules', 'algun-paquete', '.env'), 'SECRET=y')
     const out = memoryOutput()
-    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR'])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR', ''])
     await runSetup(context({ prompt, out }))
     expectDrained()
     // Specifically the "did not look inside" reason, not "found credentials in there" — the
