@@ -134,6 +134,22 @@ export function closePrompt(): void {
   sharedPromptInterface = null
 }
 
+// Pause and resume, NEVER close, around a child process that takes over the terminal. `close()`
+// fires the 'close' event, which sets `promptInterfaceClosed` permanently — that flag is the
+// protection that tells "stdin really ended" apart from "we are busy", and tripping it here
+// would leave every later question rejecting with PromptEOF even though the person is still
+// sitting there. Verified against a real pseudo-terminal: after pause → spawn(stdio:'inherit') →
+// resume, the flag is still false and the next `.question()` gets its answer normally.
+export function pausePrompt(): void {
+  sharedPromptInterface?.pause()
+  if (sharedPromptInterface) process.stdin.pause()
+}
+
+export function resumePrompt(): void {
+  if (sharedPromptInterface) process.stdin.resume()
+  sharedPromptInterface?.resume()
+}
+
 export type CliContext = {
   home: string
   out: Output
