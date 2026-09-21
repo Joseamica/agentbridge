@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { plainSocketFactory, startFakeBoard, type FakeBoard } from '../../core/test/support/fake-board'
 import { RESPONDER_CONFIG_FILE } from '../src/commands/responder'
-import { applyRelays, blockers, loginStep, runSetup, setupCommand, type SetupContext } from '../src/commands/setup'
+import { applyRelays, blockers, loginStep, mustMention, runSetup, setupCommand, type SetupContext } from '../src/commands/setup'
 import { memoryOutput, PromptEOF } from '../src/context'
 
 const allowAnyRelay = (inputs: readonly unknown[]): string[] => inputs.filter((x): x is string => typeof x === 'string').slice(0, 5)
@@ -116,7 +116,13 @@ async function responderSetupContext(o: {
   logsInDuringSetup?: boolean
   copyLink?: (text: string) => Promise<boolean>
   relays?: string[]
-}): Promise<SetupContext & { out: ReturnType<typeof memoryOutput>; interactiveCalls: InteractiveCall[]; expectDrained: () => void }> {
+  // Puts the identity (and therefore the secret key) inside a folder a sync client uploads on its
+  // own — a real, temp-only path that doctor's cloudSyncedPath recognises by segment name.
+  keyInCloudFolder?: boolean
+}): Promise<
+  SetupContext & { out: ReturnType<typeof memoryOutput>; interactiveCalls: InteractiveCall[]; expectDrained: () => void; asked: string[] }
+> {
+  if (o.keyInCloudFolder) identityHome = join(root, 'OneDrive', 'identidad')
   await loadOrCreateIdentity(identityHome)
   const store = await openStore(identityHome, { relayPolicy: allowAnyRelay })
   // Relays but no name: the name is the first question the guided flow asks, and seeding it
@@ -126,7 +132,7 @@ async function responderSetupContext(o: {
 
   const out = memoryOutput()
   const interactiveCalls: InteractiveCall[] = []
-  const { prompt, expectDrained } = scripted(o.answers)
+  const { prompt, expectDrained, asked } = scripted(o.answers)
   const loggedIn = o.loggedIn ?? true
   let authAsked = 0
   const ctx = context({
@@ -160,7 +166,9 @@ async function responderSetupContext(o: {
     },
     copyLink: o.copyLink ?? (async () => true),
   })
-  return Object.assign(ctx, { out, interactiveCalls, expectDrained })
+  // `asked` carries the questions themselves: they reach the person through `prompt`, never
+  // through `out.log`, so an assertion about a question that searched `out.lines` could not fail.
+  return Object.assign(ctx, { out, interactiveCalls, expectDrained, asked })
 }
 
 describe('the identity step', () => {
@@ -247,7 +255,7 @@ describe('the asking side', () => {
 describe('the answering side', () => {
   it('prepares the shared folder and the dedicated profile, and never writes AgentBridge state into it', async () => {
     await seedIdentityAndProfile()
-    const { prompt, expectDrained } = scripted(['1', shareDir, '', ''])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', '', 'n'])
     await runSetup(context({ prompt }))
     expectDrained()
     await expect(access(join(profileHome, RESPONDER_CONFIG_FILE))).resolves.toBeUndefined()
@@ -268,7 +276,7 @@ describe('the answering side', () => {
   it("tells the person to give their link to whoever will ask them", async () => {
     await seedIdentityAndProfile()
     const out = memoryOutput()
-    const { prompt, expectDrained } = scripted(['1', shareDir, '', ''])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', '', 'n'])
     await runSetup(context({ prompt, out }))
     expectDrained()
     const text = out.lines.join('\n')
@@ -285,7 +293,7 @@ describe('the answering side', () => {
     await seedIdentityAndProfile()
     const spacedProfile = join(root, 'mi respondedor')
     const out = memoryOutput()
-    const { prompt, expectDrained } = scripted(['1', shareDir, '', ''])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', '', 'n'])
     await runSetup(context({ prompt, out, profileHome: spacedProfile }))
     expectDrained()
     const text = out.lines.join('\n')
@@ -300,17 +308,23 @@ describe('the answering side', () => {
     // the only board refuses reads, so every board fails and doctor's aggregate "Tableros
     // públicos" check — the blocking one — fires.
     board.options = { ...board.options, rejectReads: true }
-    const { prompt, expectDrained } = scripted(['1', shareDir, '', ''])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', '', 'n'])
     await runSetup(context({ prompt, out }))
     expectDrained()
     const text = out.lines.join('\n')
     expect(text).toMatch(/Falta algo: Ningún tablero te dejó publicar y leer/)
-    // The per-board line is doctor's business, not this command's: it is the kind of detail that
-    // turned 0.2's ending into seventeen lines nobody could act on.
-    expect(text).not.toMatch(/Tablero wss:/)
+    // The per-board lines are doctor's business, not this command's: exactly the detail that
+    // turned 0.2's ending into seventeen lines nobody could act on. Asserted on the printed
+    // lines' own shape (nothing here may look like doctor's `[ok]/[falla]` report) rather than on
+    // a phrase — the previous `not.toMatch(/Tablero wss:/)` could not fail once the check list
+    // was gone, because the word only ever reached the screen through that list.
+    expect(out.lines.filter((line) => line.startsWith('['))).toEqual([])
     // And it must not tell them they are ready to answer while a blocking check is failing.
     expect(text).not.toMatch(/Listo para contestar/)
-    expect(text).toMatch(/Cuando esté resuelto, empieza a contestar con/)
+    // The summary names the thing, not "esto": review round 1, I2.
+    const summary = text.slice(text.indexOf('== Resumen =='))
+    expect(summary).toMatch(/Ningún tablero te dejó publicar y leer/)
+    expect(summary).toMatch(/Después, para empezar a contestar/)
   })
 })
 
@@ -379,7 +393,8 @@ describe('the login step', () => {
       claudeConfigDir: '/perfil/claude',
       env: {},
       out,
-      prompt: async () => '',
+      // Enter to open it, then "no" to the offer of another try.
+      prompt: scripted(['', 'n']).prompt,
       // Exit 0 with loggedIn:false — what really happens when someone opens Claude and closes it
       // without logging in. A test that used a non-zero code here would pass against an
       // implementation that only checks the exit code, which is the bug this pins.
@@ -399,7 +414,7 @@ describe('the login step', () => {
       claudeConfigDir: '/perfil/claude',
       env: {},
       out,
-      prompt: async () => '',
+      prompt: scripted(['', 'n']).prompt,
       run: async () => ({ code: 0, stdout: 'Welcome to Claude Code', stderr: '' }),
       runInteractive: async () => ({ code: 0, spawnFailed: false }),
       alreadyLoggedIn: false,
@@ -407,30 +422,99 @@ describe('the login step', () => {
     expect(ok).toBe(false)
   })
 
-  it('explains that Claude Code is missing instead of pretending it opened', async () => {
+  it('opens the login again in place instead of sending them back through the whole assistant', async () => {
+    // Review round 1, I3: closing the browser before the login finishes is the most likely
+    // first-run outcome, and "vuelve a correr setup" for it asks a person to redo six questions
+    // for a step the program is standing right there to repeat.
     const out = memoryOutput()
+    let opened = 0
+    const { prompt, expectDrained } = scripted(['', 's', ''])
     const ok = await loginStep({
       claudeConfigDir: '/perfil/claude',
       env: {},
       out,
-      prompt: async () => '',
+      prompt,
+      // Not logged in the first time it is asked, logged in the second: the person went back and
+      // finished it.
+      run: async () => ({ code: 0, stdout: JSON.stringify({ loggedIn: opened > 1 }), stderr: '' }),
+      runInteractive: async () => {
+        opened += 1
+        return { code: 0, spawnFailed: false }
+      },
+      alreadyLoggedIn: false,
+    })
+    expectDrained()
+    expect(ok).toBe(true)
+    expect(opened).toBe(2)
+    // And it never sent them back to the beginning to get there.
+    expect(out.lines.join('\n')).not.toContain(`${CLI_COMMAND} setup`)
+  })
+
+  it('stops after a bounded number of tries, however many times the person says yes', async () => {
+    // A retry loop with no bound is a dead end somebody has to Ctrl+C out of.
+    const out = memoryOutput()
+    let opened = 0
+    const ok = await loginStep({
+      claudeConfigDir: '/perfil/claude',
+      env: {},
+      out,
+      // Always Enter, always "sí": the loop itself has to be what stops.
+      prompt: async (question) => (question.includes('otra vez? [s/n]') ? 's' : ''),
       run: async () => ({ code: 0, stdout: '{"loggedIn":false}', stderr: '' }),
-      runInteractive: async () => ({ code: null, spawnFailed: true }),
+      runInteractive: async () => {
+        opened += 1
+        return { code: 0, spawnFailed: false }
+      },
+      alreadyLoggedIn: false,
+    })
+    expect(ok).toBe(false)
+    expect(opened).toBe(3)
+  })
+
+  it('explains that Claude Code is missing instead of pretending it opened', async () => {
+    const out = memoryOutput()
+    let opened = 0
+    const ok = await loginStep({
+      claudeConfigDir: '/perfil/claude',
+      env: {},
+      out,
+      prompt: scripted(['']).prompt,
+      run: async () => ({ code: 0, stdout: '{"loggedIn":false}', stderr: '' }),
+      runInteractive: async () => {
+        opened += 1
+        return { code: null, spawnFailed: true }
+      },
       alreadyLoggedIn: false,
     })
     expect(ok).toBe(false)
     expect(out.lines.join('\n')).toMatch(/claude\.com\/claude-code/)
+    // No retry for this one: opening it again cannot install a program that is not there. A
+    // second attempt would also read the scripted queue dry and fail this test loudly.
+    expect(opened).toBe(1)
   })
 })
 
 describe('blockers', () => {
   it('keeps only the failing checks that stop the person from answering', () => {
     const checks = [
-      { name: 'Base de datos', ok: true, detail: 'ok', blocking: true },
-      { name: 'Tablero wss://uno', ok: false, detail: 'no', blocking: false },
-      { name: 'Llave de AgentBridge', ok: false, detail: 'falta', blocking: true },
+      { name: 'Base de datos', ok: true, detail: 'ok', blocking: true, security: false },
+      { name: 'Tablero wss://uno', ok: false, detail: 'no', blocking: false, security: false },
+      { name: 'Llave de AgentBridge', ok: false, detail: 'falta', blocking: true, security: true },
     ]
     expect(blockers(checks).map((c) => c.name)).toEqual(['Llave de AgentBridge'])
+  })
+
+  it('mustMention adds the failing security checks that do not block, and still hides the weather', () => {
+    // Review round 1, I4. The middle one is the shape that matters: nothing is broken, the person
+    // can answer questions perfectly — and their secret key is being uploaded to somebody else's
+    // servers. `blocking` says "no need to mention"; it is the most serious line in the program.
+    const checks = [
+      { name: 'Tablero wss://uno', ok: false, detail: 'no contestó', blocking: false, security: false },
+      { name: 'Carpeta sincronizada con la nube', ok: false, detail: 'Tu llave está dentro de OneDrive', blocking: false, security: true },
+      { name: 'Tableros públicos', ok: false, detail: 'ninguno', blocking: true, security: false },
+      { name: 'Llave de AgentBridge', ok: true, detail: 'presente', blocking: true, security: true },
+    ]
+    expect(mustMention(checks).map((c) => c.name)).toEqual(['Carpeta sincronizada con la nube', 'Tableros públicos'])
   })
 })
 
@@ -439,11 +523,14 @@ describe('the guided flow as a whole', () => {
     const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', 'n'] })
     await runSetup(ctx)
     ctx.expectDrained()
-    const text = ctx.out.lines.join('\n')
+    const out = ctx.out
+    const text = out.lines.join('\n')
     expect(text).not.toMatch(/CLAUDE_CONFIG_DIR=/)
     expect(text).not.toMatch(/start\.sh/)
-    expect(text).not.toMatch(/\[ok\]/)
-    expect(text).not.toMatch(/\[falta\]/)
+    // Nothing that looks like doctor's own report. Asserted on the line shape rather than on
+    // `[ok]`/`[falta]`: doctorCommand prints `[falla]`, so a literal `[falta]` search matched
+    // nothing that this program could ever print, whatever it did.
+    expect(out.lines.filter((line) => line.startsWith('['))).toEqual([])
     expect(text).toContain('agentbridge:nprofile1')
     expect(text).toMatch(/portapapeles/)
     // Nothing blocks, so the offer to start is the last thing asked — and "n" ends it with the
@@ -472,8 +559,10 @@ describe('the guided flow as a whole', () => {
     expect(text).not.toMatch(/\[falta\]/)
     // It did open the login rather than telling them to open it.
     expect(ctx.interactiveCalls.map((c) => c.args.join(' '))).toContain('auth login')
-    // And with no session there is nothing to start, so it never offers.
-    expect(text).not.toMatch(/¿Empiezo a contestar ahora\?/)
+    // And with no session there is nothing to start, so it never offers. Asserted against the
+    // questions actually asked: a question reaches the person through `prompt`, never through
+    // `out.log`, so searching the transcript for it could not fail.
+    expect(ctx.asked.some((q) => q.includes('¿Empiezo a contestar ahora?'))).toBe(false)
     expect(ctx.interactiveCalls.some((c) => c.args.includes('plugin:agentbridge@agentbridge-local'))).toBe(false)
   })
 
@@ -517,6 +606,75 @@ describe('the guided flow as a whole', () => {
     expect(responderCall?.at).toBeGreaterThan(mcpLine)
   })
 
+  it('never says "Ya quedó" over a summary that still says "Te falta"', async () => {
+    // Review round 1, I1, from a real role-3 transcript: the person was shown two pending items
+    // and then, four lines later, "Ya quedó. A partir de aquí:" — and then the responder took the
+    // terminal until Ctrl+C, so the only way to do what they still owed was to kill the session
+    // they had just been told to leave open. On role 3 this is not an edge case: the asking side
+    // always ends with "reinicia tu sesión de Claude Code".
+    const ctx = await responderSetupContext({ answers: ['Dani', '3', shareDir, '', 'n', 'n', 's'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const text = ctx.out.lines.join('\n')
+    expect(text).toMatch(/Te falta:/)
+    expect(text).not.toMatch(/Ya quedó/)
+    // What it says instead names the conflict and how to get out of it.
+    expect(text).toMatch(/Lo que te falta \(arriba\) lo puedes hacer cuando pares con Ctrl\+C/)
+    // And the person was told what "sí" costs before they answered, not after.
+    expect(text).toMatch(/esta terminal se queda contestando hasta que la pares con Ctrl\+C/)
+  })
+
+  it('still says "Ya quedó" when there is genuinely nothing left', async () => {
+    // The other half of the same rule: the wording is gated on the truth, not removed.
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', 's'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const text = ctx.out.lines.join('\n')
+    expect(text).not.toMatch(/Te falta:/)
+    expect(text).toMatch(/Ya quedó/)
+  })
+
+  it('says out loud that the key is being uploaded, even though nothing is blocked', async () => {
+    // Review round 1, I4: `blocking` answers "can this person answer questions", and the honest
+    // answer for a key sitting in OneDrive is yes — so filtering the install's report by
+    // `blocking` alone silenced the single most serious thing this program can say, at the exact
+    // moment the person is still choosing folders.
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', 'n'], keyInCloudFolder: true })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const text = ctx.out.lines.join('\n')
+    expect(text).toMatch(/se sube sola a la nube/)
+    // Said as a warning, not as something that stopped the install — because it did not.
+    expect(text).toMatch(/^Ojo: /m)
+    expect(text).not.toMatch(/Falta algo: Tu llave/)
+    // It is still in the summary, which is the part people scroll back to…
+    expect(text.slice(text.indexOf('== Resumen =='))).toMatch(/se sube sola a la nube/)
+    // …and the closing pointer no longer conditions the report on something being broken.
+    expect(text).toMatch(/Para revisar todo con detalle/)
+    expect(text).not.toMatch(/Si algo no funciona/)
+    // Nothing blocked, so it still offered to start answering.
+    expect(ctx.asked.some((q) => q.includes('¿Empiezo a contestar ahora?'))).toBe(true)
+  })
+
+  it('proposes the folder this computer is already sharing, so a re-run cannot repoint it', async () => {
+    // Review round 1, I3(b): every remedy this command prints says "vuelve a correr setup", and
+    // the folder question used to offer a hard-coded `~/AgentBridge/compartido` no matter what was
+    // already configured — so pressing Enter there (the quick start's own worked example) silently
+    // repointed a working responder at a brand-new empty folder.
+    const first = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', 'n'] })
+    await runSetup(first)
+    first.expectDrained()
+
+    const second = await responderSetupContext({ answers: ['1', '', '', 'n'] })
+    await runSetup(second)
+    second.expectDrained()
+    // The question offered the saved folder, and plain Enter kept it.
+    expect(second.asked.some((q) => q.includes(`Enter para usar ${shareDir}`))).toBe(true)
+    expect(second.out.lines.join('\n')).toContain(`Voy a usar esta carpeta: ${shareDir}`)
+    const config = JSON.parse(await readFile(join(profileHome, RESPONDER_CONFIG_FILE), 'utf8'))
+    expect(config.shareDir).toBe(shareDir)
+  })
+
   it('still prints the link when no clipboard tool exists', async () => {
     const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', 'n'], copyLink: async () => false })
     await runSetup(ctx)
@@ -538,7 +696,7 @@ describe('the shared-folder protection', () => {
     await mkdir(join(shareDir, '.git'), { recursive: true })
     await writeFile(join(shareDir, '.env'), 'SECRET=x')
     const out = memoryOutput()
-    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR', ''])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR', '', 'n'])
     await runSetup(context({ prompt, out }))
     expectDrained()
     const text = out.lines.join('\n')
@@ -563,7 +721,7 @@ describe('the shared-folder protection', () => {
     await mkdir(shareDir, { recursive: true })
     await symlink(root, join(shareDir, 'enlace'))
     const out = memoryOutput()
-    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR', ''])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR', '', 'n'])
     await runSetup(context({ prompt, out }))
     expectDrained()
     expect(out.lines.join('\n')).toMatch(/enlaces simbólicos/)
@@ -574,7 +732,7 @@ describe('the shared-folder protection', () => {
     await mkdir(join(shareDir, 'node_modules', 'algun-paquete'), { recursive: true })
     await writeFile(join(shareDir, 'node_modules', 'algun-paquete', '.env'), 'SECRET=y')
     const out = memoryOutput()
-    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR', ''])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR', '', 'n'])
     await runSetup(context({ prompt, out }))
     expectDrained()
     // Specifically the "did not look inside" reason, not "found credentials in there" — the
