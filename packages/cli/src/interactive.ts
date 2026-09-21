@@ -16,6 +16,16 @@ export type InteractiveRunner = (
 
 export const defaultInteractiveRunner: InteractiveRunner = (command, args, opts) =>
   new Promise((resolvePromise) => {
+    // Captured before touching anything: this is the state to return to, not a fixed one.
+    // `readline.createInterface` puts a TTY's stdin into raw mode at construction and NEVER
+    // takes it back out on pause/resume (verified against a real pty) — so whenever a shared
+    // prompt interface exists, raw is the correct state, not cooked. Forcing cooked
+    // unconditionally was tried first and broke the flagship flow: after the handoff, every
+    // later question echoed the typed answer twice (once by the tty driver, once by readline)
+    // and readline's own line editing — backspace, history — stopped working, because the
+    // driver was handling the keystrokes instead. `false` remains correct for the case this
+    // guards against — a crashed child leaving the tty raw while no interface exists to need it.
+    const wasRaw = process.stdin.isTTY ? process.stdin.isRaw === true : false
     // Released BEFORE the spawn, not after: a readline interface that is still flowing competes
     // with the child for every keystroke, and the line the child asked for would be eaten by a
     // parent nobody is talking to.
@@ -24,12 +34,11 @@ export const defaultInteractiveRunner: InteractiveRunner = (command, args, opts)
     const finish = (result: { code: number | null; spawnFailed: boolean }) => {
       if (settled) return
       settled = true
-      // Claude's own interface puts the terminal in raw mode. It restores it on a clean exit,
-      // but a crash or a kill can leave it raw — and a raw terminal makes every later question
-      // unreadable (no echo, no line editing). Putting it back costs nothing when it was already
-      // cooked, and saves the rest of the session when it was not.
+      // Restores the captured state, not a fixed one: a crashed or killed child can leave the
+      // terminal raw when it should be cooked, but a parent with an open readline interface
+      // needs it RAW to keep working — see the comment on `wasRaw` above.
       try {
-        if (process.stdin.isTTY) process.stdin.setRawMode(false)
+        if (process.stdin.isTTY) process.stdin.setRawMode(wasRaw)
       } catch {
         // A terminal we cannot put back is still a terminal we must not crash on.
       }

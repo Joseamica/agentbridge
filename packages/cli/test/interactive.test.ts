@@ -4,14 +4,24 @@ import { dirname, join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { defaultInteractiveRunner } from '../src/interactive'
 
-const fixtures = join(dirname(fileURLToPath(import.meta.url)), 'fixtures')
+const testDir = dirname(fileURLToPath(import.meta.url))
+const fixtures = join(testDir, 'fixtures')
+// packages/cli/test -> packages/cli -> packages -> repo root. Resolved from this file's own
+// location rather than `process.cwd()`, so the test behaves the same no matter where `npm test`
+// is invoked from.
+const tsxBin = join(testDir, '..', '..', '..', 'node_modules', '.bin', 'tsx')
 
-// Drives the parent fixture through a pipe, feeding each line only after the prompt that asks
-// for it has been printed. Feeding all three up front would prove nothing: the question is
-// precisely whether the child reads the second line instead of the paused parent swallowing it.
+// Drives the REAL parent fixture (handoff-parent.ts, which calls `readlinePrompt` and
+// `defaultInteractiveRunner` directly — not a standalone reimplementation of pause/spawn/resume)
+// through a pipe, feeding each line only after the prompt that asks for it has been printed.
+// Feeding all three up front would prove nothing: the question is precisely whether the child
+// reads the second line instead of the paused parent swallowing it. Run through `tsx`, not
+// `node`, because the fixture imports straight from `../../src`, the way the CLI's own commands
+// do — that is what makes this test exercise `defaultInteractiveRunner` itself instead of only
+// the technique it is built on.
 function driveHandoff(): Promise<string> {
   return new Promise((resolvePromise, reject) => {
-    const proc = spawn(process.execPath, [join(fixtures, 'handoff-parent.mjs')], {
+    const proc = spawn(process.execPath, [tsxBin, join(fixtures, 'handoff-parent.ts')], {
       stdio: ['pipe', 'pipe', 'pipe'],
     })
     let out = ''
@@ -41,8 +51,10 @@ describe('handing the terminal to a child and taking it back', () => {
     // The line the child asked for reached the CHILD, not the paused parent.
     expect(out).toContain('CHILD_1=dos')
     expect(out).toContain('CHILD_EXIT=0')
-    // The whole point: pausing must not mark the interface permanently closed.
-    expect(out).toContain('CLOSED=false')
+    // The whole point: a second `readlinePrompt` after the handoff must get its answer, not
+    // reject with PromptEOF — which is what pausing tripping the shared interface's
+    // permanent-close flag would look like.
+    expect(out).not.toContain('PARENT_2_ERROR')
     expect(out).toContain('PARENT_2=tres')
   }, 20_000)
 })
