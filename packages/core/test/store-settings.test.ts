@@ -78,8 +78,8 @@ describe('profile', () => {
 
   it('trims the name and keeps only valid relays', async () => {
     const store = await newStore()
-    const profile = setProfile(store, { name: '  Ana López ', relays: ['ws://inseguro.example.com', 'wss://relay.damus.io', 'wss://relay.damus.io'], now: T0 })
-    expect(profile).toEqual({ name: 'Ana López', relays: ['wss://relay.damus.io'] })
+    const profile = setProfile(store, { name: '  Ana López ', relays: ['ws://inseguro.example.com', 'wss://relay.ejemplo.com', 'wss://relay.ejemplo.com'], now: T0 })
+    expect(profile).toEqual({ name: 'Ana López', relays: ['wss://relay.ejemplo.com'] })
     expect(getProfile(store)).toEqual(profile)
   })
 

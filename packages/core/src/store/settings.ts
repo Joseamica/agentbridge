@@ -1,15 +1,17 @@
 import { UserFacingError } from '../errors'
 import type { Store } from './db'
 
-// The five public relays that accepted, served and kept sealed wraps in the 2026-09-16 live check
-// — except relay.nostr.net, swapped for relay.damus.io on 2026-09-19 after a direct probe: its
-// WebSocket handshake answered HTTP 500 (down, not merely refusing an unknown publisher), while
-// relay.damus.io accepted and served a real 16-bit-wrap publish on the same probe. `doctor`
-// checks every board here on every run — re-probe before swapping any of these again.
+// Five public relays, each verified to do BOTH things a board has to do: accept a sealed wrap and
+// serve it back on a read. The list has moved twice, and the second move is the cautionary tale:
+// relay.nostr.net went down (its handshake answered HTTP 500) and was replaced on 2026-09-19 by
+// relay.damus.io on the strength of a probe that only tested publishing — damus accepts writes and
+// then returns nothing on a read, so the swap shipped a board that fails for everyone. A person on
+// Windows found it with `doctor` on 2026-09-21, which is what `doctor` is for. Replaced the same
+// day by nostr.mom, probed in both directions. **Never swap a board on a publish-only probe.**
 export const DEFAULT_RELAYS: readonly string[] = [
   'wss://relay.primal.net',
   'wss://relay.snort.social',
-  'wss://relay.damus.io',
+  'wss://nostr.mom',
   'wss://nostr.oxtr.dev',
   'wss://nos.lol',
 ]

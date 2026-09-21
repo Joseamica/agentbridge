@@ -17,10 +17,10 @@ import {
 } from '@agentbridge/core'
 
 // The relays that accepted and served NIP-59 wraps in the 2026-09-16 spike — except
-// relay.nostr.net, replaced with relay.damus.io on 2026-09-19 after the former's WebSocket
+// relay.nostr.net, then relay.damus.io (which accepted publishes but served no reads), now
 // handshake started answering HTTP 500 (see the comment on DEFAULT_RELAYS in
 // packages/core/src/store/settings.ts, which this list mirrors).
-const RELAYS = ['wss://relay.primal.net', 'wss://relay.snort.social', 'wss://relay.damus.io', 'wss://nostr.oxtr.dev', 'wss://nos.lol']
+const RELAYS = ['wss://relay.primal.net', 'wss://relay.snort.social', 'wss://nostr.mom', 'wss://nostr.oxtr.dev', 'wss://nos.lol']
 
 const newIdentity = (): Identity => {
   const secretKey = generateSecretKey()

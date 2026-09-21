@@ -1,6 +1,10 @@
 {
   "name": "agentbridge",
   "description": "AgentBridge channel: receive questions from people you authorized and answer them from this folder.",
-  "version": "0.2.0",
-  "keywords": ["agentbridge", "channel", "mcp"]
+  "version": "0.2.1",
+  "keywords": [
+    "agentbridge",
+    "channel",
+    "mcp"
+  ]
 }
