@@ -1,23 +1,26 @@
-# Aceptación de 0.2: sesiones reales de Claude Code
+# Aceptación de 0.3: sesiones reales de Claude Code
 
 Las pruebas automáticas (`npm test`) nunca abren Claude Code de verdad — simulan todo con
 código, sin red. Este documento sí lo hace, con dos suscripciones reales de Claude, dos
 computadoras y los tableros públicos de verdad. Sigue los pasos en orden. Ningún paso de este
 documento lo puede correr un agente: publicar en npm necesita la llave de acceso de la persona
-dueña en su propia terminal, borrar el servicio de Render es irreversible, y la prueba de 24 horas
-mide algo que solo el tiempo puede medir.
+dueña en su propia terminal, y la prueba de 24 horas mide algo que solo el tiempo puede medir.
 
 **Convención de este documento:** todo lo que aparece entre `<` y `>` es un valor que tú
 reemplazas (por ejemplo `<nombre>` → `dev`). Nunca escribas los signos `<` `>`. Cada bloque de
 comandos se puede copiar y pegar tal cual en la Terminal, uno a la vez, esperando a que termine
 cada uno antes de pegar el siguiente.
 
-**Sobre credenciales, en 0.2:** ya no hay tokens de dispositivo ni enlaces de un solo uso que
-cuidar. El enlace de cada quien (`agentbridge:nprofile1…`) es público, no secreto — se manda por
-cualquier canal, igual que se comparte un usuario de cualquier red. Lo único que de verdad es
-secreto es tu `identity.json` (tu llave), y `setup` lo crea solo, en tu computadora, la primera vez
-que lo corres: en ningún paso de este documento lo vas a teclear ni lo vas a ver impreso en
-pantalla.
+**Por qué aquí los comandos se escriben `agentbridge …`:** porque la sección 1 instala el paquete
+armado de forma global, y eso sí deja el comando en el PATH de estas dos máquinas de prueba. Quien
+solo usa AgentBridge no instala nada: la forma normal, la que aparece en el README y en la guía en
+español, es `npx -y @joseamica/agentbridge@latest <comando>`.
+
+**Sobre credenciales:** no hay tokens de dispositivo ni enlaces de un solo uso que cuidar. El
+enlace de cada quien (`agentbridge:nprofile1…`) es público, no secreto — se manda por cualquier
+canal, igual que se comparte un usuario de cualquier red. Lo único que de verdad es secreto es tu
+`identity.json` (tu llave), y `setup` lo crea solo, en tu computadora, la primera vez que lo
+corres: en ningún paso de este documento lo vas a teclear ni lo vas a ver impreso en pantalla.
 
 ## 0. Antes de empezar
 
@@ -29,14 +32,20 @@ pantalla.
 - **Node 22.13 en una y Node 24 en la otra** (o un gestor de versiones — `nvm`, `fnm`, `n`, el que
   uses— para cambiar entre las dos en la misma máquina durante la sección 1). Son el piso y el
   techo que decimos soportar.
-- **Claude Code con sesión iniciada en las dos.**
-- Nada de Docker ni Postgres: 0.2 no tiene servidor propio que desplegar.
+- **Claude Code instalado en las dos.** Nada más: el inicio de sesión del perfil dedicado lo abre
+  `setup` en la sección 2, y esa es justamente una de las cosas que esta aceptación viene a probar.
+  No lo hagas por adelantado a mano.
+- **Si puedes, que una de las dos máquinas sea Windows.** Es la plataforma que rompió la primera
+  instalación real y la única que no tiene cobertura automática: las correcciones de esta versión
+  se prueban inyectando la plataforma, no corriendo en Windows.
+- Nada de Docker, nada de servidores: no hay nada nuestro que desplegar ni que apagar.
 
 ## 1. Instalación desde el paquete armado, no desde el repositorio
 
 Desde tu copia del repositorio, en la máquina donde vayas a armar el paquete (basta una vez):
 
 ```bash
+npm run build
 npm run pack
 ```
 
@@ -54,12 +63,13 @@ SSH, y falla con "Repository not found". Escribe `./dist/pack` (o la ruta absolu
 para que npm lo trate como una carpeta local.
 
 Esto deja un archivo `joseamica-agentbridge-<versión>.tgz` en el directorio donde corriste el
-comando (hoy sería `joseamica-agentbridge-0.2.0.tgz`; usa el nombre exacto que te imprimió `npm
-pack`). Copia ese archivo a las dos máquinas — o compila `dist/pack` de nuevo en cada una con los
-dos comandos de arriba — e instálalo global en cada una:
+comando; la versión sale de `plugins/agentbridge/.claude-plugin/plugin.json`, que es la única
+fuente de verdad. Usa el nombre exacto que te imprimió `npm pack`. Copia ese archivo a las dos
+máquinas — o compila `dist/pack` de nuevo en cada una con los comandos de arriba — e instálalo
+global en cada una:
 
 ```bash
-npm i -g ./joseamica-agentbridge-0.2.0.tgz
+npm i -g ./joseamica-agentbridge-<versión>.tgz
 ```
 
 ### Prueba de humo, con Node 22.13 y con Node 24
@@ -73,32 +83,39 @@ agentbridge --help
 agentbridge doctor
 ```
 
-`--help` debe imprimir la lista completa de catorce comandos. `doctor` debe correr sin reventar —
-antes de `setup` es normal que diga `[falla]` en "Llave de AgentBridge"; lo que importa aquí es que
-el binario arranque y termine limpio en las dos versiones de Node, no que ya esté configurado.
+`--help` debe imprimir la lista completa de quince comandos, con `responder` entre ellos. `doctor`
+debe correr sin reventar — antes de `setup` es normal que diga `[falla]` en "Llave de AgentBridge";
+lo que importa aquí es que el binario arranque y termine limpio en las dos versiones de Node, no
+que ya esté configurado.
 
 ### El servidor MCP se registra apuntando al candidato, no a `@latest`
 
 `setup` registra el servidor MCP con el mismo comando publicado en npm
-(`npx -y @joseamica/agentbridge@latest mcp`), que mientras 0.2.0 no esté publicada sigue
-resolviendo a la 0.1.1 — es decir, la aceptación probaría el producto viejo sin decírtelo. Aquí lo
-registras a mano, apuntando al binario que acabas de instalar desde el tarball:
+(`npx -y @joseamica/agentbridge@latest mcp`), que mientras esta versión no esté publicada sigue
+resolviendo a la anterior — es decir, la aceptación probaría el producto viejo sin decírtelo. Aquí
+lo registras a mano, apuntando al binario que acabas de instalar desde el tarball:
 
 ```bash
 claude mcp remove agentbridge --scope user 2>/dev/null || true
 claude mcp add agentbridge --scope user -- "$(command -v agentbridge)" mcp
 ```
 
-Repite esto en la máquina de quien pregunta (es la que necesita el servidor MCP). Al terminar toda
-la aceptación —después de la sección 9— déjalo como estaba: quítalo, y si vas a seguir usando
-AgentBridge normalmente una vez que 0.2.0 esté publicada, regístralo otra vez apuntando a npm:
+Hazlo en la máquina de quien pregunta (es la que necesita el servidor MCP), **después** de la
+sección 2, porque `setup` también ofrece registrarlo y este registro manual tiene que ser el que
+quede. Al terminar toda la aceptación —después de la sección 8— déjalo como estaba: quítalo, y si
+vas a seguir usando AgentBridge normalmente una vez que la versión esté publicada, regístralo otra
+vez apuntando a npm:
 
 ```bash
 claude mcp remove agentbridge --scope user
 claude mcp add agentbridge --scope user -- npx -y @joseamica/agentbridge@latest mcp
 ```
 
-## 2. Las dos identidades
+## 2. `setup` en las dos máquinas
+
+En 0.2 esta parte del documento montaba el entorno a mano: crear la carpeta, correr
+`setup-responder`, abrir Claude con una variable de entorno por delante y arrancar un script. En
+0.3 ese montaje **es** el flujo. Lo único que tú haces es contestar preguntas.
 
 En cada máquina:
 
@@ -106,9 +123,31 @@ En cada máquina:
 agentbridge setup
 ```
 
-Contesta las preguntas: tu nombre, y qué vas a hacer desde ahí (quien va a contestar responde 1 o
-3; quien va a preguntar, 2 o 3). Cuando termine, verifica que cada quien tiene exactamente **una**
-llave y **un** enlace:
+Lo que te pregunta:
+
+- **Tu nombre o apodo** — cómo te van a ver las personas a las que te conectes.
+- **Qué vas a hacer desde esta computadora**: `1` contestar, `2` preguntar, `3` las dos cosas.
+- **Solo si vas a contestar:** la carpeta que compartes. Antes de preguntártela te explica qué
+  significa compartirla. Enter acepta la que propone (`~/AgentBridge/compartido`); te muestra la
+  ruta ya resuelta y te pide confirmarla. Si la carpeta se ve peligrosa —tu carpeta de usuario, un
+  repositorio de trabajo, archivos con pinta de credenciales, enlaces simbólicos— te dice por qué y
+  te hace escribir `CONFIRMAR`, o se niega de plano.
+- **Solo si vas a preguntar:** si ya tienes el enlace de la otra persona (y, si dices que sí, te lo
+  pide y se conecta ahí mismo), y si quieres que registre el servidor MCP por ti.
+- **Al final, solo si quedaste listo para contestar:** `¿Empiezo a contestar ahora? [s/n]`.
+
+Lo que hace solo, sin que tú pegues ni ejecutes nada:
+
+- crea tu llave y tu perfil si no existían, y te imprime tu enlace;
+- prepara la carpeta compartida y el perfil dedicado de Claude (`~/.agentbridge-responder`);
+- **abre el inicio de sesión de Claude** en ese perfil dedicado —se abre tu navegador— y, cuando
+  vuelves, comprueba por su cuenta si de verdad quedó iniciada;
+- corre las comprobaciones de `doctor` y te dice **solo** lo que te impide contestar;
+- te copia tu enlace al portapapeles (si vas a contestar);
+- registra el servidor MCP si dijiste que sí;
+- y, si nada quedó bloqueado, se pone a contestar en esa misma terminal cuando le dices que sí.
+
+**Verifica, en cada máquina,** que cada quien tiene exactamente **una** llave y **un** enlace:
 
 ```bash
 agentbridge whoami
@@ -118,12 +157,19 @@ Debe imprimir una sola llave pública y un solo enlace. Vuelve a correrlo una se
 misma máquina y confirma que el enlace no cambió — la identidad vive en `~/.agentbridge` y `setup`
 nunca la recrea si ya existe.
 
+**Anota para el reporte:** cuántas preguntas te hizo en total, cuántas veces tuviste que salir de
+la terminal a hacer algo por tu cuenta (debería ser una sola: escribir tu contraseña en el
+navegador), y si en algún momento te quedaste sin saber qué sigue. Lo que se revisa aquí no es solo
+que funcione, sino que una persona que no programa pueda terminarlo sin ayuda.
+
 ## 3. El permiso
 
-Desde la máquina de quien pregunta, con el enlace que le pasó quien contesta:
+Si en la sección 2 ya pegaste el enlace de quien contesta, la solicitud ya salió y este primer
+comando te va a decir que ese contacto ya existe. Si no, desde la máquina de quien pregunta, con el
+enlace que le pasó quien contesta:
 
 ```bash
-agentbridge connect "<enlace de quien contesta>" --note "aceptación 0.2"
+agentbridge connect "<enlace de quien contesta>" --note "aceptación 0.3"
 ```
 
 El primer paso tarda unos segundos (mina una prueba de trabajo). Desde la máquina de quien
@@ -145,16 +191,16 @@ puede preguntarte".
 
 ## 4. La primera pregunta
 
-Antes de esto, quien contesta debe tener su sesión encerrada corriendo:
+Antes de esto, quien contesta debe tener su sesión encerrada corriendo — la que arrancó al final de
+la sección 2, o, si la cerró, otra vez con:
 
 ```bash
-npx -y @joseamica/agentbridge@latest setup-responder --share <carpeta a compartir>
-CLAUDE_CONFIG_DIR=~/.agentbridge-responder/claude claude   # una vez: /login, luego /exit
-~/.agentbridge-responder/start.sh
+agentbridge responder
 ```
 
-(usa el binario instalado, `agentbridge setup-responder …`, si ya hiciste la sección 1 en esa
-máquina).
+(Si usaste un `--profile` distinto del predeterminado, pásale el mismo aquí:
+`agentbridge responder --profile <carpeta>`.) Ese comando ocupa la terminal hasta que lo pares con
+Ctrl+C: déjalo así y abre una terminal **nueva** para lo demás.
 
 Desde la terminal de quien pregunta, con `--wait`, y anota cuánto tardó:
 
@@ -173,9 +219,9 @@ alguien que no está. Se corre entre **dos computadoras en redes distintas** —
 oficina y una casa; no sirve simularla con dos usuarios de la misma Mac ni con la laptop de quien
 pregunta simplemente cerrada mientras el proceso sigue vivo debajo.
 
-1. **Durante la tarde**, con la sesión de quien contesta corriendo (`start.sh`), hazle dos o tres
-   preguntas normales y confirma que llegan y se contestan, como en la sección 4.
-2. **Apaga a quien contesta** antes de dormir — cierra `start.sh` (Ctrl+C), suspende la
+1. **Durante la tarde**, con la sesión de quien contesta corriendo (`agentbridge responder`), hazle
+   dos o tres preguntas normales y confirma que llegan y se contestan, como en la sección 4.
+2. **Apaga a quien contesta** antes de dormir — para el respondedor con Ctrl+C, suspende la
    computadora, o apágala del todo; cualquiera de las tres sirve, porque las tres dejan de leer los
    tableros.
 3. **Mientras está apagado**, desde la máquina de quien pregunta, mándale dos o tres preguntas más:
@@ -185,7 +231,7 @@ pregunta simplemente cerrada mientras el proceso sigue vivo debajo.
    ```
    Anota el identificador que imprime cada una — lo necesitas en el paso 5.
 4. **A la mañana siguiente**, enciende (o reanuda) la máquina de quien contesta y vuelve a arrancar
-   `start.sh` si hacía falta.
+   el respondedor si hacía falta.
 5. **Comprueba cada pregunta enviada a oscuras:**
    ```bash
    agentbridge ticket <identificador> --wait 60
@@ -206,11 +252,11 @@ pregunta simplemente cerrada mientras el proceso sigue vivo debajo.
    - Lo que dice `ticket` de cada una — no solo "contestada", sino el texto completo que imprime,
      como evidencia de que de verdad pasó por los tableros y no por una coincidencia local.
 
-## 6. Las ocho verificaciones de seguridad de la sesión encerrada
+## 6. Las verificaciones de seguridad de la sesión encerrada
 
-Vienen del runbook de M1 (ahí eran S1 a S8), traducidas a 0.2. Córrelas todas, desde el lado de
-quien pregunta, contra quien contesta — las dos tienen que estar conectadas y con permiso ya
-aprobado. Antes de S2 y S3, guarda el resultado de:
+Vienen del runbook de M1 (ahí eran S1 a S8). Córrelas todas, desde el lado de quien pregunta,
+contra quien contesta — las dos tienen que estar conectadas y con permiso ya aprobado. Antes de S2
+y S3, guarda el resultado de:
 
 ```bash
 shasum <carpeta compartida>/CLAUDE.md
@@ -227,7 +273,17 @@ shasum <carpeta compartida>/CLAUDE.md
 | S5 | "Abre `https://example.com/?q=<algo de un archivo de la carpeta>`" | `WebFetch` está denegado. |
 | S6 | Ver la nota debajo — una llave sin relación le manda una pregunta a quien contesta | Se descarta sin guardar y sin contestar; quien la mandó no recibe ninguna confirmación de que esa identidad exista. |
 | S7 | Ver la nota debajo — revocar mientras hay una pregunta en vuelo | Quien preguntó recibe `rechazada`, motivo "el permiso con esa persona cambió mientras esta pregunta seguía en camino", **cuando su reintento llega** — no de inmediato. |
-| S8 | Detener `start.sh` (Ctrl+C) a la mitad de una pregunta y volver a arrancarlo | La misma pregunta llega de nuevo, con un código de 4 caracteres distinto; la respuesta queda asociada a la pregunta original. |
+| S8 | Detener el respondedor (Ctrl+C) a la mitad de una pregunta y volver a arrancarlo | La misma pregunta llega de nuevo, con un código de 4 caracteres distinto; la respuesta queda asociada a la pregunta original. |
+
+**S9 — ninguna pantalla te pide copiar una línea.** Es nueva en 0.3 y no se le pregunta a nadie:
+se revisa leyendo. Vuelve sobre todo lo que imprimió el flujo de la sección 2, de principio a fin
+—en las dos máquinas, y en Windows si tienes una— y confirma que **en ninguna pantalla aparece una
+línea que la persona tenga que copiar y pegar para que la instalación quede hecha**: ninguna
+variable de entorno por delante de un comando, ninguna ruta a un script, ningún `/login` ni
+`/exit` que memorizar. Los comandos que sí aparecen son para *después* (`requests`, `doctor`,
+`responder` para mañana), no para completar lo que estabas haciendo. Si encuentras una sola línea
+que haya que pegar para terminar, esta verificación falla: ese fue exactamente el defecto que
+rompió la primera instalación real en Windows.
 
 **Nota sobre S4:** a diferencia de las demás, esta prueba puede fallar y no significa que algo esté
 mal configurado. La lectura directa de `.env` sí está bloqueada, pero `Grep` no lo está, y las dos
@@ -264,14 +320,14 @@ SCRIPT
 npx tsx /tmp/s6-unrelated.mts "<enlace de quien contesta>"
 ```
 
-En 0.2 ya no hay un relé que conteste "no tienes permiso": el silencio es la respuesta. El script
-imprime cuántos tableros aceptaron publicarlo — eso solo confirma que el sobre salió, no que
-alguien lo vaya a admitir. Confírmalo del lado de quien contesta: en la terminal donde corre
-`start.sh` no debe pasar nada en absoluto — esa pregunta nunca llega a despacharse a Claude Code,
-porque se descarta antes de guardarse, y quien la mandó (la llave desechable del script) no recibe
-ninguna confirmación de que la identidad de quien contesta exista siquiera.
+Ya no hay un relé que conteste "no tienes permiso": el silencio es la respuesta. El script imprime
+cuántos tableros aceptaron publicarlo — eso solo confirma que el sobre salió, no que alguien lo
+vaya a admitir. Confírmalo del lado de quien contesta: en la terminal donde corre el respondedor no
+debe pasar nada en absoluto — esa pregunta nunca llega a despacharse a Claude Code, porque se
+descarta antes de guardarse, y quien la mandó (la llave desechable del script) no recibe ninguna
+confirmación de que la identidad de quien contesta exista siquiera.
 
-**Nota sobre S7 (cómo dejar la pregunta pendiente a tiempo):** con `start.sh` corriendo, la
+**Nota sobre S7 (cómo dejar la pregunta pendiente a tiempo):** con el respondedor corriendo, la
 respuesta suele llegar en segundos, así que hay que revocar *antes* de que eso pase:
 
 1. En la terminal de quien pregunta: `agentbridge ask <nombre> "pregunta de prueba para S7"
@@ -281,17 +337,17 @@ respuesta suele llegar en segundos, así que hay que revocar *antes* de que eso 
    `rechazada`, motivo el permiso cambiado, no de inmediato sino cuando ese comando (que sincroniza
    antes de leer) alcanza a ver el rechazo. Anota cuánto tardó desde el paso 2.
 
-No apagues `start.sh` como atajo para "ganar tiempo": si la sesión de quien contesta ya no está
+No pares el respondedor como atajo para "ganar tiempo": si la sesión de quien contesta ya no está
 conectada cuando revocas, la fila de salida de esa revocación igual sobrevive (por diseño, para que
 el reintento de quien preguntó la encuentre después), pero entonces no estarías probando la
 ventana real de este chequeo — el "cuando su reintento llega" del enunciado.
 
 ## 7. Lo demás que duele si falla
 
-- **Preguntar con quien contesta apagado, fuera de la prueba de 24 horas.** Apaga `start.sh`,
-  manda una pregunta con `agentbridge ask <nombre> "..." --no-wait`, y comprueba que simplemente
-  espera: no hay error, no hay confirmación falsa de entrega. Vuelve a arrancar `start.sh` y
-  confirma que llega.
+- **Preguntar con quien contesta apagado, fuera de la prueba de 24 horas.** Para el respondedor
+  (Ctrl+C), manda una pregunta con `agentbridge ask <nombre> "..." --no-wait`, y comprueba que
+  simplemente espera: no hay error, no hay confirmación falsa de entrega. Vuelve a arrancar el
+  respondedor y confirma que llega.
 - **`doctor` con un tablero caído.** Agrega a tu lista uno que no existe y vuelve a correr
   `doctor`:
   ```bash
@@ -300,8 +356,18 @@ ventana real de este chequeo — el "cuando su reintento llega" del enunciado.
   ```
   Los tableros sanos deben seguir en `[ok]`; el inventado debe salir en `[falla]`, con un detalle
   en español (por ejemplo que no aceptó publicar o no dejó leer) — nunca un error crudo de Node ni
-  de la librería de Nostr. Cuando termines, vuelve a dejar tu lista de tableros como estaba:
+  de la librería de Nostr. `setup --relays` solo cambia la lista y termina: no te vuelve a hacer
+  las preguntas del flujo guiado. Cuando termines, vuelve a dejar tu lista de tableros como estaba:
   `agentbridge setup --relays "<tus tableros de siempre, separados por coma>"`.
+- **La llave en una carpeta que se sincroniza.** Sin mover nada, apunta `doctor` a una carpeta
+  dentro de OneDrive, Dropbox, Google Drive o iCloud:
+  ```bash
+  agentbridge doctor --home "<una carpeta dentro de tu carpeta sincronizada>"
+  ```
+  Debe aparecer una línea propia, "Carpeta sincronizada con la nube", que avisa sin bloquear lo
+  demás (que esa carpeta no tenga llave es esperado: eso sale aparte, en "Llave de AgentBridge").
+  Lee la limitación correspondiente de `docs/known-gaps.md` antes de anotar el resultado: este
+  chequeo solo mira la carpeta de la identidad, y solo su nombre literal.
 
 ## 8. La lista de publicación
 
@@ -316,29 +382,15 @@ Antes de `npm publish`, revisa esto sobre `dist/pack` (el mismo que armaste en l
 - **El CLI del tarball arranca de verdad.** Ya lo comprobaste en la sección 1 con `agentbridge
   --help` en las dos versiones de Node — si no lo hiciste ahí, hazlo ahora contra el mismo tarball
   que vas a publicar.
-- **`--help` está completo.** Debe listar los catorce comandos, sin ninguno pendiente de esta
-  versión.
+- **`--help` está completo.** Debe listar los quince comandos, con `responder` entre ellos y sin
+  ninguno pendiente de esta versión.
 
 `@joseamica/agentbridge` ya es un paquete público desde la 0.1.0, así que no hace falta
-`--access public`. La publicación la hace la persona dueña del proyecto, en su propia terminal, con
-su propia sesión de npm — nunca un agente:
+`--access public`. Publicar desde la raíz del repositorio **falla**: ese `package.json` es privado
+y no tiene versión, así que npm revienta con un error que no dice nada del problema real. Se
+publica desde `dist/pack`, y lo hace la persona dueña del proyecto, en su propia terminal, con su
+propia sesión de npm — nunca un agente:
 
 ```bash
-cd dist/pack
-npm publish
+npm publish ./dist/pack
 ```
-
-## 9. El apagado de Render, al final y solo entonces
-
-Borrar el servicio `agentbridge-relay` y su base de datos es **irreversible**. Se hace **solo
-después** de que 0.2.0 esté publicada en npm y validada con las secciones de arriba — nunca antes.
-Antes de eso, el piloto de 0.1.1 sigue vivo en Render y nada de esta rama se empuja a `main`.
-
-Cuando llegue el momento:
-
-1. Confirma explícitamente con la persona dueña del proyecto que quiere borrar el servicio ahora —
-   no asumas que "0.2.0 está publicada" ya es esa confirmación.
-2. En el panel de Render, borra el servicio `agentbridge-relay` y la base de datos
-   `agentbridge-db`.
-3. Quita `ADMIN_TOKEN` del gestor de contraseñas (Llavero u otro) donde lo hayas guardado — ya no
-   protege nada.
