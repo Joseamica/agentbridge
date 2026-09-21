@@ -75,7 +75,8 @@ Eso es todo lo que hay que escribir para dejarlo instalado. Lo demás son pregun
 - **Si vas a contestar, qué carpeta compartes.** Compartir una carpeta significa esto: **quien
   tenga tu permiso puede leer todo lo que esté ahí dentro**, así que pon copias de lo que quieras
   compartir, nunca tu carpeta de trabajo. Te propone una carpeta nueva (`AgentBridge/compartido`,
-  dentro de tu carpeta de usuario) y con Enter la aceptas. Si eliges una que se ve peligrosa te
+  dentro de tu carpeta de usuario): con Enter la aceptas, y antes de crear nada te muestra la ruta
+  completa y te pide confirmarla. Si eliges una que se ve peligrosa te
   dice exactamente por qué y te hace escribir `CONFIRMAR` para seguir, o de plano se niega. Lo que
   cuenta como peligrosa: tu carpeta de usuario, un repositorio con `.git`, archivos con pinta de
   credenciales, enlaces simbólicos (no mira qué hay del otro lado), un `node_modules` que no
@@ -87,19 +88,26 @@ Code.
 
 ## 4. Qué va a hacer solo
 
-Sin que tú ejecutes nada aparte:
+Sin que tú ejecutes nada aparte. Si dijiste que vas a **contestar**:
 
 - **Te abre el inicio de sesión de Claude** en un perfil aparte, dedicado a contestar preguntas —
   tu Claude de todos los días no se toca. Se abre tu navegador, escribes tu contraseña ahí, y
   vuelves a la terminal. Después comprueba solo si la sesión de verdad quedó iniciada.
 - **Deja la carpeta lista**, con los permisos que impiden que esa sesión corra comandos, edite
   archivos o salga a internet.
+- **Revisa que todo esté bien** y te dice **solo** lo que te impide contestar. El reporte completo
+  es de `doctor`, no de este momento.
 - **Te copia tu enlace al portapapeles**, para que se lo pases a quien quieras que pueda
   preguntarte.
 - Y al final, **si le dices que sí, te pone a contestar** ahí mismo. Esa terminal se queda
   ocupada esperando preguntas; para parar, Ctrl+C.
 
-Si algo quedó a medias, te lo dice en un resumen corto al final: qué quedó listo y qué te falta.
+Si dijiste que vas a **preguntar**: te imprime tu enlace, manda tu solicitud de permiso si le
+pegaste el enlace de la otra persona, y registra la herramienta dentro de tu Claude Code si le
+dijiste que sí.
+
+Y en los dos casos, si algo quedó a medias te lo dice en un resumen corto al final: qué quedó
+listo y qué te falta.
 
 ## 5. Los comandos del día a día
 
