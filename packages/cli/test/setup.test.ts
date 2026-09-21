@@ -61,7 +61,15 @@ function context(o: Partial<SetupContext> & { prompt: SetupContext['prompt'] }):
   } as SetupContext
 }
 
+// `setup`'s own default answer to the folder question, in the real home of whoever runs this.
+// Nothing here may create it — see the check in afterEach.
+const defaultShareDir = join(homedir(), 'AgentBridge', 'compartido')
+let defaultShareExistedBefore = false
+
 beforeEach(async () => {
+  defaultShareExistedBefore = await access(defaultShareDir)
+    .then(() => true)
+    .catch(() => false)
   root = await mkdtemp(join(tmpdir(), 'ab-setup-'))
   identityHome = join(root, 'identidad')
   profileHome = join(root, 'perfil')
@@ -75,6 +83,18 @@ beforeEach(async () => {
 
 afterEach(async () => {
   for (const c of cleanups.splice(0).reverse()) await c()
+  // Answering the folder question with a plain Enter accepts `setup`'s own default, which is a
+  // real path in the real home directory of whoever runs this suite — and the flow then CREATES
+  // it and writes a CLAUDE.md into it. That happened for real while these tests were being
+  // written (and once before, per the comment on expandUserPath): every test here must pass an
+  // explicit temp folder. Fails loudly instead of deleting anything, because by the time this
+  // notices, the folder may well be one the person actually wanted.
+  if (!defaultShareExistedBefore) {
+    const leaked = await access(defaultShareDir)
+      .then(() => true)
+      .catch(() => false)
+    expect(leaked, `${defaultShareDir} — a test answered the folder question with Enter`).toBe(false)
+  }
 })
 
 async function seedIdentityAndProfile(): Promise<void> {
@@ -416,7 +436,7 @@ describe('blockers', () => {
 
 describe('the guided flow as a whole', () => {
   it('prints no shell syntax and no technical check list when everything works', async () => {
-    const ctx = await responderSetupContext({ answers: ['Dani', '1', '', '', 'n'] })
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', 'n'] })
     await runSetup(ctx)
     ctx.expectDrained()
     const text = ctx.out.lines.join('\n')
@@ -436,7 +456,7 @@ describe('the guided flow as a whole', () => {
     // never happened (blocking). Port 9 on loopback refuses immediately: nothing here needs a
     // network, and nothing waits on a timeout.
     const ctx = await responderSetupContext({
-      answers: ['Dani', '1', '', '', ''],
+      answers: ['Dani', '1', shareDir, '', ''],
       loggedIn: false,
       relays: [board.url, 'wss://127.0.0.1:9/'],
     })
@@ -445,7 +465,11 @@ describe('the guided flow as a whole', () => {
     const text = ctx.out.lines.join('\n')
     expect(text).toMatch(/no quedó iniciada/i)
     // The dead board is real — doctor saw it fail — and this command still says nothing about it.
-    expect(text).not.toMatch(/Tablero/)
+    // Asserted on the "Falta algo:" lines themselves rather than on the whole transcript: the
+    // word "tablero" appears legitimately up top ("usas N tableros públicos"), so a search over
+    // everything would pass no matter what this branch printed.
+    expect(ctx.out.lines.filter((line) => line.startsWith('Falta algo:'))).toEqual([])
+    expect(text).not.toMatch(/\[falta\]/)
     // It did open the login rather than telling them to open it.
     expect(ctx.interactiveCalls.map((c) => c.args.join(' '))).toContain('auth login')
     // And with no session there is nothing to start, so it never offers.
@@ -454,7 +478,7 @@ describe('the guided flow as a whole', () => {
   })
 
   it('starts answering when asked to', async () => {
-    const ctx = await responderSetupContext({ answers: ['Dani', '1', '', '', 's'] })
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', 's'] })
     await runSetup(ctx)
     ctx.expectDrained()
     expect(ctx.interactiveCalls.map((c) => c.args.join(' ')).join('\n')).toContain('plugin:agentbridge@agentbridge-local')
@@ -465,7 +489,7 @@ describe('the guided flow as a whole', () => {
     // before the login and recorded "no session". Deciding whether the responder can start from
     // that recorded answer — instead of from what the login itself reported — refuses to start a
     // responder that works perfectly, on the single most common path through this flow.
-    const ctx = await responderSetupContext({ answers: ['Dani', '1', '', '', '', 's'], logsInDuringSetup: true })
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '', 's'], logsInDuringSetup: true })
     await runSetup(ctx)
     ctx.expectDrained()
     const text = ctx.out.lines.join('\n')
@@ -480,7 +504,7 @@ describe('the guided flow as a whole', () => {
     // The ordering bug this plan nearly shipped: starting the responder from inside the answering
     // branch would return before `connect` and the MCP registration ever ran, and the person would
     // have no way to know what they did not get.
-    const ctx = await responderSetupContext({ answers: ['Dani', '3', '', '', 'n', 'n', 's'] })
+    const ctx = await responderSetupContext({ answers: ['Dani', '3', shareDir, '', 'n', 'n', 's'] })
     await runSetup(ctx)
     ctx.expectDrained()
     const text = ctx.out.lines.join('\n')
@@ -494,7 +518,7 @@ describe('the guided flow as a whole', () => {
   })
 
   it('still prints the link when no clipboard tool exists', async () => {
-    const ctx = await responderSetupContext({ answers: ['Dani', '1', '', '', 'n'], copyLink: async () => false })
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', 'n'], copyLink: async () => false })
     await runSetup(ctx)
     ctx.expectDrained()
     const text = ctx.out.lines.join('\n')
