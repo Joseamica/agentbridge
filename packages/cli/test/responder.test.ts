@@ -5,10 +5,17 @@ import { CLI_COMMAND } from '@agentbridge/core'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { memoryOutput } from '../src/context'
 import { readResponderConfig, responderArgs, runResponder, RESPONDER_CONFIG_FILE } from '../src/commands/responder'
+import { responderSettings } from '../src/commands/setup-responder'
 
-async function profileWith(config: unknown): Promise<string> {
+// `settingsText` is what lands in the profile's settings.json — the file `--settings` points
+// `claude` at, and the only thing that actually fences the answering session. It defaults to
+// exactly what setupResponder writes, because every test that reaches the spawn needs a profile
+// that is genuinely safe to start; the fence tests below pass their own broken shapes, and
+// `null` leaves the file out altogether.
+async function profileWith(config: unknown, settingsText: string | null = JSON.stringify(responderSettings())): Promise<string> {
   const profileHome = await mkdtemp(join(tmpdir(), 'ab-responder-'))
   await writeFile(join(profileHome, RESPONDER_CONFIG_FILE), JSON.stringify(config), { mode: 0o600 })
+  if (settingsText !== null) await writeFile(join(profileHome, 'settings.json'), settingsText, { mode: 0o600 })
   return profileHome
 }
 
@@ -178,6 +185,87 @@ describe('runResponder', () => {
       runInteractive: async () => ({ code: 3, spawnFailed: false }),
     })
     expect(code).toBe(3)
+  })
+
+  // Whole-branch review, Important 1. `claude` refuses a MISSING --settings file but accepts one
+  // that exists and is not valid JSON, in silence (verified against the real 2.1.278 binary) — so
+  // the one shape that leaves the answering session unfenced is the one Claude does not catch.
+  // Every case below must be refused BEFORE the spawn: a session started with
+  // --permission-mode dontAsk and no deny list and no read fence is answering another person's
+  // questions with Bash, Write and WebFetch reachable and the whole machine readable.
+  describe('the fence around the answering session', () => {
+    async function startWith(settingsText: string | null): Promise<{ error: unknown; spawned: boolean }> {
+      const profileHome = await profileWith(workingConfig, settingsText)
+      let spawned = false
+      const error: unknown = await runResponder({
+        profileHome,
+        env: {},
+        out: memoryOutput(),
+        runInteractive: async () => {
+          spawned = true
+          return { code: 0, spawnFailed: false }
+        },
+      }).catch((e: unknown) => e)
+      return { error, spawned }
+    }
+
+    it('refuses to start when settings.json is missing, and never spawns', async () => {
+      const { error, spawned } = await startWith(null)
+      expect((error as Error).message).toMatch(/permisos/i)
+      expect((error as Error).message).toContain(`${CLI_COMMAND} setup`)
+      expect(spawned).toBe(false)
+    })
+
+    it('refuses to start when settings.json exists but is not valid JSON, and never spawns', async () => {
+      const { error, spawned } = await startWith('no-json')
+      expect((error as Error).message).toMatch(/JSON/i)
+      expect(spawned).toBe(false)
+    })
+
+    it('refuses to start when a deny rule is gone, naming it, and never spawns', async () => {
+      const weakened = responderSettings()
+      weakened.permissions.deny = weakened.permissions.deny.filter((rule) => rule !== 'Bash')
+      const { error, spawned } = await startWith(JSON.stringify(weakened))
+      expect((error as Error).message).toContain('Bash')
+      expect(spawned).toBe(false)
+    })
+
+    it('refuses to start when the read fence is not true, and never spawns', async () => {
+      const unfenced = responderSettings()
+      unfenced.permissions.blockReadsOutsideWorkingDirectories = false
+      const { error, spawned } = await startWith(JSON.stringify(unfenced))
+      expect((error as Error).message).toContain('blockReadsOutsideWorkingDirectories')
+      expect(spawned).toBe(false)
+    })
+
+    // The subtlety the fence's own comment records: Claude Code reads this key nested INSIDE
+    // `permissions`. A copy beside it is valid JSON, is accepted in silence, and never engages —
+    // so a checker that reads it from the top level would wave through a genuinely unfenced
+    // profile. This is the shape that proves the check reads the nested place.
+    it('refuses a fence written beside `permissions` instead of inside it', async () => {
+      const misplaced = responderSettings() as Record<string, unknown> & { permissions: Record<string, unknown> }
+      delete misplaced.permissions.blockReadsOutsideWorkingDirectories
+      misplaced.blockReadsOutsideWorkingDirectories = true
+      const { error, spawned } = await startWith(JSON.stringify(misplaced))
+      expect((error as Error).message).toContain('blockReadsOutsideWorkingDirectories')
+      expect(spawned).toBe(false)
+    })
+
+    it('starts normally with the settings setupResponder writes', async () => {
+      const profileHome = await profileWith(workingConfig)
+      let spawned = false
+      const code = await runResponder({
+        profileHome,
+        env: {},
+        out: memoryOutput(),
+        runInteractive: async () => {
+          spawned = true
+          return { code: 0, spawnFailed: false }
+        },
+      })
+      expect(spawned).toBe(true)
+      expect(code).toBe(0)
+    })
   })
 
   it('treats Ctrl+C as a normal stop, not a failure', async () => {

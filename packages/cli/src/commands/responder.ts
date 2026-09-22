@@ -7,6 +7,7 @@ import { CliError, type CliContext, type Output } from '../context'
 import { isSameOrWithin } from '../fs-paths'
 import { defaultInteractiveRunner, type InteractiveRunner } from '../interactive'
 import { ALLOWED_EFFORTS, RESPONDER_CONFIG_FILE, SAFE_MODEL_PATTERN, type ResponderConfig } from './responder-config'
+import { inspectResponderSettings } from './setup-responder'
 
 export { RESPONDER_CONFIG_FILE, type ResponderConfig } from './responder-config'
 
@@ -86,6 +87,25 @@ export async function runResponder(o: {
 }): Promise<number> {
   const profileHome = resolve(o.profileHome)
   const config = await readResponderConfig(profileHome)
+
+  // The one file that actually fences this session, checked before spawning — not merely
+  // reported by `doctor`, which nothing makes anyone run. `responder.json` is re-validated on
+  // every read above, and it is the harmless one: it names a folder and a model. `settings.json`
+  // is what carries `permissions.blockReadsOutsideWorkingDirectories` and RESPONDER_DENY, and it
+  // is handed to `claude --settings` unread. Claude Code refuses a MISSING settings file but
+  // accepts one that exists and is not valid JSON in silence (verified against the real 2.1.278
+  // binary), so a settings.json truncated by a crash, mangled by a sync-conflict copy or broken
+  // by a hand-edit would otherwise start a `--permission-mode dontAsk` session with no deny list
+  // and no read fence — answering another person's questions with the whole machine readable,
+  // and nothing said. `responder --profile <any directory>` makes that reachable on purpose, so
+  // the check belongs here and not only in `doctor`. The reader itself lives beside the writer
+  // (setup-responder.ts) so this and doctor's own check can never disagree.
+  const fence = await inspectResponderSettings(profileHome)
+  if (fence.problems.length > 0) {
+    throw new CliError(
+      `No puedo ponerte a contestar: los permisos del perfil dedicado no están como deben (${fence.problems.join(' · ')}). Sin ellos, la sesión que contesta podría leer archivos fuera de la carpeta compartida. Vuelve a correr: ${CLI_COMMAND} setup`,
+    )
+  }
 
   // Checked here, before spawning, rather than inferred from the spawn's own failure: `spawn`
   // raises the same ENOENT for a `cwd` that does not exist as it does for a binary that is not

@@ -1,6 +1,6 @@
 import { CLI_COMMAND } from '@agentbridge/core'
 import { spawn } from 'node:child_process'
-import { access, chmod, mkdir, writeFile } from 'node:fs/promises'
+import { access, chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -54,6 +54,59 @@ export function responderSettings() {
   }
 }
 
+// What `doctor` reports and what `responder` refuses to start without: one reader for the file
+// `responderSettings()` above writes, living next to the writer so the two cannot drift. Both
+// callers need the same verdict for opposite reasons — doctor to print a check, `responder` to
+// stop before handing another person's questions to an unfenced session — and a second copy of
+// this logic somewhere else is exactly how one of them ends up reading the key from the wrong
+// place. `problems` is empty when the fence is intact; `detail` is what to say when it is.
+export type ResponderSettingsReport = { problems: string[]; detail: string }
+
+export async function inspectResponderSettings(profileHome: string): Promise<ResponderSettingsReport> {
+  type SettingsFile = {
+    permissions?: { allow?: string[]; deny?: string[]; blockReadsOutsideWorkingDirectories?: boolean }
+  }
+  const settingsPath = join(resolve(profileHome), 'settings.json')
+  let settings: SettingsFile | null = null
+  // Missing and corrupt are different problems — "you never ran setup-responder" vs. "someone
+  // hand-edited this and broke the JSON" — and deserve different Spanish messages, not the
+  // same "no existe" for both. The corrupt case is the one that matters most: `claude` itself
+  // refuses a MISSING --settings file, but accepts one that exists and is not valid JSON in
+  // silence (verified against the real 2.1.278 binary), so nothing else would ever catch it.
+  let settingsProblem: string | null = null
+  try {
+    const text = await readFile(settingsPath, 'utf8')
+    try {
+      settings = JSON.parse(text) as SettingsFile
+    } catch {
+      settingsProblem = `${settingsPath} existe pero no es JSON válido`
+    }
+  } catch (err) {
+    settingsProblem =
+      (err as NodeJS.ErrnoException).code === 'ENOENT' ? `no existe ${settingsPath}` : `no se pudo leer ${settingsPath}`
+  }
+  const allow = settings?.permissions?.allow ?? []
+  const deny = settings?.permissions?.deny ?? []
+  const missingDeny = RESPONDER_DENY.filter((rule) => !deny.includes(rule))
+  const extraAllow = allow.filter((rule) => rule !== REPLY_TOOL_NAME)
+  // Read from nested inside `permissions`, never from the top level — see the comment on
+  // responderSettings() above. A copy beside `permissions` is accepted in silence and never
+  // engages, so reading it from there would report a genuinely unfenced responder as fine.
+  const fenced = settings?.permissions?.blockReadsOutsideWorkingDirectories === true
+  const problems: string[] = []
+  if (settingsProblem) {
+    problems.push(settingsProblem)
+  } else {
+    if (missingDeny.length) problems.push(`faltan denegaciones: ${missingDeny.join(', ')}`)
+    if (extraAllow.length) problems.push(`permisos de más: ${extraAllow.join(', ')}`)
+    if (!fenced) problems.push('permissions.blockReadsOutsideWorkingDirectories no está en true')
+  }
+  return {
+    problems,
+    detail: `Deniega ${deny.join(', ')}; permite solo ${allow.join(', ') || 'nada'}; lecturas limitadas a la carpeta de trabajo`,
+  }
+}
+
 // Written once into the shared folder as its CLAUDE.md. setupResponder never overwrites an
 // existing one — if the owner already customized it, we tell them in Spanish instead of
 // silently replacing their rules with ours.
@@ -67,11 +120,6 @@ This folder is shared through AgentBridge. People your owner authorized send que
 - In this session you cannot run commands, edit files or browse the web. If a question asks for an action, reply that your owner has to do it personally.
 - Always answer with the reply tool: copy the code exactly, list the files you used in source, and set confidence to seguro, creo or no_se. If the files do not contain the answer, say so with confidence no_se.
 `
-
-// Exported so setup.ts prints paths with the same quoting rule its own printed commands need —
-// a profile at `/tmp/mi respondedor` or a home with an apostrophe in it must still produce a
-// line that runs.
-export const quote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`
 
 export type CommandRunner = (
   command: string,

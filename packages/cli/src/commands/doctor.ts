@@ -23,7 +23,7 @@ import { parseArgs } from 'node:util'
 import { CliError, type CliContext } from '../context'
 import { isSameOrWithin, resolveComparablePath, resolveNonExisting } from '../fs-paths'
 import { readResponderConfig, RESPONDER_CONFIG_FILE } from './responder'
-import { defaultRunner, REPLY_TOOL_NAME, RESPONDER_DENY, type CommandRunner } from './setup-responder'
+import { defaultRunner, inspectResponderSettings, type CommandRunner } from './setup-responder'
 
 export type Check = {
   name: string
@@ -448,9 +448,9 @@ async function addShareChecks(
 }
 
 // Everything the dedicated Claude Code profile is responsible for: whether `--profile` was
-// given, never whether `--share` was. Settings, the start script, the installed plugin and the
-// login check all live under `profileHome` regardless of whether a shared folder is in the
-// picture at all.
+// given, never whether `--share` was. Settings, the saved responder configuration, the installed
+// plugin and the login check all live under `profileHome` regardless of whether a shared folder
+// is in the picture at all.
 async function addProfileChecks(
   add: (name: string, ok: boolean, detail: string, blocking: boolean, security?: boolean) => void,
   o: { profileHome: string; repoDir?: string; run: CommandRunner },
@@ -458,51 +458,11 @@ async function addProfileChecks(
   // Everything below lives under `profileHome`, independent of whether a shared folder was given —
   // a profile with no settings.json (or a weakened one) must fail loudly even when doctor is run
   // with only --profile.
-  type SettingsFile = {
-    permissions?: { allow?: string[]; deny?: string[]; blockReadsOutsideWorkingDirectories?: boolean }
-  }
-  const settingsPath = join(o.profileHome, 'settings.json')
-  let settings: SettingsFile | null = null
-  // Missing and corrupt are different problems — "you never ran setup-responder" vs. "someone
-  // hand-edited this and broke the JSON" — and deserve different Spanish messages, not the
-  // same "no existe" for both.
-  let settingsProblem: string | null = null
-  try {
-    const text = await readFile(settingsPath, 'utf8')
-    try {
-      settings = JSON.parse(text) as SettingsFile
-    } catch {
-      settingsProblem = `${settingsPath} existe pero no es JSON válido`
-    }
-  } catch (err) {
-    settingsProblem =
-      (err as NodeJS.ErrnoException).code === 'ENOENT' ? `no existe ${settingsPath}` : `no se pudo leer ${settingsPath}`
-  }
-  const allow = settings?.permissions?.allow ?? []
-  const deny = settings?.permissions?.deny ?? []
-  const missingDeny = RESPONDER_DENY.filter((rule) => !deny.includes(rule))
-  const extraAllow = allow.filter((rule) => rule !== REPLY_TOOL_NAME)
-  // Claude Code reads this key nested inside `permissions`, not as a sibling of it — see the
-  // comment on responderSettings() in setup-responder.ts. Reading it from the wrong place here
-  // would report a genuinely unfenced responder as fine.
-  const fenced = settings?.permissions?.blockReadsOutsideWorkingDirectories === true
-  const permissionProblems: string[] = []
-  if (settingsProblem) {
-    permissionProblems.push(settingsProblem)
-  } else {
-    if (missingDeny.length) permissionProblems.push(`faltan denegaciones: ${missingDeny.join(', ')}`)
-    if (extraAllow.length) permissionProblems.push(`permisos de más: ${extraAllow.join(', ')}`)
-    if (!fenced) permissionProblems.push('permissions.blockReadsOutsideWorkingDirectories no está en true')
-  }
-  add(
-    'Permisos del respondedor',
-    permissionProblems.length === 0,
-    permissionProblems.length
-      ? permissionProblems.join(' · ')
-      : `Deniega ${deny.join(', ')}; permite solo ${allow.join(', ') || 'nada'}; lecturas limitadas a la carpeta de trabajo`,
-    true,
-    true,
-  )
+  // The reading itself lives beside the writer, in setup-responder.ts: `responder` refuses to
+  // start on exactly this verdict (whole-branch review, Important 1), and a second copy here
+  // would be free to drift from the one that decides whether a session is safe to spawn.
+  const fence = await inspectResponderSettings(o.profileHome)
+  add('Permisos del respondedor', fence.problems.length === 0, fence.problems.length ? fence.problems.join(' · ') : fence.detail, true, true)
 
   // What `start.sh`'s own executable-bit check used to stand in for: proof that this profile
   // was actually prepared by setup-responder, not just a folder someone pointed --profile at.
