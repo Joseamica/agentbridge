@@ -34,5 +34,8 @@ step(['run', 'pack'])
 console.log(`\nTodo verde. Falta un paso, y es tuyo:\n`)
 console.log(`  npm publish ./dist/pack`)
 console.log(`\nDespués:\n`)
-console.log(`  git tag v${version} && git push origin main --tags`)
+// The tag by name, never `--tags`: that pushes every local tag at once, and this repository has
+// history that is deliberately kept local (the `archive/pre-oss` branch exists for that reason).
+// A release should push exactly the one tag it is about.
+console.log(`  git tag v${version} && git push origin main && git push origin v${version}`)
 console.log(`  gh release create v${version} --title "AgentBridge ${version}" --notes-file <notas>`)
