@@ -786,7 +786,10 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     // so by now it is stale — reading it here would report "no has iniciado sesión" to someone
     // who just did, and (worse, below) would refuse to start a responder that works perfectly.
     const toSay = mustMention(checks).filter((c) => c.name !== SESSION_CHECK_NAME)
-    const stillBlocking = toSay.filter((c) => c.blocking)
+    // Deliberately `blockers`, not `toSay.filter(...)`: the two lists answer two different
+    // questions, and only this one may decide whether there is any point offering to start the
+    // responder. A key inside OneDrive must be said out loud AND must not stop anything.
+    const stillBlocking = blockers(checks).filter((c) => c.name !== SESSION_CHECK_NAME)
     // Two different sentences, because these are two different things: one stops them from
     // answering at all, the other is a machine that works fine and a key that is not safe.
     for (const c of toSay) out.log(`${c.blocking ? 'Falta algo' : 'Ojo'}: ${c.detail}`)
