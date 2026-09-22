@@ -73,6 +73,10 @@ export const makeInteractiveRunner =
       // alongside it with nothing said. Registered for the duration of the handoff only, and
       // removed in `finish`, so Ctrl+C means what it always did everywhere else in the program.
       const ignoreSigint = (): void => {}
+      // Attached AFTER the terminal is cooked, never before: while the tty is still raw the
+      // kernel delivers no SIGINT at all, so a listener installed first guards nothing — and the
+      // instant cooking takes effect, a Ctrl+C would reach this process and kill the CLI out from
+      // under the child. Cook first, then guard, and the window between the two states is closed.
       process.on('SIGINT', ignoreSigint)
       // Released BEFORE the spawn, not after: a readline interface that is still flowing competes
       // with the child for every keystroke, and the line the child asked for would be eaten by a
@@ -94,9 +98,20 @@ export const makeInteractiveRunner =
       // with a space, a model id, a path with an apostrophe — can be reinterpreted by a shell.
       // This is also what makes the whole plan work identically on Windows, where the shell is
       // not the one we would have quoted for.
-      const child = spawn(command, args, { env: opts.env, cwd: opts.cwd, stdio: 'inherit' })
-      child.on('error', () => finish({ code: null, spawnFailed: true }))
-      child.on('exit', (code) => finish({ code, spawnFailed: false }))
+      // Wrapped because `spawn` can throw SYNCHRONOUSLY — a malformed `cwd` or `env` is a
+      // TypeError, not an 'error' event — and a throw here would escape past `finish`, leaving
+      // this process with the SIGINT listener still installed, the prompt still paused and the
+      // terminal still cooked: Ctrl+C dead and no echo, for the rest of the session. Every
+      // argument we pass today is validated upstream, so this is unreachable; it is here because
+      // the cost of being wrong about that is the person's terminal, and the cost of the guard is
+      // three lines. Reported as a spawn failure, the same shape the 'error' event produces.
+      try {
+        const child = spawn(command, args, { env: opts.env, cwd: opts.cwd, stdio: 'inherit' })
+        child.on('error', () => finish({ code: null, spawnFailed: true }))
+        child.on('exit', (code) => finish({ code, spawnFailed: false }))
+      } catch {
+        finish({ code: null, spawnFailed: true })
+      }
     })
 
 export const defaultInteractiveRunner: InteractiveRunner = makeInteractiveRunner()

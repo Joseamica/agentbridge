@@ -199,6 +199,22 @@ describe('defaultInteractiveRunner', () => {
     expect(process.listenerCount('SIGINT')).toBe(before)
   })
 
+  it('survives a spawn that throws synchronously, without leaving the terminal wedged', async () => {
+    // `spawn` raises a TypeError, not an 'error' event, for a malformed option — here a `cwd`
+    // that is not a string. Before the guard, that throw escaped past `finish`: the SIGINT
+    // listener stayed installed, the prompt stayed paused and the tty stayed cooked, which is
+    // Ctrl+C dead and no echo for the rest of the session. Unreachable through today's call
+    // sites, which validate their arguments; pinned because the cost of being wrong is the
+    // person's terminal.
+    const before = process.listenerCount('SIGINT')
+    const result = await defaultInteractiveRunner(process.execPath, ['-e', ''], {
+      env: process.env,
+      cwd: 42 as unknown as string,
+    })
+    expect(result).toEqual({ code: null, spawnFailed: true })
+    expect(process.listenerCount('SIGINT')).toBe(before)
+  })
+
   it('runs the child in the requested folder', async () => {
     const result = await defaultInteractiveRunner(process.execPath, ['-e', 'process.exit(process.cwd() === process.env.EXPECTED ? 0 : 1)'], {
       env: { ...process.env, EXPECTED: fixtures },
