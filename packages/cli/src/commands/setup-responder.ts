@@ -292,7 +292,13 @@ export async function setupResponder(o: {
     { args: ['plugin', 'install', 'agentbridge@agentbridge-local', '--scope', 'user'], target: 'agentbridge@agentbridge-local' },
   ]
   for (const step of steps) {
-    const r = await o.run('claude', step.args, { env })
+    // Bounded like every other `claude` call in this flow (`auth status`, `mcp add`). These two
+    // are the only ones left unbounded, and they run in the middle of the guided setup with
+    // nothing on screen: a `claude` that never returns would leave the assistant hanging forever,
+    // with no message and nothing to press. Ninety seconds because these two genuinely do work —
+    // they resolve a marketplace and install a plugin — unlike the fifteen-second checks. An
+    // abort surfaces as a non-zero code and lands on the same Spanish failure as any other.
+    const r = await o.run('claude', step.args, { env, signal: AbortSignal.timeout(90_000) })
     const text = `${r.stdout}${r.stderr}`
     // A non-zero exit only counts as an already-satisfied no-op when the output both says
     // "already" AND names the specific thing we tried to add or install — a bare "already"
