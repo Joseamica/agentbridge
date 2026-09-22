@@ -63,6 +63,14 @@ describe('link', () => {
 
 describe('connect', () => {
   it('stores the request, publishes it, and says so in Spanish', async () => {
+    // 22 bits of proof of work, mined for real — this is the one test in its file that does
+    // genuine cryptographic work rather than arranging data, and how long it takes depends on how
+    // busy the machine is, not on this code. Vitest's 20-second default was enough until the suite
+    // grew past 800 tests, several of which spawn real child processes and compete for the same
+    // cores; then it began failing about twice in three full runs while passing every time in
+    // isolation. An explicit bound, the same way tests/asker/multiprocess.test.ts bounds its own
+    // real-process tests, rather than a retry — a flaky guard teaches people to re-run instead of
+    // to look.
     await connect([encodeLink(them.publicKey, [board.url]), '--note', 'soy Beto'], ctx)
     const store = await openStore(home, { relayPolicy: allowAnyRelay })
     expect(getContact(store, them.publicKey, 'outbound')).toMatchObject({ state: 'pending' })
@@ -75,7 +83,7 @@ describe('connect', () => {
     const store = await openStore(home, { relayPolicy: allowAnyRelay })
     expect(getContact(store, them.publicKey, 'outbound')).toBeNull()
     store.close()
-  })
+  }, 120_000)
 
   it('explains what is missing when the link is not one of ours', async () => {
     await expect(connect(['no-es-un-enlace'], ctx)).rejects.toThrow()

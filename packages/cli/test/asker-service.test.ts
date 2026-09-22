@@ -107,6 +107,14 @@ async function waitFor(predicate: () => boolean, options: { timeoutMs?: number; 
 
 describe('connect', () => {
   it('stores a pending request and publishes it to the relays in the link', async () => {
+    // 22 bits of proof of work, mined for real — this is the one test in its file that does
+    // genuine cryptographic work rather than arranging data, and how long it takes depends on how
+    // busy the machine is, not on this code. Vitest's 20-second default was enough until the suite
+    // grew past 800 tests, several of which spawn real child processes and compete for the same
+    // cores; then it began failing about twice in three full runs while passing every time in
+    // isolation. An explicit bound, the same way tests/asker/multiprocess.test.ts bounds its own
+    // real-process tests, rather than a retry — a flaky guard teaches people to re-run instead of
+    // to look.
     const outcome = await service.connect(encodeLink(them.publicKey, [board.url]), 'soy Beto, del equipo de datos')
     expect(outcome).toMatchObject({ kind: 'requested', pubkey: them.publicKey })
     expect(getContact(store, them.publicKey, 'outbound')).toMatchObject({ state: 'pending' })
@@ -122,7 +130,7 @@ describe('connect', () => {
     await service.connect(link, 'hola')
     const second = await service.connect(link, 'hola otra vez')
     expect(second).toMatchObject({ kind: 'already_pending', pubkey: them.publicKey })
-  })
+  }, 120_000)
 
   it('refuses a link with no usable relay', async () => {
     await expect(service.connect(encodeLink(them.publicKey, ['http://x.example.com']), 'hola')).rejects.toThrow(UserFacingError)
