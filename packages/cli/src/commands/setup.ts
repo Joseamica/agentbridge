@@ -8,6 +8,7 @@ import {
   nowSeconds,
   openStore,
   setProfile,
+  UserFacingError,
   type Profile,
 } from '@agentbridge/core'
 import type { Dirent } from 'node:fs'
@@ -15,12 +16,15 @@ import { access, lstat, readdir, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
+import { copyToClipboard } from '../clipboard'
 import { CliError, PromptEOF, type CliContext, type Output, type Prompt } from '../context'
 import { isSameOrWithin, resolveComparablePath } from '../fs-paths'
+import { defaultInteractiveRunner, type InteractiveRunner } from '../interactive'
 import { describeFsError } from '../spanish-errors'
 import { connect } from './connect'
-import { projectConfigArtifacts, runDoctor } from './doctor'
-import { defaultRunner, quote, repoDirFromBundleLocation, setupResponder, type CommandRunner } from './setup-responder'
+import { projectConfigArtifacts, runDoctor, type Check } from './doctor'
+import { readResponderConfig, runResponder } from './responder'
+import { defaultRunner, repoDirFromBundleLocation, setupResponder, type CommandRunner } from './setup-responder'
 
 // The guided flow needs two extra things the plain CliContext does not carry: something to
 // drive prompts with (real readline in production, a scripted queue in tests — see
@@ -39,6 +43,12 @@ export type SetupContext = CliContext & {
   // The one seam this command needs for tests: `connect` mines 22 bits of proof of work, and the
   // plan allows exactly one test in the whole repository to pay for that (tests/asker/flow.test.ts).
   connectWith?: (link: string, ctx: CliContext) => Promise<void>
+  // How this command hands the terminal over to Claude — for the login, and for the responder
+  // itself. Injected like `run` so tests never spawn anything.
+  runInteractive: InteractiveRunner
+  // Returns false when no clipboard tool exists. Injected so a test does not depend on whether
+  // the machine running it happens to have one.
+  copyLink?: (text: string) => Promise<boolean>
 }
 
 // The truth today: the key and the name are only ever created by answering these two questions,
@@ -204,31 +214,71 @@ export function expandUserPath(raw: string): string {
 
 const MAX_FOLDER_ATTEMPTS = 3
 
+// The three verdicts no typed confirmation can override, as a sentence instead of a thrown
+// error. They used to end the whole interview: a typo in a long path cost a full re-run, for the
+// role whose interview is the longest, with the loop to feed it back into sitting right there
+// (whole-branch review, Minor 3). The sentence carries no "vuelve a correr setup" — inside the
+// loop that would be wrong advice, and the one place that does give up says it itself.
+function hardRefusal(assessment: ShareDirAssessment): string | null {
+  if (assessment.problem) return `No puedo usar esa carpeta: ${assessment.problem}.`
+  if (assessment.isHome) {
+    return 'Esa es tu carpeta de usuario, y compartirla dejaría visible todo lo que tienes en la computadora.'
+  }
+  if (assessment.credentialConflict) {
+    // What is actually at stake differs by branch (Q1: the dedicated profile holds no key or
+    // database) — naming the wrong one would either overclaim (a leaked settings.json is not
+    // "tu identidad entera") or underclaim (a leaked identity.json is worse than a permission
+    // file), so each says only what is true of it.
+    const stake =
+      assessment.credentialConflictKind === 'identity'
+        ? 'Tu llave secreta es tu identidad entera: quien la lea puede hacerse pasar por ti en cualquier tablero, para siempre, y no hay forma de revocarla.'
+        : 'Ahí viven settings.json y responder.json, que controlan qué puede hacer la sesión que contesta preguntas: quien los lea o los reescriba podría aflojar sus permisos o cambiar qué corre.'
+    return `Ahí dentro está ${assessment.credentialConflict}. ${stake}`
+  }
+  return null
+}
+
 // Expands `~`/`$HOME` and resolves a relative path against the current directory, then always
 // shows the fully resolved absolute path and asks for confirmation before anything is created —
 // a relative path or a surprising `~`/`$HOME` expansion is visible here, before it does
-// anything, rather than after a folder was already created somewhere unintended. Saying "no"
-// re-asks for a different folder (bounded, same 3-attempt shape as every other question here)
-// rather than ending the whole run.
-async function chooseShareDir(prompt: Prompt, out: Output, defaultShare: string): Promise<string> {
+// anything, rather than after a folder was already created somewhere unintended. Saying "no",
+// and now also naming a folder that cannot be used at all, re-asks for a different one
+// (bounded, same 3-attempt shape as every other question here) rather than ending the whole run.
+// The assessment travels back out with the folder so the caller does not have to run it twice.
+async function chooseShareDir(o: {
+  prompt: Prompt
+  out: Output
+  defaultShare: string
+  assess: (shareDir: string) => Promise<ShareDirAssessment>
+}): Promise<{ shareDir: string; assessment: ShareDirAssessment }> {
   for (let attempt = 1; attempt <= MAX_FOLDER_ATTEMPTS; attempt++) {
-    const rawShare = (await prompt(`Carpeta a compartir (Enter para usar ${defaultShare}): `)).trim()
-    const shareDir = resolve(expandUserPath(rawShare) || defaultShare)
+    const rawShare = (await o.prompt(`Carpeta a compartir (Enter para usar ${o.defaultShare}): `)).trim()
+    const shareDir = resolve(expandUserPath(rawShare) || o.defaultShare)
     // Logged explicitly (not just folded into the question text below) so it is always visible
     // — to a person at a real terminal AND to anything inspecting this command's output — even
     // though a real readline `.question()` would also echo its own question string to the
     // terminal on its own.
-    out.log(`Voy a usar esta carpeta: ${shareDir}`)
+    o.out.log(`Voy a usar esta carpeta: ${shareDir}`)
     const proceed = await askWithRetries(
-      prompt,
-      out,
+      o.prompt,
+      o.out,
       '¿Está bien? [S/n]: ',
       parseProceedOrRetry,
       'Escribe s (sí), n (no), o solo Enter para aceptar.',
       'No entendí tu respuesta.',
     )
-    if (proceed) return shareDir
-    if (attempt < MAX_FOLDER_ATTEMPTS) out.log('Bien, dime otra carpeta.')
+    if (proceed) {
+      const assessment = await o.assess(shareDir)
+      const refusal = hardRefusal(assessment)
+      if (!refusal) return { shareDir, assessment }
+      o.out.log(refusal)
+      if (attempt === MAX_FOLDER_ATTEMPTS) {
+        throw new CliError(`${refusal} No toqué nada. Vuelve a correr "${CLI_COMMAND} setup" cuando tengas otra carpeta en mente.`)
+      }
+      o.out.log('Elige otra ruta.')
+      continue
+    }
+    if (attempt < MAX_FOLDER_ATTEMPTS) o.out.log('Bien, dime otra carpeta.')
   }
   throw new CliError(`No pude confirmar una carpeta para compartir después de 3 intentos. Vuelve a correr "${CLI_COMMAND} setup".`)
 }
@@ -363,7 +413,7 @@ export type ShareDirAssessment = {
   credentialConflict: string | null
   // What is actually at stake in `credentialConflict`, since it is not the same thing for the two
   // branches: the identity folder holds the secret key itself, but the dedicated profile (Q1 of
-  // this plan) holds no key or database at all — only settings.json and start.sh, which control
+  // this plan) holds no key or database at all — only settings.json and responder.json, which control
   // what the answering session is allowed to do. A caller that prints one message for both would
   // overclaim for the profile branch.
   credentialConflictKind: 'identity' | 'profile' | null
@@ -448,6 +498,147 @@ export async function assessShareDir(
   return { exists, isHome, credentialConflict, credentialConflictKind, problem, reasons }
 }
 
+// doctor's own name for the one check this command can fix on the spot instead of merely
+// reporting. Matched by name because `Check` carries no identifier of any other kind, and the
+// coupling is loud rather than silent: renaming the string in doctor.ts fails four tests in
+// `setup.test.ts` (verified in review round 1). Two things that failure would NOT be: subtle, or
+// harmless. A rename leaves the stale, pre-login session check inside the blocking list, which
+// resurrects exactly the defect fixed below — a person who just logged in successfully being
+// told "todavía te falta" and never offered the responder. And it surfaces only in
+// `setup.test.ts`, so `npm test -- doctor` alone stays green. If `Check` ever grows a stable id,
+// this should move to it.
+const SESSION_CHECK_NAME = 'Sesión iniciada en el perfil dedicado'
+
+// How many times this command will open Claude's login before it stops asking. Three is enough
+// for the realistic failure (the browser was closed before the login finished, or the wrong
+// account was used) without turning a dead end into a loop somebody has to Ctrl+C out of.
+const MAX_LOGIN_ATTEMPTS = 3
+
+// Exactly the question `doctor` asks, for exactly the same reason: `claude auth status` exits 0
+// whether or not there is a session, so the verdict is the parsed `loggedIn` field and never the
+// exit code. Claiming a session that does not exist would send someone to start a responder that
+// cannot answer a single question.
+async function sessionExists(run: CommandRunner, env: NodeJS.ProcessEnv): Promise<boolean> {
+  const status = await run('claude', ['auth', 'status', '--json'], { env, signal: AbortSignal.timeout(15_000) }).catch(() => ({
+    code: 127,
+    stdout: '',
+    stderr: '',
+  }))
+  try {
+    return (JSON.parse(status.stdout) as { loggedIn?: boolean }).loggedIn === true
+  } catch {
+    // Unparseable output is not a session. Same reading doctor takes.
+    return false
+  }
+}
+
+// Claude's login is a person typing a password into a browser. We cannot do that for them — but
+// we CAN open the right Claude, in the right profile, and be there when they come back. What we
+// must never do is what 0.2 did: print `CLAUDE_CONFIG_DIR='…' claude` and leave. That line is
+// bash; in PowerShell it is a syntax error, and the person who hit it had no way to know that the
+// instruction itself was wrong rather than their typing.
+export async function loginStep(o: {
+  claudeConfigDir: string
+  env: NodeJS.ProcessEnv
+  out: Output
+  prompt: Prompt
+  run: CommandRunner
+  runInteractive: InteractiveRunner
+  alreadyLoggedIn: boolean
+}): Promise<boolean> {
+  if (o.alreadyLoggedIn) return true
+  const env = { ...o.env, CLAUDE_CONFIG_DIR: o.claudeConfigDir }
+  // Never "una cuenta aparte": it is the same Claude account, kept in its own folder. Someone who
+  // read that as "I need a second account" would stop right here, at the step this whole plan
+  // exists to get them through.
+  o.out.log('Ahora hay que iniciar sesión en Claude. Queda guardado aparte, solo para contestar preguntas:')
+  o.out.log('tu Claude de todos los días no se toca.')
+  o.out.log('Te abro el inicio de sesión — se va a abrir tu navegador. Cuando termines, vuelves solo aquí.')
+  // Retried here, in place, rather than by sending the person back through the whole interview.
+  // Closing the browser before the login finishes is the single most likely first-run outcome,
+  // and "vuelve a correr setup" for it is both lazy (the program is standing right here, it can
+  // just open it again) and, until the folder default below started reading responder.json,
+  // actively dangerous — see the comment on `defaultShare` in the answering branch.
+  for (let attempt = 1; attempt <= MAX_LOGIN_ATTEMPTS; attempt++) {
+    // Enter, not a yes/no: there is no "no" that leads anywhere — without a session there is
+    // nothing to answer with. A question with one real answer should not be asked as if it had two.
+    await o.prompt(attempt === 1 ? 'Presiona Enter para abrirlo: ' : 'Presiona Enter para abrirlo otra vez: ')
+    // `claude auth login`, not a bare `claude`. Claude Code ships a dedicated login subcommand that
+    // does one thing and exits; opening the whole interface instead would mean teaching the person
+    // two slash commands (`/login` to start it, `/exit` to come back) — which is the very habit this
+    // plan exists to end. One command, no instructions to remember.
+    const opened = await o.runInteractive('claude', ['auth', 'login'], { env })
+    if (opened.spawnFailed) {
+      // Not a bare "no está instalado": a missing binary and one that is installed but absent from
+      // this terminal's PATH arrive as the very same Node error, and only one of them is fixed by
+      // installing anything — the same distinction `responder` already makes for its own spawn.
+      // No retry either: opening it again cannot install it.
+      o.out.log(
+        `No pude abrir Claude Code: puede que no esté instalado, o que sí lo esté pero no aparezca en esta terminal. Instálalo desde claude.com/claude-code (o cierra y vuelve a abrir la terminal) y vuelve a correr: ${CLI_COMMAND} setup`,
+      )
+      return false
+    }
+    if (await sessionExists(o.run, env)) {
+      o.out.log('Listo: la sesión quedó iniciada.')
+      return true
+    }
+    if (attempt === MAX_LOGIN_ATTEMPTS) break
+    o.out.log('La sesión no quedó iniciada. A veces pasa: se cierra el navegador antes de terminar, o se usa otra cuenta.')
+    const again = await askWithRetries(
+      o.prompt,
+      o.out,
+      '¿Lo intentamos otra vez? [s/n]: ',
+      parseYesNo,
+      'Escribe s (sí) o n (no).',
+      'No entendí tu respuesta.',
+    ).catch(() => false)
+    if (!again) break
+  }
+  // Only now, after the retries: the re-run is safe (the folder question proposes the folder
+  // already saved in responder.json, so pressing Enter cannot repoint a working responder at an
+  // empty one), and everything else this command did is already on disk.
+  o.out.log('Lo dejamos por ahora: sin la sesión iniciada todavía no puedes contestar preguntas.')
+  o.out.log(`Cuando quieras intentarlo otra vez: ${CLI_COMMAND} setup — no vas a perder nada de lo que ya quedó listo.`)
+  return false
+}
+
+// The failing checks that actually stop this person from answering questions. Used for one
+// decision only — whether there is any point offering to start the responder.
+export function blockers(checks: readonly Check[]): Check[] {
+  return checks.filter((c) => !c.ok && c.blocking)
+}
+
+// What `setup` says out loud: everything that blocks, PLUS everything whose failure is about the
+// safety of the key or the shared folder even when it does not block. Those two are not the same
+// set, and the difference is the whole point: "tu llave está dentro de OneDrive, así que se sube
+// sola a la nube" blocks nothing at all — the install works perfectly — and it is the single most
+// serious sentence this program can say. Filtering the install's own report by `blocking` alone
+// silenced exactly it, at the one moment the person is still choosing which folder to use.
+// A board down out of five stays hidden, as intended: it is weather, and `doctor` still prints it.
+export function mustMention(checks: readonly Check[]): Check[] {
+  return checks.filter((c) => !c.ok && (c.blocking || c.security))
+}
+
+// Printed right before the responder takes over the terminal, because after that the only thing
+// on screen is Claude — and the person will scroll up to here when they want to stop and come
+// back tomorrow. Two things travel in rather than being hard-coded. `responderLine`: on a
+// non-default --profile a bare `responder` would start a different (empty) profile than the one
+// just prepared. `hasPending`: "Ya quedó" is only true of a run with nothing left, and on role 3
+// there is almost always something left — the asking side always ends with "reinicia tu sesión de
+// Claude Code". Printing "Ya quedó" four lines under "Te falta:" and then taking the terminal
+// away told the person both that they were finished and that they still owed two things they
+// could now only do by killing the session they had just been told to leave open.
+function summaryBeforeStart(responderLine: string, hasPending: boolean): string {
+  return [
+    hasPending
+      ? 'Empiezo a contestar. Lo que te falta (arriba) lo puedes hacer cuando pares con Ctrl+C.'
+      : 'Ya quedó. A partir de aquí:',
+    `  - Para ver quién te pidió permiso:   ${CLI_COMMAND} requests`,
+    `  - Para revisar que todo siga bien:   ${CLI_COMMAND} doctor`,
+    `  - Para volver a contestar mañana:    ${responderLine}`,
+  ].join('\n')
+}
+
 // The public entry point tests and setupCommand call. It's a thin wrapper around
 // `runGuidedSetup`: its only job is to turn a `PromptEOF` that escapes the whole flow into
 // INPUT_CLOSED_ES — reached whenever stdin closes or a test's scripted answers run out partway
@@ -524,42 +715,46 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
 
   const done: string[] = [`Identidad lista como ${profile.name}.`]
   const pending: string[] = []
+  // Filled in by the answering branch; read after the verdict, which is the only place from which
+  // starting the responder cannot swallow a step that has not run yet.
+  let canStartResponder = false
+  let responderProfileHome: string | null = null
+  let responderStartLine = `${CLI_COMMAND} responder`
 
   // 3. Answering side
   if (willAnswer) {
     out.log(SHARE_FOLDER_EXPLANATION_ES)
     out.log('')
-    const defaultShare = join(homedir(), 'AgentBridge', 'compartido')
     const repoDir = ctx.repoDir ? resolve(ctx.repoDir) : await repoDirFromBundleLocation(import.meta.url)
     const profileHome = ctx.profileHome ? resolve(ctx.profileHome) : join(homedir(), '.agentbridge-responder')
 
-    const shareDir = await chooseShareDir(prompt, out, defaultShare)
+    // The folder this computer is ALREADY sharing, when there is one, rather than a hard-coded
+    // default. This file's own comment on `applyRelays` documents what the hard-coded version
+    // cost: someone re-running `setup` pressed Enter at this question — the answer the quick
+    // start's own worked example models as normal — and silently repointed a working responder at
+    // a brand-new, empty `~/AgentBridge/compartido`, with no error anywhere. Every remedy this
+    // command prints now says "vuelve a correr setup", so that trap was about to become the
+    // standard route rather than an edge case.
+    const saved = await readResponderConfig(profileHome).catch(() => null)
+    const defaultShare = saved?.shareDir ?? join(homedir(), 'AgentBridge', 'compartido')
 
-    const assessment = await assessShareDir(shareDir, { identityHome: ctx.home, profileHome })
-    if (assessment.problem) {
-      throw new CliError(`No puedo usar esa carpeta: ${assessment.problem}. Elige otra ruta y vuelve a correr "${CLI_COMMAND} setup".`)
-    }
-    if (assessment.isHome) {
-      throw new CliError(
-        `Esa es tu carpeta de usuario, y compartirla dejaría visible todo lo que tienes en la computadora. Vuelve a correr "${CLI_COMMAND} setup" con otra carpeta.`,
-      )
-    }
-    if (assessment.credentialConflict) {
-      // What is actually at stake differs by branch (Q1: the dedicated profile holds no key or
-      // database) — naming the wrong one would either overclaim (a leaked settings.json is not
-      // "tu identidad entera") or underclaim (a leaked identity.json is worse than a permission
-      // file), so each says only what is true of it.
-      const stake =
-        assessment.credentialConflictKind === 'identity'
-          ? 'Tu llave secreta es tu identidad entera: quien la lea puede hacerse pasar por ti en cualquier tablero, para siempre, y no hay forma de revocarla.'
-          : 'Ahí viven settings.json y start.sh, que controlan qué puede hacer la sesión que contesta preguntas: quien los lea o los reescriba podría aflojar sus permisos o cambiar qué corre.'
-      throw new CliError(`Ahí dentro está ${assessment.credentialConflict}. ${stake} Vuelve a correr "${CLI_COMMAND} setup" con otra carpeta.`)
-    }
+    const { shareDir, assessment } = await chooseShareDir({
+      prompt,
+      out,
+      defaultShare,
+      assess: (dir) => assessShareDir(dir, { identityHome: ctx.home, profileHome }),
+    })
+
     if (assessment.reasons.length > 0) {
       out.log('Ojo: esa carpeta se ve peligrosa para compartir —')
       for (const reason of assessment.reasons) out.log(`  - ${reason}`)
+      // Says what actually happens. It used to promise "Cualquier otra respuesta cancela." and
+      // then ask twice more — verified: typing "no" got "No entendí «no»…" twice before it
+      // finally cancelled. The person most likely to type "no" here is the person this gate
+      // exists for, and telling them the run is over when it is not is the same defect this
+      // whole branch is about (whole-branch review, Minor 1).
       out.log(
-        `Si de verdad quieres usarla de todos modos, escribe exactamente ${CONFIRM_WORD} (mayúsculas o minúsculas da igual). Cualquier otra respuesta cancela.`,
+        `Si de verdad quieres usarla de todos modos, escribe exactamente ${CONFIRM_WORD} (mayúsculas o minúsculas da igual). Si escribes otra cosa te lo vuelvo a preguntar, y si aun así no escribes ${CONFIRM_WORD}, no toco nada.`,
       )
       await askWithRetries(
         prompt,
@@ -586,7 +781,9 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     }
     out.log('')
 
-    out.log('Verificando con doctor…')
+    // Said in words, not as a list of check names: this runs for a few seconds (it really does
+    // publish to and read back from every board), and silence here reads as a hang.
+    out.log('Reviso que todo esté listo…')
     const checks = await runDoctor({
       identityHome: ctx.home,
       profileHome,
@@ -596,35 +793,67 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
       createSocket: ctx.createSocket,
       relayPolicy: ctx.relayPolicy,
     })
-    for (const c of checks) out.log(`${c.ok ? '[ok]    ' : '[falta] '}${c.name}: ${c.detail}`)
-    out.log('')
 
-    // Whoever is going to ask needs this string, and nothing else: there is no invitation to create
-    // and no relay to register with.
-    out.log('Este es tu enlace. Dáselo a quien quieras que pueda preguntarte:')
+    const alreadyLoggedIn = checks.some((c) => c.name === SESSION_CHECK_NAME && c.ok)
+    const loggedIn = await loginStep({
+      claudeConfigDir: setupResult.claudeConfigDir,
+      env: ctx.env,
+      out,
+      prompt,
+      run: ctx.run,
+      runInteractive: ctx.runInteractive,
+      alreadyLoggedIn,
+    })
+    // Only when the login step actually said something: an already-logged-in profile prints
+    // nothing at all there, and an unconditional blank line left a stray gap under "Reviso que
+    // todo esté listo…".
+    if (!alreadyLoggedIn) out.log('')
+
+    // Everything that blocks or is about the safety of the key, said once, in the words of
+    // whoever wrote the check — and nothing else. `doctor` still prints all of it, and the last
+    // line of this command says where to find it.
+    // The session check is dropped from this list for two reasons at once: `loginStep` has just
+    // spoken about it in far better words, and the check itself was taken BEFORE the login ran,
+    // so by now it is stale — reading it here would report "no has iniciado sesión" to someone
+    // who just did, and (worse, below) would refuse to start a responder that works perfectly.
+    const toSay = mustMention(checks).filter((c) => c.name !== SESSION_CHECK_NAME)
+    // Deliberately `blockers`, not `toSay.filter(...)`: the two lists answer two different
+    // questions, and only this one may decide whether there is any point offering to start the
+    // responder. A key inside OneDrive must be said out loud AND must not stop anything.
+    const stillBlocking = blockers(checks).filter((c) => c.name !== SESSION_CHECK_NAME)
+    // Two different sentences, because these are two different things: one stops them from
+    // answering at all, the other is a machine that works fine and a key that is not safe.
+    for (const c of toSay) out.log(`${c.blocking ? 'Falta algo' : 'Ojo'}: ${c.detail}`)
+    if (toSay.length > 0) out.log('')
+
+    const copied = await (ctx.copyLink ?? copyToClipboard)(myLink)
+    out.log(copied ? 'Tu enlace — ya lo copié al portapapeles:' : 'Tu enlace:')
     out.log(`  ${myLink}`)
-    out.log(`Cuando te manden una solicitud, la ves con: ${CLI_COMMAND} requests`)
+    out.log('Dáselo a quien quieras que pueda preguntarte. Cuando te manden una solicitud, la ves con:')
+    out.log(`  ${CLI_COMMAND} requests`)
     out.log('')
 
-    const alreadyLoggedIn = checks.some((c) => c.name === 'Sesión iniciada en el perfil dedicado' && c.ok)
-    const remainingSteps = [
-      ...(alreadyLoggedIn ? [] : [`Inicia sesión una vez en el perfil dedicado:  CLAUDE_CONFIG_DIR=${quote(setupResult.claudeConfigDir)} claude   (usa /login y sal)`]),
-      `Arráncalo:  ${quote(setupResult.startScriptPath)}`,
-      'Dale tu enlace a quien vaya a preguntarte.',
-    ]
-    out.log('Para terminar de dejarlo contestando, en este orden:')
-    remainingSteps.forEach((step, i) => out.log(`  ${i + 1}. ${step}`))
-    out.log('')
-
-    done.push('Perfil dedicado del respondedor preparado.')
-    for (const c of checks) {
-      if (!c.ok) pending.push(`${c.name}: ${c.detail}`)
-    }
-    // Quoted like every other printed path in this command (Minor 1): a profile at
-    // `/tmp/mi respondedor`, or a home with an apostrophe in it, must still be a line that runs
-    // when pasted, not just when the default path happens to have neither.
-    pending.push(`Arranca el respondedor: ${quote(setupResult.startScriptPath)}`)
-    pending.push('Dale tu enlace a quien vaya a preguntarte.')
+    // NOT started here. Starting the responder occupies the terminal until Ctrl+C, and this is
+    // section 3 of five: someone who answered "3" (both sides) still has the asking side ahead of
+    // them — the link they paste, `connect`, the MCP registration. Starting here would silently
+    // skip all of it and they would never know what they did not get. The offer happens after the
+    // verdict, as the very last thing this command does.
+    canStartResponder = loggedIn && stillBlocking.length === 0
+    responderProfileHome = profileHome
+    // A non-default --profile has to be named, or the printed command would start the wrong
+    // (default, empty) profile. Printed PLAIN, never quoted: POSIX single quotes are not quotes
+    // to cmd.exe, so wrapping a Windows path in them breaks a whole platform to serve the rarer
+    // case of a profile path with a space in it (review round 1, Important 4).
+    if (profileHome !== join(homedir(), '.agentbridge-responder')) responderStartLine = `${CLI_COMMAND} responder --profile ${profileHome}`
+    // Never "listo para contestar" while something still blocks answering: that is the sentence
+    // the person reads to decide whether they are done.
+    done.push(canStartResponder ? 'Listo para contestar desde esta computadora.' : 'Dejé preparados la carpeta compartida y el perfil dedicado.')
+    // The summary is the part people scroll back to, so it has to carry its own subject. It used
+    // to say only "Cuando esté resuelto, empieza a contestar con: …" — a sentence whose "esto"
+    // had been named eight lines earlier and was gone from the screen by then.
+    if (!loggedIn) pending.push(`Iniciar sesión en Claude. Cuando quieras intentarlo otra vez: ${CLI_COMMAND} setup`)
+    for (const c of toSay) pending.push(c.detail)
+    if (!canStartResponder) pending.push(`Después, para empezar a contestar: ${responderStartLine}`)
   }
 
   // 4. Asking side
@@ -652,12 +881,27 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
       // connect mines 22 bits of proof of work and says so before it starts (P5c). It also runs its
       // own short-lived cycle, which is why the store above was closed first.
       const connectWith = ctx.connectWith ?? ((value: string, inner: CliContext) => connect([value], inner))
-      await connectWith(link, ctx)
-      // Deliberately not "I sent your request": `connect` also returns normally when the contact was
-      // already approved and when every board refused the publication, and claiming a send that did
-      // not happen is how a person ends up waiting for an answer that was never coming. What it
-      // printed is what actually happened; this line only says where to look next.
-      pending.push(`Revisa cómo va: ${CLI_COMMAND} contacts`)
+      try {
+        await connectWith(link, ctx)
+        // Deliberately not "I sent your request": `connect` also returns normally when the contact was
+        // already approved and when every board refused the publication, and claiming a send that did
+        // not happen is how a person ends up waiting for an answer that was never coming. What it
+        // printed is what actually happened; this line only says where to look next.
+        pending.push(`Revisa cómo va: ${CLI_COMMAND} contacts`)
+      } catch (err) {
+        // Wrapped for the same reason the MCP question below is: one mistyped answer must not
+        // throw away work that already succeeded. `askWithRetries(parseNonEmpty)` only checks the
+        // string is non-empty, so a truncated or line-wrapped paste reaches `decodeLink` and
+        // throws — and on role 3 that used to discard the verdict, the whole pending list and the
+        // offer to start answering, AFTER the folder, the profile and the browser login had all
+        // worked. Only the two error types whose messages are written to be read by this person
+        // are caught (CliError here, UserFacingError from core); anything else is a real fault and
+        // must not be swallowed behind a reassuring sentence.
+        if (!(err instanceof CliError || err instanceof UserFacingError)) throw err
+        out.log(err.message)
+        out.log('No se perdió nada de lo demás: lo que ya quedó listo sigue guardado en esta computadora.')
+        pending.push(`Conéctate con quien vayas a preguntar: ${CLI_COMMAND} connect <enlace>`)
+      }
     } else {
       out.log(`Cuando lo tengas: ${CLI_COMMAND} connect <enlace>`)
       pending.push(`Conéctate con quien vayas a preguntar: ${CLI_COMMAND} connect <enlace>`)
@@ -691,10 +935,21 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     }
     let mcpRegistered = false
     if (wantsMcp) {
-      const result = await ctx.run('claude', ['mcp', 'add', 'agentbridge', '--scope', 'user', ...envArgs, '--', ...CLI_ARGV, 'mcp'], { env: ctx.env })
+      // Bounded like every other `claude` spawn this branch added (`auth status` gets the same 15 s,
+      // the clipboard 3 s): this one writes a line into a config file, so anything longer than that
+      // is a wedge, and an unbounded spawn here leaves `setup` frozen with no way to know which
+      // step stalled. `defaultRunner` hands the signal to `spawn` itself — Node's own kill-on-abort,
+      // not a promise race that leaves the real process alive — and reports 124 when it fires.
+      const result = await ctx.run('claude', ['mcp', 'add', 'agentbridge', '--scope', 'user', ...envArgs, '--', ...CLI_ARGV, 'mcp'], {
+        env: ctx.env,
+        signal: AbortSignal.timeout(15_000),
+      })
       if (result.code === 0) {
         mcpRegistered = true
         out.log('Listo: el servidor MCP quedó registrado.')
+      } else if (result.code === 124) {
+        out.log('No pude registrar el servidor MCP automáticamente: el comando claude no respondió en 15 segundos. Hazlo a mano:')
+        out.log(`  ${manual}`)
       } else {
         out.log(`No pude registrar el servidor MCP automáticamente (el comando terminó con código ${result.code}). Hazlo a mano:`)
         out.log(`  ${manual}`)
@@ -719,15 +974,62 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
 
   // 5. Verdict
   out.log('== Resumen ==')
-  out.log('Listo:')
-  for (const d of done) out.log(`  - ${d}`)
-  if (pending.length === 0) {
-    out.log('Pendiente: nada. Ya puedes usar AgentBridge.')
-  } else {
-    out.log('Pendiente:')
+  for (const d of done) out.log(`  ✓ ${d}`)
+  if (pending.length > 0) {
+    out.log('Te falta:')
     for (const p of pending) out.log(`  - ${p}`)
+  }
+  out.log('')
+  // `doctor` named exactly once, at the end, instead of its seventeen lines printed in the middle.
+  // Not "si algo no funciona": the most serious thing doctor can report — a secret key sitting in
+  // a folder that syncs to somebody else's servers — happens on a machine where everything works,
+  // and a pointer conditioned on breakage tells that person the report is not for them.
+  out.log(`Para revisar todo con detalle cuando quieras: ${CLI_COMMAND} doctor`)
+
+  // The last thing, after every branch has run and the verdict has been printed. Offered, not
+  // ordered, and only when it can actually work: asking someone to start a responder with no
+  // session would hand them a failure as the last thing they see.
+  if (canStartResponder && responderProfileHome) {
+    // Said BEFORE the question, not after it: "sí" hands this terminal to Claude until Ctrl+C,
+    // and someone who does not already know that cannot answer the question meaningfully.
+    out.log('Si dices que sí, esta terminal se queda contestando hasta que la pares con Ctrl+C.')
+    // Said before the question too, and not only at the handover: someone who says "sí" without
+    // knowing this meets Claude's own first-run wizard instead of an agent waiting for questions,
+    // and reads it as the install having gone wrong. The login is already done by the time this
+    // offer exists (canStartResponder requires it), so the only one left is the theme picker —
+    // naming the one they will actually see rather than both.
+    out.log('La primera vez, Claude te pregunta primero su tema de colores; lo contestas y ya se queda esperando preguntas.')
+    // The only question in this whole flow whose closed input is swallowed rather than reported.
+    // Everywhere else a PromptEOF means answers are still missing and the run is incomplete; here
+    // everything already succeeded and the only thing left is an offer, so ending on
+    // "se cerró la entrada" would turn a finished setup into an error message.
+    const startNow = await askWithRetries(
+      prompt,
+      out,
+      '¿Empiezo a contestar ahora? [s/n]: ',
+      parseYesNo,
+      'Escribe s (sí) o n (no).',
+      `No entendí tu respuesta. Cuando quieras empezar: ${responderStartLine}`,
+    ).catch(() => false)
+    if (!startNow) {
+      out.log(`Cuando quieras empezar a contestar: ${responderStartLine}`)
+      return
+    }
     out.log('')
-    out.log(`Siguiente paso: ${pending[0]}`)
+    out.log(summaryBeforeStart(responderStartLine, pending.length > 0))
+    // Occupies the terminal until Ctrl+C. Nothing may follow it.
+    // Both of its failure shapes are reported the same way, on purpose: everything this command
+    // was asked to do already worked, and ending a finished setup with "Error:" would read as if
+    // the setup itself had failed. `runResponder` throws only when `claude` cannot be spawned at
+    // all — its message is already a finished Spanish sentence — and returns a non-zero code when
+    // it ran and failed. Ctrl+C, which is how a person stops this, already comes back as 0.
+    try {
+      const code = await runResponder({ profileHome: responderProfileHome, env: ctx.env, out, runInteractive: ctx.runInteractive })
+      if (code !== 0) out.log(`Claude Code terminó con código ${code}. Si te vuelve a pasar: ${CLI_COMMAND} doctor`)
+    } catch (err) {
+      if (!(err instanceof CliError)) throw err
+      out.log(err.message)
+    }
   }
 }
 
@@ -770,5 +1072,12 @@ export async function setupCommand(argv: string[], ctx: CliContext): Promise<voi
   if (!ctx.prompt) {
     throw new CliError(NON_INTERACTIVE_ES)
   }
-  await runSetup({ ...ctx, prompt: ctx.prompt, run: defaultRunner, repoDir: values.repo, profileHome: values.profile })
+  await runSetup({
+    ...ctx,
+    prompt: ctx.prompt,
+    run: defaultRunner,
+    runInteractive: defaultInteractiveRunner,
+    repoDir: values.repo,
+    profileHome: values.profile,
+  })
 }

@@ -9,7 +9,8 @@
     "test:live": "vitest run --config vitest.live.config.ts",
     "typecheck": "tsc -p tsconfig.json",
     "build": "node scripts/build.mjs",
-    "pack": "node scripts/pack.mjs"
+    "pack": "node scripts/pack.mjs",
+    "release": "node scripts/release.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.20.2",

@@ -13,9 +13,9 @@ import {
   responderSettings,
   setupResponder,
   setupResponderCommand,
-  startScript,
   type CommandRunner,
 } from '../src/commands/setup-responder'
+import { readResponderConfig, RESPONDER_CONFIG_FILE } from '../src/commands/responder'
 import { CliError, memoryOutput } from '../src/context'
 
 let root: string
@@ -149,18 +149,19 @@ describe('defaultRunner', () => {
 })
 
 describe('setupResponder', () => {
-  it('prints next steps as login, start and doctor, never an enroll instruction', async () => {
+  it('prints next steps as login, respond and doctor, never an enroll instruction', async () => {
     const out = memoryOutput()
     await setupResponder({ shareDir, repoDir, profileHome: home, identityHome, run: runner, out })
     const text = out.lines.join('\n')
-    expect(text).toContain(`CLAUDE_CONFIG_DIR='${join(home, 'claude')}' claude`)
-    expect(text).toContain(`'${join(home, 'start.sh')}'`)
-    expect(text).toContain(`${CLI_COMMAND} doctor --home '${identityHome}' --profile '${home}'`)
+    // No shell syntax and no path: every step names a real command instead (D2 in the plan).
+    expect(text).toContain(`${CLI_COMMAND} setup`)
+    expect(text).toContain(`${CLI_COMMAND} responder`)
+    expect(text).toContain(`${CLI_COMMAND} doctor`)
     expect(text).not.toContain('enroll')
     expect(text).not.toMatch(/(^|\s)agentbridge (enroll|doctor)\b/m)
   })
 
-  it('writes locked-down settings, the persona and an executable start script', async () => {
+  it('writes locked-down settings, the persona and the responder config', async () => {
     const result = await setupResponder({ shareDir, repoDir, profileHome: home, identityHome, run: runner, out: memoryOutput() })
 
     const settings = JSON.parse(await readFile(result.settingsPath, 'utf8'))
@@ -177,15 +178,10 @@ describe('setupResponder', () => {
     expect(persona).toContain('reply')
     expect(persona).toContain('.env')
 
-    const script = await readFile(result.startScriptPath, 'utf8')
-    expect((await stat(result.startScriptPath)).mode & 0o111).not.toBe(0)
-    expect(script).toContain(`cd '${shareDir}'`)
-    expect(script).toContain(`export AGENTBRIDGE_HOME='${identityHome}'`)
-    expect(script).toContain(`export CLAUDE_CONFIG_DIR='${join(home, 'claude')}'`)
-    expect(script).toContain('--dangerously-load-development-channels plugin:agentbridge@agentbridge-local')
-    expect(script).toContain('--permission-mode dontAsk')
-    expect(script).toContain(`--settings '${result.settingsPath}'`)
-    expect(script).toContain("--model 'sonnet' --effort 'low'")
+    expect(result.configPath).toBe(join(home, RESPONDER_CONFIG_FILE))
+    const config = JSON.parse(await readFile(result.configPath, 'utf8'))
+    expect(config).toEqual({ version: 1, shareDir, identityHome, model: 'sonnet', effort: 'low' })
+    expect((await stat(result.configPath)).mode & 0o777).toBe(0o600)
 
     // The shared folder must not be left world-readable by the default umask on a
     // multi-user machine.
@@ -199,6 +195,29 @@ describe('setupResponder', () => {
       ['claude', 'plugin', 'install', 'agentbridge@agentbridge-local', '--scope', 'user'],
     ])
     for (const c of calls) expect(c.env.CLAUDE_CONFIG_DIR).toBe(join(home, 'claude'))
+  })
+
+  it('bounds both plugin steps, and says a timeout in words instead of an exit code', async () => {
+    // These two were the last `claude` calls in the guided flow with no deadline, and they run
+    // mid-setup with nothing on screen: one that never returned left the assistant hanging
+    // forever, with no message and nothing to press. 124 is what `defaultRunner` reports when a
+    // bound fires; "(código 124)" would say nothing to anybody, the same reason the `mcp add`
+    // step refuses to print a bare exit code.
+    const signals: (AbortSignal | undefined)[] = []
+    await expect(
+      setupResponder({
+        shareDir,
+        repoDir,
+        profileHome: home,
+        identityHome,
+        out: memoryOutput(),
+        run: async (_command, _args, opts) => {
+          signals.push(opts.signal)
+          return { code: 124, stdout: '', stderr: '' }
+        },
+      }),
+    ).rejects.toThrow(/no respondió en 90 segundos/)
+    expect(signals[0]).toBeInstanceOf(AbortSignal)
   })
 
   it('keeps an existing CLAUDE.md in the shared folder', async () => {
@@ -246,10 +265,11 @@ describe('setupResponder', () => {
     ).rejects.toThrow('npm run build')
   })
 
-  it('rejects a --model value containing a shell metacharacter', async () => {
+  it('rejects a --model value containing a shell metacharacter, before writing anything', async () => {
     await expect(
       setupResponder({ shareDir, repoDir, profileHome: home, identityHome, model: 'sonnet; curl http://evil', run: runner, out: memoryOutput() }),
     ).rejects.toThrow(/modelo/i)
+    await expect(access(home)).rejects.toThrow()
   })
 
   it('accepts a full model id (not just the short aliases)', async () => {
@@ -266,10 +286,11 @@ describe('setupResponder', () => {
     ).resolves.toBeDefined()
   })
 
-  it('rejects a bogus --effort value', async () => {
+  it('rejects a bogus --effort value, before writing anything', async () => {
     await expect(
       setupResponder({ shareDir, repoDir, profileHome: home, identityHome, effort: 'extreme', run: runner, out: memoryOutput() }),
     ).rejects.toThrow(/esfuerzo/i)
+    await expect(access(home)).rejects.toThrow()
   })
 
   it('rejects a --effort value containing a shell metacharacter', async () => {
@@ -328,7 +349,7 @@ describe('setupResponder', () => {
     ).resolves.toBeDefined()
   })
 
-  // The device token (config.json), settings.json and start.sh all land under --home.
+  // The device token (config.json), settings.json and responder.json all land under --home.
   // blockReadsOutsideWorkingDirectories only fences reads to the session's cwd (--share), and
   // the two Read(**/.env*) denies only cover --share too — so a --home that is --share, or
   // inside it, leaves the token readable by a crafted question. Refused before anything is
@@ -388,7 +409,7 @@ describe('setupResponder', () => {
     // home directory, while the actual directory creation below still used plain resolve() —
     // so from a cwd inside the share, a quoted `--profile '~/ab-responder'` had the guard compare
     // an outside path (the real $HOME) while the code went on to actually create
-    // settings.json/start.sh/claude/ under a literal "~" folder INSIDE the share, and doctor
+    // settings.json/responder.json/claude/ under a literal "~" folder INSIDE the share, and doctor
     // would then report the setup as fine. If the two sides ever diverge like that again, this
     // either resolves (should have refused) or leaves the literal "~" folder on disk.
     it('refuses a ~-spelled --profile from a cwd inside the share, matching how it is actually resolved on disk', async () => {
@@ -406,38 +427,22 @@ describe('setupResponder', () => {
     })
   })
 
-  it('quotes a profile path with a space so the printed commands still run', async () => {
-    const out = memoryOutput()
+  // The two "quotes a profile path" tests this replaces (a space, an apostrophe) protected
+  // start.sh's own hand-rolled shell-quoting from breaking on either character. That risk is
+  // gone by construction now: responder.json is JSON, read back by readResponderConfig and
+  // handed to `spawn` as an argv array (see responder.ts) — never interpolated into a shell
+  // line — so a space or an apostrophe in a profile path needs no quoting at all. This proves
+  // that property directly, in place of testing a quoting helper that no longer runs.
+  it('stores a profile path with a space or an apostrophe as plain data, no quoting needed', async () => {
     const spaced = join(root, 'mi respondedor')
-    await setupResponder({ shareDir, repoDir, profileHome: spaced, identityHome, run: runner, out })
-    const printed = out.lines.join('\n')
-    expect(printed).toContain(`'${join(spaced, 'start.sh')}'`)
-  })
+    const result = await setupResponder({ shareDir, repoDir, profileHome: spaced, identityHome, run: runner, out: memoryOutput() })
+    expect(result.configPath).toBe(join(spaced, RESPONDER_CONFIG_FILE))
+    await expect(readResponderConfig(spaced)).resolves.toEqual({ version: 1, shareDir, identityHome, model: 'sonnet', effort: 'low' })
 
-  it("quotes a profile path with an apostrophe so the printed commands still run", async () => {
-    const out = memoryOutput()
     const withApostrophe = join(root, "o'brien")
-    await setupResponder({ shareDir, repoDir, profileHome: withApostrophe, identityHome, run: runner, out })
-    const printed = out.lines.join('\n')
-    const escapedStartScript = join(withApostrophe, 'start.sh').replaceAll("'", `'\\''`)
-    expect(printed).toContain(`'${escapedStartScript}'`)
-  })
-})
-
-describe('start.sh points at the single identity, not at the dedicated profile', () => {
-  it("exports AGENTBRIDGE_HOME pointing at the identity home", () => {
-    const script = startScript({ shareDir: '/tmp/compartido', profileHome: '/tmp/perfil', identityHome: '/tmp/identidad', model: 'sonnet', effort: 'low' })
-    expect(script).toContain("export AGENTBRIDGE_HOME='/tmp/identidad'")
-    // The dedicated profile is Claude's, never AgentBridge's: a session pointed at it would get
-    // its own key, its own contacts and its own database, so the inbox commands (requests,
-    // approve, reject, revoke) would read a different store than the channel writes.
-    expect(script).not.toContain("export AGENTBRIDGE_HOME='/tmp/perfil'")
-  })
-
-  it("keeps Claude's own profile in the dedicated folder", () => {
-    const script = startScript({ shareDir: '/tmp/compartido', profileHome: '/tmp/perfil', identityHome: '/tmp/identidad', model: 'sonnet', effort: 'low' })
-    expect(script).toContain("export CLAUDE_CONFIG_DIR='/tmp/perfil/claude'")
-    expect(script).toContain("--settings '/tmp/perfil/settings.json'")
+    const result2 = await setupResponder({ shareDir, repoDir, profileHome: withApostrophe, identityHome, run: runner, out: memoryOutput() })
+    expect(result2.configPath).toBe(join(withApostrophe, RESPONDER_CONFIG_FILE))
+    await expect(readResponderConfig(withApostrophe)).resolves.toEqual({ version: 1, shareDir, identityHome, model: 'sonnet', effort: 'low' })
   })
 })
 
@@ -476,9 +481,9 @@ describe('setupResponder guards both folders against the shared one', () => {
   it('prepares the profile when both folders are outside the shared one', async () => {
     const out = memoryOutput()
     const result = await setupResponder({ shareDir, repoDir, profileHome: home, identityHome, run: runner, out })
-    expect(result.startScriptPath).toBe(join(home, 'start.sh'))
-    const script = await readFile(result.startScriptPath, 'utf8')
-    expect(script).toContain(`export AGENTBRIDGE_HOME='${identityHome}'`)
+    expect(result.configPath).toBe(join(home, RESPONDER_CONFIG_FILE))
+    const config = JSON.parse(await readFile(result.configPath, 'utf8'))
+    expect(config.identityHome).toBe(identityHome)
     // Nothing of AgentBridge's own state is created in the profile: no key, no database.
     await expect(access(join(home, 'identity.json'))).rejects.toThrow()
     await expect(access(join(home, 'agentbridge.db'))).rejects.toThrow()

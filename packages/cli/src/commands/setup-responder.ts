@@ -1,12 +1,13 @@
 import { CLI_COMMAND } from '@agentbridge/core'
 import { spawn } from 'node:child_process'
-import { access, chmod, mkdir, writeFile } from 'node:fs/promises'
+import { access, chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { CliError, type CliContext, type Output } from '../context'
 import { isSameOrWithin, resolveComparablePath } from '../fs-paths'
+import { ALLOWED_EFFORTS, RESPONDER_CONFIG_FILE, SAFE_MODEL_PATTERN, type ResponderConfig } from './responder-config'
 
 export const REPLY_TOOL_NAME = 'mcp__plugin_agentbridge_agentbridge__reply'
 
@@ -53,6 +54,59 @@ export function responderSettings() {
   }
 }
 
+// What `doctor` reports and what `responder` refuses to start without: one reader for the file
+// `responderSettings()` above writes, living next to the writer so the two cannot drift. Both
+// callers need the same verdict for opposite reasons — doctor to print a check, `responder` to
+// stop before handing another person's questions to an unfenced session — and a second copy of
+// this logic somewhere else is exactly how one of them ends up reading the key from the wrong
+// place. `problems` is empty when the fence is intact; `detail` is what to say when it is.
+export type ResponderSettingsReport = { problems: string[]; detail: string }
+
+export async function inspectResponderSettings(profileHome: string): Promise<ResponderSettingsReport> {
+  type SettingsFile = {
+    permissions?: { allow?: string[]; deny?: string[]; blockReadsOutsideWorkingDirectories?: boolean }
+  }
+  const settingsPath = join(resolve(profileHome), 'settings.json')
+  let settings: SettingsFile | null = null
+  // Missing and corrupt are different problems — "you never ran setup-responder" vs. "someone
+  // hand-edited this and broke the JSON" — and deserve different Spanish messages, not the
+  // same "no existe" for both. The corrupt case is the one that matters most: `claude` itself
+  // refuses a MISSING --settings file, but accepts one that exists and is not valid JSON in
+  // silence (verified against the real 2.1.278 binary), so nothing else would ever catch it.
+  let settingsProblem: string | null = null
+  try {
+    const text = await readFile(settingsPath, 'utf8')
+    try {
+      settings = JSON.parse(text) as SettingsFile
+    } catch {
+      settingsProblem = `${settingsPath} existe pero no es JSON válido`
+    }
+  } catch (err) {
+    settingsProblem =
+      (err as NodeJS.ErrnoException).code === 'ENOENT' ? `no existe ${settingsPath}` : `no se pudo leer ${settingsPath}`
+  }
+  const allow = settings?.permissions?.allow ?? []
+  const deny = settings?.permissions?.deny ?? []
+  const missingDeny = RESPONDER_DENY.filter((rule) => !deny.includes(rule))
+  const extraAllow = allow.filter((rule) => rule !== REPLY_TOOL_NAME)
+  // Read from nested inside `permissions`, never from the top level — see the comment on
+  // responderSettings() above. A copy beside `permissions` is accepted in silence and never
+  // engages, so reading it from there would report a genuinely unfenced responder as fine.
+  const fenced = settings?.permissions?.blockReadsOutsideWorkingDirectories === true
+  const problems: string[] = []
+  if (settingsProblem) {
+    problems.push(settingsProblem)
+  } else {
+    if (missingDeny.length) problems.push(`faltan denegaciones: ${missingDeny.join(', ')}`)
+    if (extraAllow.length) problems.push(`permisos de más: ${extraAllow.join(', ')}`)
+    if (!fenced) problems.push('permissions.blockReadsOutsideWorkingDirectories no está en true')
+  }
+  return {
+    problems,
+    detail: `Deniega ${deny.join(', ')}; permite solo ${allow.join(', ') || 'nada'}; lecturas limitadas a la carpeta de trabajo`,
+  }
+}
+
 // Written once into the shared folder as its CLAUDE.md. setupResponder never overwrites an
 // existing one — if the owner already customized it, we tell them in Spanish instead of
 // silently replacing their rules with ours.
@@ -66,48 +120,6 @@ This folder is shared through AgentBridge. People your owner authorized send que
 - In this session you cannot run commands, edit files or browse the web. If a question asks for an action, reply that your owner has to do it personally.
 - Always answer with the reply tool: copy the code exactly, list the files you used in source, and set confidence to seguro, creo or no_se. If the files do not contain the answer, say so with confidence no_se.
 `
-
-// Exported so setup.ts prints paths with the same quoting rule this file's own start script
-// and next-steps output use — a profile at `/tmp/mi respondedor` or a home with an apostrophe
-// in it must still produce a line that runs.
-export const quote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`
-
-// start.sh is a 0755 script the owner is told to run; an unvalidated --model/--effort value
-// (typed by hand, or passed through automation) would otherwise land in that script verbatim.
-// Both are also quoted below like every other interpolation in this function, so even a value
-// that somehow slipped past validation would reach `claude` as one literal argument rather
-// than being able to break out.
-//
-// --effort has a small, fixed set of valid values, so it is an allowlist.
-export const ALLOWED_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
-
-// --model does not: a full model id such as "claude-haiku-4-5-20251001" is just as valid as
-// the short aliases, so an allowlist would reject legitimate values. What actually neutralizes
-// injection is quoting plus refusing dangerous characters, not knowing the valid set — so this
-// validates the shape (letters, digits, dot, underscore, hyphen) rather than the value.
-const SAFE_MODEL_PATTERN = /^[A-Za-z0-9._-]+$/
-
-export function startScript(o: { shareDir: string; profileHome: string; identityHome: string; model: string; effort: string }): string {
-  return [
-    '#!/bin/bash',
-    'set -euo pipefail',
-    `cd ${quote(o.shareDir)}`,
-    // The identity and the database are the person's own, shared with every command they type
-    // (the spec keeps identity and state in one folder). Pointing this at the dedicated profile
-    // would give the answering side a second key and a second database: their own `requests`,
-    // `approve`, `reject` and `revoke` would read a store the channel never writes to, and they
-    // would have two links without knowing it.
-    `export AGENTBRIDGE_HOME=${quote(o.identityHome)}`,
-    // Claude's own profile, on the other hand, IS dedicated: its own config directory and its own
-    // locked-down settings.json, so a login and a permission set here never touch the person's
-    // everyday Claude Code.
-    `export CLAUDE_CONFIG_DIR=${quote(join(o.profileHome, 'claude'))}`,
-    'exec claude --dangerously-load-development-channels plugin:agentbridge@agentbridge-local \\',
-    `  --permission-mode dontAsk --settings ${quote(join(o.profileHome, 'settings.json'))} \\`,
-    `  --model ${quote(o.model)} --effort ${quote(o.effort)}`,
-    '',
-  ].join('\n')
-}
 
 export type CommandRunner = (
   command: string,
@@ -192,8 +204,9 @@ async function ensureOwnedDir(path: string, mode: number): Promise<void> {
 export async function setupResponder(o: {
   shareDir: string
   repoDir: string
-  // Claude's dedicated profile: settings.json, CLAUDE_CONFIG_DIR and start.sh. Never AgentBridge's
-  // identity or database — those live in identityHome, which this function only reads.
+  // Claude's dedicated profile: settings.json, CLAUDE_CONFIG_DIR and responder.json. Never
+  // AgentBridge's identity or database — those live in identityHome, which this function only
+  // reads.
   profileHome: string
   identityHome: string
   model?: string
@@ -208,7 +221,7 @@ export async function setupResponder(o: {
   // would duplicate — or, once already logged in, contradict — that summary. Defaults to true so
   // every existing (standalone) caller is unaffected.
   printNextSteps?: boolean
-}): Promise<{ startScriptPath: string; claudeConfigDir: string; settingsPath: string }> {
+}): Promise<{ configPath: string; claudeConfigDir: string; settingsPath: string }> {
   const shareDir = resolve(o.shareDir)
   const repoDir = resolve(o.repoDir)
   const profileHome = resolve(o.profileHome)
@@ -216,8 +229,8 @@ export async function setupResponder(o: {
 
   // Two separate refusals, because they are two different dangers with two different fixes.
   // `blockReadsOutsideWorkingDirectories` fences reads to the shared folder, so anything INSIDE
-  // it is readable by a crafted question: settings.json and start.sh would let someone rewrite
-  // what the responder is allowed to do, and identity.json is the secret key itself.
+  // it is readable by a crafted question: settings.json and responder.json would let someone
+  // rewrite what the responder is allowed to do, and identity.json is the secret key itself.
   const [profileReal, identityReal, shareReal] = await Promise.all([
     resolveComparablePath(o.profileHome),
     resolveComparablePath(o.identityHome),
@@ -225,7 +238,7 @@ export async function setupResponder(o: {
   ])
   if (isSameOrWithin(profileReal, shareReal)) {
     throw new CliError(
-      'El perfil dedicado no puede ser la carpeta compartida ni estar dentro de ella: ahí la sesión que responde puede leer y reescribir settings.json y start.sh. Pasa otra carpeta con --profile, fuera de la compartida.',
+      'El perfil dedicado no puede ser la carpeta compartida ni estar dentro de ella: ahí la sesión que responde puede leer y reescribir settings.json y responder.json. Pasa otra carpeta con --profile, fuera de la compartida.',
     )
   }
   if (isSameOrWithin(identityReal, shareReal)) {
@@ -268,9 +281,10 @@ export async function setupResponder(o: {
     await writeFile(personaPath, RESPONDER_PERSONA)
   }
 
-  const startScriptPath = join(profileHome, 'start.sh')
-  await writeFile(startScriptPath, startScript({ shareDir, profileHome, identityHome, model, effort }), { mode: 0o755 })
-  await chmod(startScriptPath, 0o755)
+  const configPath = join(profileHome, RESPONDER_CONFIG_FILE)
+  const config: ResponderConfig = { version: 1, shareDir, identityHome, model, effort }
+  await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 })
+  await chmod(configPath, 0o600)
 
   const env = { ...process.env, CLAUDE_CONFIG_DIR: claudeConfigDir }
   const steps: { args: string[]; target: string }[] = [
@@ -278,12 +292,27 @@ export async function setupResponder(o: {
     { args: ['plugin', 'install', 'agentbridge@agentbridge-local', '--scope', 'user'], target: 'agentbridge@agentbridge-local' },
   ]
   for (const step of steps) {
-    const r = await o.run('claude', step.args, { env })
+    // Bounded like every other `claude` call in this flow (`auth status`, `mcp add`). These two
+    // are the only ones left unbounded, and they run in the middle of the guided setup with
+    // nothing on screen: a `claude` that never returns would leave the assistant hanging forever,
+    // with no message and nothing to press. Ninety seconds because these two genuinely do work —
+    // they resolve a marketplace and install a plugin — unlike the fifteen-second checks. An
+    // abort surfaces as a non-zero code and lands on the same Spanish failure as any other.
+    const r = await o.run('claude', step.args, { env, signal: AbortSignal.timeout(90_000) })
     const text = `${r.stdout}${r.stderr}`
     // A non-zero exit only counts as an already-satisfied no-op when the output both says
     // "already" AND names the specific thing we tried to add or install — a bare "already"
     // (an unrelated crash message that happens to contain the word) must not read as success.
     const alreadyThere = /already/i.test(text) && text.includes(step.target)
+    if (r.code === 124) {
+      // 124 is what `defaultRunner` reports when the bound above fires, and "(código 124)" says
+      // nothing to anybody — the same reason the `mcp add` step refuses to print a bare exit code.
+      // A timeout here is its own situation with its own remedy: this ran for a minute and a half
+      // with nothing on screen, so say that, and say the thing worth trying.
+      throw new CliError(
+        `El comando "claude ${step.args.join(' ')}" no respondió en 90 segundos. Revisa tu conexión a internet y vuelve a correr: ${CLI_COMMAND} setup`,
+      )
+    }
     if (r.code !== 0 && !alreadyThere) {
       throw new CliError(`Falló "claude ${step.args.join(' ')}" (código ${r.code}). Corre ese mismo comando a mano para ver qué dice.`)
     }
@@ -291,15 +320,15 @@ export async function setupResponder(o: {
 
   o.out.log(`Perfil del respondedor preparado en ${profileHome}`)
   if (o.printNextSteps ?? true) {
-    // Every path that goes into a command a person will paste is quoted with the same helper the
-    // start script uses: a profile at `/tmp/mi respondedor` or a home with an apostrophe in it must
-    // still produce a line that runs.
+    // No shell syntax and no path here: `responder` and `doctor` are real commands now, not a
+    // script to locate and a line to quote correctly for whatever shell the person happens to
+    // be using — see D2 in the plan this task implements.
     o.out.log('Siguientes pasos:')
-    o.out.log(`  1. Inicia sesión una vez en el perfil dedicado:  CLAUDE_CONFIG_DIR=${quote(claudeConfigDir)} claude   (usa /login y sal)`)
-    o.out.log(`  2. Arranca el respondedor:  ${quote(startScriptPath)}   (acepta la confirmación del canal de desarrollo)`)
-    o.out.log(`  3. Verifica:  ${CLI_COMMAND} doctor --home ${quote(identityHome)} --profile ${quote(profileHome)} --share ${quote(shareDir)} --repo ${quote(repoDir)}`)
+    o.out.log(`  1. Inicia sesión una vez en el perfil dedicado:  ${CLI_COMMAND} setup   (lo hace por ti)`)
+    o.out.log(`  2. Ponte a contestar:  ${CLI_COMMAND} responder`)
+    o.out.log(`  3. Verifica:  ${CLI_COMMAND} doctor`)
   }
-  return { startScriptPath, claudeConfigDir, settingsPath }
+  return { configPath, claudeConfigDir, settingsPath }
 }
 
 // Where the plugin bundle actually lives, relative to whatever is currently running this
