@@ -156,9 +156,14 @@ describe('defaultInteractiveRunner', () => {
     // Not awaited yet on purpose: the assertion in between is the one that says WHEN, and it runs
     // while the child (300 ms) is provably still alive.
     const running = makeInteractiveRunner(tty)(process.execPath, ['-e', 'setTimeout(() => {}, 300)'], { env: process.env })
-    expect(tty.calls).toEqual([false])
-    expect(tty.isRaw).toBe(false)
-    await running
+    // Awaited in a `finally` even when the assertion above fails: an abandoned run would leave
+    // its SIGINT listener attached and quietly shift the count the test below measures.
+    try {
+      expect(tty.calls).toEqual([false])
+      expect(tty.isRaw).toBe(false)
+    } finally {
+      await running
+    }
     expect(tty.calls).toEqual([false, true])
     expect(tty.isRaw).toBe(true)
   })
@@ -179,8 +184,11 @@ describe('defaultInteractiveRunner', () => {
   it('ignores SIGINT only while the child owns the terminal', async () => {
     const before = process.listenerCount('SIGINT')
     const running = defaultInteractiveRunner(process.execPath, ['-e', 'setTimeout(() => {}, 300)'], { env: process.env })
-    expect(process.listenerCount('SIGINT')).toBe(before + 1)
-    await running
+    try {
+      expect(process.listenerCount('SIGINT')).toBe(before + 1)
+    } finally {
+      await running
+    }
     expect(process.listenerCount('SIGINT')).toBe(before)
   })
 
