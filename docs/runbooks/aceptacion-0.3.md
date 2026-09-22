@@ -150,7 +150,7 @@ Lo que te pregunta:
   significa compartirla. Enter acepta la que propone (`~/AgentBridge/compartido`); te muestra la
   ruta ya resuelta y te pide confirmarla. Si la carpeta se ve peligrosa —tu carpeta de usuario, un
   repositorio de trabajo, archivos con pinta de credenciales, enlaces simbólicos— te dice por qué y
-  te hace escribir `CONFIRMAR`, o se niega de plano.
+  te hace escribir `CONFIRMAR`, o se niega de plano y te pide otra ruta ahí mismo.
 - **Solo si vas a preguntar:** si ya tienes el enlace de la otra persona (y, si dices que sí, te lo
   pide y se conecta ahí mismo), y si quieres que registre el servidor MCP por ti.
 - **Al final, solo si quedaste listo para contestar:** `¿Empiezo a contestar ahora? [s/n]`.
@@ -167,7 +167,9 @@ Lo que hace solo, sin que tú pegues ni ejecutes nada:
   sincroniza). Lo demás —un tablero caído de cinco— se lo calla y queda para `doctor`;
 - te copia tu enlace al portapapeles (si vas a contestar);
 - registra el servidor MCP si dijiste que sí;
-- y, si nada quedó bloqueado, se pone a contestar en esa misma terminal cuando le dices que sí.
+- y, si nada quedó bloqueado, se pone a contestar en esa misma terminal cuando le dices que sí
+  (la primera vez, Claude hace antes un par de preguntas suyas: el tema de colores y, si hace
+  falta, el inicio de sesión).
 
 **Verifica, en cada máquina,** que cada quien tiene exactamente **una** llave y **un** enlace:
 
