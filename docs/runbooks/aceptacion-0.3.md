@@ -16,6 +16,19 @@ armado de forma global, y eso sí deja el comando en el PATH de estas dos máqui
 solo usa AgentBridge no instala nada: la forma normal, la que aparece en el README y en la guía en
 español, es `npx -y @joseamica/agentbridge@latest <comando>`.
 
+**Dónde sí hay shell, y dónde no.** Este documento da por hecho que **la máquina desde la que
+publicas** —la que tiene el repositorio clonado— corre una shell tipo POSIX (macOS o Linux): ahí
+se arma el paquete, ahí se corre el script de S6, y ahí se publica. Esas son las únicas partes con
+sintaxis de shell, y se reconocen a simple vista: son los únicos bloques marcados ```` ```bash ````.
+Hay cuatro, todos en la sección 1, en S6 y en la sección 8.
+
+En la **otra** máquina, todo lo que se hace son comandos de AgentBridge, de Claude Code, de npm y
+de Node, sin una sola línea de shell: ni variables por delante de un comando, ni sustituciones,
+ni redirecciones, ni rutas a un script. Eso es a propósito, y es parte de lo que se está probando:
+si esa máquina es Windows —y conviene que lo sea— todos sus pasos tienen que poder copiarse tal
+cual en PowerShell. Si encuentras uno que no, eso es un hallazgo de la aceptación, no un detalle
+del documento.
+
 **Sobre credenciales:** no hay tokens de dispositivo ni enlaces de un solo uso que cuidar. El
 enlace de cada quien (`agentbridge:nprofile1…`) es público, no secreto — se manda por cualquier
 canal, igual que se comparte un usuario de cualquier red. Lo único que de verdad es secreto es tu
@@ -35,9 +48,11 @@ corres: en ningún paso de este documento lo vas a teclear ni lo vas a ver impre
 - **Claude Code instalado en las dos.** Nada más: el inicio de sesión del perfil dedicado lo abre
   `setup` en la sección 2, y esa es justamente una de las cosas que esta aceptación viene a probar.
   No lo hagas por adelantado a mano.
-- **Si puedes, que una de las dos máquinas sea Windows.** Es la plataforma que rompió la primera
-  instalación real y la única que no tiene cobertura automática: las correcciones de esta versión
-  se prueban inyectando la plataforma, no corriendo en Windows.
+- **Si puedes, que una de las dos máquinas sea Windows, y que sea la que contesta.** Es la
+  plataforma que rompió la primera instalación real y la única que no tiene cobertura automática:
+  las correcciones de esta versión se prueban inyectando la plataforma, no corriendo en Windows. Y
+  fue montando el lado que contesta donde se rompió, así que ahí es donde hay que volver a verlo.
+  La otra máquina, la que publica, necesita una shell tipo POSIX (ver arriba).
 - Nada de Docker, nada de servidores: no hay nada nuestro que desplegar ni que apagar.
 
 ## 1. Instalación desde el paquete armado, no desde el repositorio
@@ -68,7 +83,7 @@ fuente de verdad. Usa el nombre exacto que te imprimió `npm pack`. Copia ese ar
 máquinas — o compila `dist/pack` de nuevo en cada una con los comandos de arriba — e instálalo
 global en cada una:
 
-```bash
+```
 npm i -g ./joseamica-agentbridge-<versión>.tgz
 ```
 
@@ -77,7 +92,7 @@ npm i -g ./joseamica-agentbridge-<versión>.tgz
 Corre esto en cada máquina (o, si usas un gestor de versiones en una sola, una vez por cada
 versión de Node) y **anota el resultado de cada una por separado**:
 
-```bash
+```
 node --version
 agentbridge --help
 agentbridge doctor
@@ -95,10 +110,14 @@ que ya esté configurado.
 resolviendo a la anterior — es decir, la aceptación probaría el producto viejo sin decírtelo. Aquí
 lo registras a mano, apuntando al binario que acabas de instalar desde el tarball:
 
-```bash
-claude mcp remove agentbridge --scope user 2>/dev/null || true
-claude mcp add agentbridge --scope user -- "$(command -v agentbridge)" mcp
 ```
+claude mcp remove agentbridge --scope user
+claude mcp add agentbridge --scope user -- agentbridge mcp
+```
+
+El primero se queja si todavía no había nada registrado; ignóralo y sigue con el segundo. El
+`agentbridge` del segundo es el que acabas de instalar global desde el tarball, no `npx`, que es
+justo el punto.
 
 Hazlo en la máquina de quien pregunta (es la que necesita el servidor MCP), **después** de la
 sección 2, porque `setup` también ofrece registrarlo y este registro manual tiene que ser el que
@@ -106,7 +125,7 @@ quede. Al terminar toda la aceptación —después de la sección 8— déjalo c
 vas a seguir usando AgentBridge normalmente una vez que la versión esté publicada, regístralo otra
 vez apuntando a npm:
 
-```bash
+```
 claude mcp remove agentbridge --scope user
 claude mcp add agentbridge --scope user -- npx -y @joseamica/agentbridge@latest mcp
 ```
@@ -119,7 +138,7 @@ En 0.2 esta parte del documento montaba el entorno a mano: crear la carpeta, cor
 
 En cada máquina:
 
-```bash
+```
 agentbridge setup
 ```
 
@@ -152,7 +171,7 @@ Lo que hace solo, sin que tú pegues ni ejecutes nada:
 
 **Verifica, en cada máquina,** que cada quien tiene exactamente **una** llave y **un** enlace:
 
-```bash
+```
 agentbridge whoami
 ```
 
@@ -171,21 +190,21 @@ Si en la sección 2 ya pegaste el enlace de quien contesta, la solicitud ya sali
 comando te va a decir que ese contacto ya existe. Si no, desde la máquina de quien pregunta, con el
 enlace que le pasó quien contesta:
 
-```bash
+```
 agentbridge connect "<enlace de quien contesta>" --note "aceptación 0.3"
 ```
 
 El primer paso tarda unos segundos (mina una prueba de trabajo). Desde la máquina de quien
 contesta:
 
-```bash
+```
 agentbridge requests
 agentbridge approve <id>
 ```
 
 Y en **las dos** máquinas, para comprobar que ven el mismo estado:
 
-```bash
+```
 agentbridge contacts
 ```
 
@@ -197,7 +216,7 @@ puede preguntarte".
 Antes de esto, quien contesta debe tener su sesión encerrada corriendo — la que arrancó al final de
 la sección 2, o, si la cerró, otra vez con:
 
-```bash
+```
 agentbridge responder
 ```
 
@@ -205,10 +224,11 @@ agentbridge responder
 `agentbridge responder --profile <carpeta>`.) Ese comando ocupa la terminal hasta que lo pares con
 Ctrl+C: déjalo así y abre una terminal **nueva** para lo demás.
 
-Desde la terminal de quien pregunta, con `--wait`, y anota cuánto tardó:
+Desde la terminal de quien pregunta, con `--wait`. Mira el reloj antes de darle Enter y otra vez
+cuando devuelva la respuesta, y anota cuánto tardó:
 
-```bash
-time agentbridge ask <nombre> "pregunta real de aceptación" --wait 120
+```
+agentbridge ask <nombre> "pregunta real de aceptación" --wait 120
 ```
 
 Y la misma pregunta otra vez, ahora desde dentro de Claude Code (el servidor MCP ya quedó
@@ -228,7 +248,7 @@ pregunta simplemente cerrada mientras el proceso sigue vivo debajo.
    computadora, o apágala del todo; cualquiera de las tres sirve, porque las tres dejan de leer los
    tableros.
 3. **Mientras está apagado**, desde la máquina de quien pregunta, mándale dos o tres preguntas más:
-   ```bash
+   ```
    agentbridge ask <nombre> "pregunta de la madrugada 1" --no-wait
    agentbridge ask <nombre> "pregunta de la madrugada 2" --no-wait
    ```
@@ -236,7 +256,7 @@ pregunta simplemente cerrada mientras el proceso sigue vivo debajo.
 4. **A la mañana siguiente**, enciende (o reanuda) la máquina de quien contesta y vuelve a arrancar
    el respondedor si hacía falta.
 5. **Comprueba cada pregunta enviada a oscuras:**
-   ```bash
+   ```
    agentbridge ticket <identificador> --wait 60
    ```
    Cada una debe llegar y contestarse dentro de la ventana de admisión (24 horas desde que se creó,
@@ -258,14 +278,12 @@ pregunta simplemente cerrada mientras el proceso sigue vivo debajo.
 ## 6. Las verificaciones de seguridad de la sesión encerrada
 
 Vienen del runbook de M1 (ahí eran S1 a S8). Córrelas todas, desde el lado de quien pregunta,
-contra quien contesta — las dos tienen que estar conectadas y con permiso ya aprobado. Antes de S2
-y S3, guarda el resultado de:
+contra quien contesta — las dos tienen que estar conectadas y con permiso ya aprobado.
 
-```bash
-shasum <carpeta compartida>/CLAUDE.md
-```
-
-(para comparar después y confirmar que nadie lo modificó).
+Antes de S2 y S3, en la máquina de quien contesta, **guarda una copia del `CLAUDE.md` de la carpeta
+compartida** en otro lado, para compararla al final y confirmar que nadie lo modificó. Copiar el
+archivo funciona en cualquier sistema; si esa máquina es macOS o Linux y prefieres una huella,
+`shasum <carpeta compartida>/CLAUDE.md` sirve igual.
 
 | # | Pregúntale a quien contesta | Debe pasar |
 |---|---|---|
@@ -280,7 +298,7 @@ shasum <carpeta compartida>/CLAUDE.md
 
 **S9 — ninguna pantalla te pide copiar una línea.** Es nueva en 0.3 y no se le pregunta a nadie:
 se revisa leyendo. Vuelve sobre todo lo que imprimió el flujo de la sección 2, de principio a fin
-—en las dos máquinas, y en Windows si tienes una— y confirma que **en ninguna pantalla aparece una
+—en las dos máquinas, y con especial cuidado en la de Windows si tienes una— y confirma que **en ninguna pantalla aparece una
 línea que la persona tenga que copiar y pegar para que la instalación quede hecha**: ninguna
 variable de entorno por delante de un comando, ninguna ruta a un script, ningún `/login` ni
 `/exit` que memorizar. Los comandos que sí aparecen son para *después* (`requests`, `doctor`,
@@ -301,8 +319,10 @@ llegar siquiera a la red. Eso es justo lo que hay que probar de otra forma: que 
 todos modos **llega** a quien contesta desde una llave con la que nunca hubo trato, ni se guarda ni
 se contesta.
 
-Corre esto desde tu copia del repositorio (necesita `@agentbridge/core`, no está en el paquete
-publicado), reemplazando `<enlace de quien contesta>` por el enlace real:
+Corre esto **en la máquina desde la que publicas**, desde tu copia del repositorio (necesita
+`@agentbridge/core`, que no está en el paquete publicado), reemplazando `<enlace de quien
+contesta>` por el enlace real. Es el único bloque de shell de toda la aceptación que hay que
+ejecutar, y por eso vive aquí y no del lado que se está probando:
 
 ```bash
 cat > /tmp/s6-unrelated.mts <<'SCRIPT'
@@ -353,7 +373,7 @@ ventana real de este chequeo — el "cuando su reintento llega" del enunciado.
   respondedor y confirma que llega.
 - **`doctor` con un tablero caído.** Agrega a tu lista uno que no existe y vuelve a correr
   `doctor`:
-  ```bash
+  ```
   agentbridge setup --relays "wss://relay.primal.net,wss://tablero-que-no-existe.invalid"
   agentbridge doctor
   ```
@@ -364,7 +384,7 @@ ventana real de este chequeo — el "cuando su reintento llega" del enunciado.
   `agentbridge setup --relays "<tus tableros de siempre, separados por coma>"`.
 - **La llave en una carpeta que se sincroniza.** Sin mover nada, apunta `doctor` a una carpeta
   dentro de OneDrive, Dropbox, Google Drive o iCloud:
-  ```bash
+  ```
   agentbridge doctor --home "<una carpeta dentro de tu carpeta sincronizada>"
   ```
   Debe aparecer una línea propia, "Carpeta sincronizada con la nube", que avisa sin bloquear lo
