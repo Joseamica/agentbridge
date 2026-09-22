@@ -168,11 +168,17 @@ npx -y @joseamica/agentbridge@latest setup
 It creates your key and profile if they don't exist yet, asks whether you're going to answer
 questions, ask questions, or both, and — before it ever asks you to name a folder to share —
 explains in plain language what putting one there means: everything inside becomes readable by
-anyone you let ask you, including a stray `.env` or key file. It refuses your own home directory
-outright, and makes you type an explicit confirmation before using a folder that looks like a
-working repo, already has credential-shaped files in it, contains symlinks it did not follow or a
-`node_modules` it did not read, or is too large or too deeply nested to have been fully scanned. It
-never creates that folder silently.
+anyone you let ask you, including a stray `.env` or key file.
+
+Three folders it refuses outright, with no confirmation available: your own home directory; any
+folder containing your AgentBridge identity or the dedicated responder profile; and a path that
+is not a directory at all (a file, a broken symlink, or something it could not inspect). Seven
+more it will use only after you type `CONFIRMAR`, and it names which one fired: a `.git`
+repository inside, credential-shaped filenames, symlinks it did not follow, a `node_modules` it
+did not read, project configuration already sitting there (`.claude/settings*.json`, `.mcp.json`,
+`AGENTS.md`, `CLAUDE.local.md`, `.claude/agents|skills|commands`), a tree too deeply nested to
+walk fully, and a tree too large to walk fully — the last two because it cannot then promise none
+of the others is hiding further in. It never creates that folder silently.
 
 Then it *performs* the rest instead of printing it. It opens Claude's login in the dedicated
 profile — the browser opens, you type your password, you come back — and afterwards checks for

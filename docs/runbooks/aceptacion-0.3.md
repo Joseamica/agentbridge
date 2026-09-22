@@ -142,7 +142,10 @@ Lo que hace solo, sin que tú pegues ni ejecutes nada:
 - prepara la carpeta compartida y el perfil dedicado de Claude (`~/.agentbridge-responder`);
 - **abre el inicio de sesión de Claude** en ese perfil dedicado —se abre tu navegador— y, cuando
   vuelves, comprueba por su cuenta si de verdad quedó iniciada;
-- corre las comprobaciones de `doctor` y te dice **solo** lo que te impide contestar;
+- corre las comprobaciones de `doctor` y habla **solo** de lo que necesitas atender: lo que te
+  impide contestar (`Falta algo:`) y cualquier cosa que afecte la seguridad de tu llave o de tu
+  carpeta compartida aunque no bloquee (`Ojo:`, por ejemplo la llave dentro de una carpeta que se
+  sincroniza). Lo demás —un tablero caído de cinco— se lo calla y queda para `doctor`;
 - te copia tu enlace al portapapeles (si vas a contestar);
 - registra el servidor MCP si dijiste que sí;
 - y, si nada quedó bloqueado, se pone a contestar en esa misma terminal cuando le dices que sí.

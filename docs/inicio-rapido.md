@@ -76,11 +76,21 @@ Eso es todo lo que hay que escribir para dejarlo instalado. Lo demás son pregun
   tenga tu permiso puede leer todo lo que esté ahí dentro**, así que pon copias de lo que quieras
   compartir, nunca tu carpeta de trabajo. Te propone una carpeta nueva (`AgentBridge/compartido`,
   dentro de tu carpeta de usuario): con Enter la aceptas, y antes de crear nada te muestra la ruta
-  completa y te pide confirmarla. Si eliges una que se ve peligrosa te dice exactamente por qué y
-  te hace escribir `CONFIRMAR` para seguir, o de plano se niega. Lo que cuenta como peligrosa: tu
-  carpeta de usuario, un repositorio con `.git`, archivos con pinta de credenciales, enlaces
-  simbólicos (no mira qué hay del otro lado), un `node_modules` que no revisó por dentro, y una
-  carpeta tan grande o tan anidada que no alcanzó a revisarla completa.
+  completa y te pide confirmarla.
+
+  **Hay carpetas que no te va a dejar usar**, digas lo que digas: tu carpeta de usuario; cualquiera
+  que tenga dentro tu identidad de AgentBridge (tu llave) o el perfil dedicado del respondedor; y
+  una ruta que no sea una carpeta — un archivo, un enlace roto, o algo que no pudo ni revisar. En
+  esos casos te dice cuál es el problema y termina, para que elijas otra.
+
+  **Y hay carpetas que te deja usar solo si escribes `CONFIRMAR`.** Son siete avisos, y te dice
+  cuál o cuáles saltaron: que dentro haya un repositorio con `.git`; archivos con pinta de
+  credenciales (`.env`, `.pem`, `.key`, `id_rsa…`, `credentials…`); enlaces simbólicos, porque no
+  mira qué hay del otro lado; un `node_modules` que no revisó por dentro; configuración de proyecto
+  que el agente cargaría sola al arrancar (`.claude/settings.json`, `.mcp.json`, `AGENTS.md`,
+  `CLAUDE.local.md`, `.claude/agents`, `.claude/skills`, `.claude/commands`); y —los dos últimos—
+  una carpeta tan anidada o tan grande que no alcanzó a recorrerla completa, así que no puede
+  prometerte que no haya nada de lo anterior más adentro.
 
 Si vas a preguntar, también te pregunta si ya tienes el enlace de la otra persona (y, si lo tienes,
 te lo pide y se conecta ahí mismo) y si quieres que registre la herramienta dentro de tu Claude
@@ -95,8 +105,11 @@ Sin que tú ejecutes nada aparte. Si dijiste que vas a **contestar**:
   vuelves a la terminal. Después comprueba solo si la sesión de verdad quedó iniciada.
 - **Deja la carpeta lista**, con los permisos que impiden que esa sesión corra comandos, edite
   archivos o salga a internet.
-- **Revisa que todo esté bien** y te dice **solo** lo que necesitas atender. El reporte completo es
-  de `doctor`, no de este momento.
+- **Revisa que todo esté bien** y habla **solo** de lo que necesitas atender: lo que te impide
+  contestar (lo marca `Falta algo:`) y cualquier cosa que afecte la seguridad de tu llave o de tu
+  carpeta compartida aunque no bloquee nada (lo marca `Ojo:` — por ejemplo, que tu llave haya
+  quedado dentro de una carpeta que se sincroniza con la nube). De lo demás se queda callado: un
+  tablero caído de cinco es clima, y para eso está `doctor`.
 - **Te copia tu enlace al portapapeles**, para que se lo pases a quien quieras que pueda
   preguntarte.
 - Y al final, **si le dices que sí, te pone a contestar** ahí mismo. Esa terminal se queda
@@ -184,12 +197,13 @@ npx -y @joseamica/agentbridge@latest doctor --profile <carpeta del perfil dedica
 Con esas dos revisa además: que los permisos de la sesión que contesta sigan siendo los
 restringidos, que su configuración esté completa, que el plugin esté instalado, que la sesión de
 Claude esté iniciada, y —del lado de la carpeta compartida— que tenga su `CLAUDE.md`, que no haya
-enlaces simbólicos que salgan de ella, y que no haya llegado ahí configuración de proyecto que el
-agente cargaría sola al arrancar.
+enlaces simbólicos que salgan de ella, que no haya llegado ahí configuración de proyecto que el
+agente cargaría sola al arrancar, y que el perfil dedicado no haya quedado dentro de la carpeta
+compartida (ahí sus archivos serían legibles para cualquier pregunta).
 
 Volver a correr `setup` también sirve: nunca recrea tu llave ni cambia tu enlace, y de paso repara
 los permisos de tu carpeta de identidad si algo los había aflojado. Si eliges contestar, hace esa
-revisión completa por su cuenta y te dice solo lo que te impide contestar — eso sí, te vuelve a
+revisión completa por su cuenta y te dice solo lo que necesitas atender — eso sí, te vuelve a
 preguntar qué carpeta compartes, así que si no usas la que propone, escríbela otra vez en vez de
 aceptar con Enter.
 
@@ -197,9 +211,12 @@ Dos cosas que confunden la primera vez:
 
 - **La herramienta no aparece en Claude Code.** Falta cerrar y volver a abrir la sesión.
 - **Una solicitud o una pregunta no llegan de inmediato.** No hace falta que hagas nada especial:
-  se reintentan solas cada vez que corres un comando de AgentBridge (`ask`, `contacts`, `doctor`,
-  la herramienta dentro de Claude Code mientras esté abierta…), hasta por una semana. Si quien
-  responde tiene la computadora apagada, la pregunta simplemente espera.
+  se reintentan solas cada vez que corres un comando que habla con los tableros — `ask`, `ticket`,
+  `connect`, `contacts`, `requests`, `approve`, `reject`, `revoke` — y también mientras la
+  herramienta dentro de Claude Code esté abierta. Así hasta por una semana. Si quien responde
+  tiene la computadora apagada, la pregunta simplemente espera.
+  **`doctor` no cuenta:** diagnostica, pero no reintenta nada. Si estás esperando algo, el que lo
+  empuja es cualquiera de los de arriba.
 
 ## Quitar el permiso
 
