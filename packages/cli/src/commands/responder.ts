@@ -147,9 +147,15 @@ export async function runResponder(o: {
       'No pude ejecutar Claude Code. Puede que no esté instalado, o que sí lo esté pero no aparezca en el PATH de esta terminal: cierra y vuelve a abrir la terminal, o instala Claude Code con su propio instalador (no por npm), y vuelve a intentarlo.',
     )
   }
-  if (result.code === null) {
-    // Killed by a signal — Ctrl+C, which is exactly how a person stops this. Reporting it as a
-    // failure would teach them that stopping is an error.
+  // The two shapes a person's Ctrl+C actually takes, said the same way, because to them they are
+  // the same thing. `code === null` is the child killed by the signal itself — reachable since
+  // the handoff runs with the terminal cooked and this process ignoring SIGINT (see
+  // interactive.ts), which is the startup window before Claude Code takes the terminal. `code
+  // === 0` is the ordinary case a second later: Claude is in raw mode, handles the Ctrl+C itself
+  // and exits cleanly — and used to print nothing at all, so the person pressed the key the docs
+  // tell them to press and got silence. Reporting either as a failure would teach them that
+  // stopping is an error.
+  if (result.code === null || result.code === 0) {
     o.out.log('Dejaste de contestar preguntas. Las que te lleguen mientras tanto se reintentan durante siete días.')
     return 0
   }

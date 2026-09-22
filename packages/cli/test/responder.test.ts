@@ -280,4 +280,22 @@ describe('runResponder', () => {
     expect(code).toBe(0)
     expect(out.lines.join('\n')).toMatch(/dejaste de contestar|detuviste/i)
   })
+
+  // Whole-branch review, Important 3: the branch above only fires when the child dies BY A SIGNAL
+  // while this process survives. Once Claude Code has the terminal it handles Ctrl+C itself and
+  // exits cleanly, which is the shape a person actually gets a second in — and it used to print
+  // nothing at all, so pressing the key the docs tell them to press answered with silence.
+  it('says the same thing when Claude handled the Ctrl+C itself and exited cleanly', async () => {
+    const profileHome = await profileWith(workingConfig)
+    const out = memoryOutput()
+    const code = await runResponder({
+      profileHome,
+      env: {},
+      out,
+      runInteractive: async () => ({ code: 0, spawnFailed: false }),
+    })
+    expect(code).toBe(0)
+    expect(out.lines.join('\n')).toMatch(/dejaste de contestar/i)
+    expect(out.lines.join('\n')).toMatch(/siete días/)
+  })
 })

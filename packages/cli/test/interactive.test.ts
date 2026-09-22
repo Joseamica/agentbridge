@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { defaultInteractiveRunner } from '../src/interactive'
+import { defaultInteractiveRunner, makeInteractiveRunner, type TtyLike } from '../src/interactive'
 
 const testDir = dirname(fileURLToPath(import.meta.url))
 const fixtures = join(testDir, 'fixtures')
@@ -73,6 +73,54 @@ describe('handing the terminal to a child and taking it back', () => {
   }, 20_000)
 })
 
+// Whole-branch review, Important 3. Spawned `detached`, which puts the fixture in a process group
+// of its own, so `process.kill(-pid, …)` reaches it and its child the way a terminal's Ctrl+C
+// reaches a foreground group — without signalling this test runner. The SIGINT is sent only once
+// `CHILD_READY` has been printed, so the child provably exists to receive it.
+function driveGroupSigint(): Promise<string> {
+  return new Promise((resolvePromise, reject) => {
+    const proc = spawn(process.execPath, [tsxBin, join(fixtures, 'sigint-parent.ts')], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true,
+    })
+    let out = ''
+    let signalled = false
+    proc.stdout.on('data', (d) => {
+      out += String(d)
+      if (!signalled && out.includes('CHILD_READY')) {
+        signalled = true
+        try {
+          process.kill(-(proc.pid as number), 'SIGINT')
+        } catch (err) {
+          reject(err)
+        }
+      }
+    })
+    proc.stderr.on('data', (d) => (out += String(d)))
+    proc.on('error', reject)
+    proc.on('exit', () => resolvePromise(out))
+  })
+}
+
+describe('Ctrl+C while a child owns the terminal', () => {
+  // Run more than once on purpose: this is the one guard in the file whose outcome depends on
+  // process scheduling and signal delivery, and a single green pass proves nothing there.
+  for (const attempt of [1, 2, 3]) {
+    it(`stops the child and leaves the CLI alive to say so (run ${attempt})`, async () => {
+      const out = await driveGroupSigint()
+      // The child took the signal and died by it — which is the `code === null` shape
+      // `runResponder` turns into "las que te lleguen se reintentan durante siete días".
+      expect(out).toContain('CHILD_EXIT=null SPAWN_FAILED=false')
+      expect(out).not.toContain('CHILD_FINISHED_ON_ITS_OWN')
+      // And the parent survived it. Before this, the same Ctrl+C killed the whole foreground
+      // group, so the CLI died with the child and the person got silence.
+      expect(out).toContain('PARENT_ALIVE')
+      // The ignore lasts for the handoff and not one moment longer.
+      expect(out).toContain('SIGINT_LISTENERS=0')
+    }, 30_000)
+  }
+})
+
 describe('defaultInteractiveRunner', () => {
   it('returns the child exit code', async () => {
     const result = await defaultInteractiveRunner(process.execPath, ['-e', 'process.exit(7)'], { env: process.env })
@@ -83,6 +131,64 @@ describe('defaultInteractiveRunner', () => {
     const result = await defaultInteractiveRunner('agentbridge-no-existe-jamas', [], { env: process.env })
     expect(result.spawnFailed).toBe(true)
     expect(result.code).toBeNull()
+  })
+
+  // The terminal half of Important 3. `npm test` has no pseudo-terminal, so the real runner is
+  // handed a fake tty and watched: it must be COOKED while the child owns the terminal (raw means
+  // ISIG off, and a Ctrl+C that is only the byte 0x03 cannot interrupt a child that does not read
+  // stdin — verified on a real pty by the reviewer) and must go back to exactly the state it
+  // found, because `setup`'s own readline interface needs raw to keep working afterwards.
+  function fakeTty(isRaw: boolean): TtyLike & { calls: boolean[] } {
+    const calls: boolean[] = []
+    return {
+      calls,
+      isTTY: true,
+      isRaw,
+      setRawMode(mode: boolean) {
+        calls.push(mode)
+        this.isRaw = mode
+      },
+    }
+  }
+
+  it('cooks the terminal for the handoff and gives back the raw state it found', async () => {
+    const tty = fakeTty(true)
+    // Not awaited yet on purpose: the assertion in between is the one that says WHEN, and it runs
+    // while the child (300 ms) is provably still alive.
+    const running = makeInteractiveRunner(tty)(process.execPath, ['-e', 'setTimeout(() => {}, 300)'], { env: process.env })
+    expect(tty.calls).toEqual([false])
+    expect(tty.isRaw).toBe(false)
+    await running
+    expect(tty.calls).toEqual([false, true])
+    expect(tty.isRaw).toBe(true)
+  })
+
+  it('leaves a cooked terminal cooked — it restores what it found, not a fixed state', async () => {
+    const tty = fakeTty(false)
+    await makeInteractiveRunner(tty)(process.execPath, ['-e', ''], { env: process.env })
+    expect(tty.calls).toEqual([false, false])
+  })
+
+  it('never touches a stdin that is not a terminal', async () => {
+    const tty = fakeTty(false)
+    tty.isTTY = false
+    await makeInteractiveRunner(tty)(process.execPath, ['-e', ''], { env: process.env })
+    expect(tty.calls).toEqual([])
+  })
+
+  it('ignores SIGINT only while the child owns the terminal', async () => {
+    const before = process.listenerCount('SIGINT')
+    const running = defaultInteractiveRunner(process.execPath, ['-e', 'setTimeout(() => {}, 300)'], { env: process.env })
+    expect(process.listenerCount('SIGINT')).toBe(before + 1)
+    await running
+    expect(process.listenerCount('SIGINT')).toBe(before)
+  })
+
+  it('takes the SIGINT ignore back off even when the binary does not exist', async () => {
+    const before = process.listenerCount('SIGINT')
+    const result = await defaultInteractiveRunner('agentbridge-no-existe-jamas', [], { env: process.env })
+    expect(result.spawnFailed).toBe(true)
+    expect(process.listenerCount('SIGINT')).toBe(before)
   })
 
   it('runs the child in the requested folder', async () => {
