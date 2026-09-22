@@ -634,15 +634,22 @@ describe('the guided flow as a whole', () => {
   // answerable — the same reason the "esta terminal se queda contestando" line moved above it.
   it('warns about Claude\'s own first-run questions before asking whether to start', async () => {
     const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', 's'] })
+    // Measured against the QUESTION, not against the handover: `runResponder` prints a heads-up of
+    // its own right before spawning, and that one lands after the person has already answered. A
+    // test that only checked "somewhere before the handover" passed on the responder's line and
+    // stayed green with `setup`'s own warning deleted (verified by deleting it).
+    const inner = ctx.prompt
+    let linesWhenOffered = -1
+    ctx.prompt = async (question: string) => {
+      if (question.includes('¿Empiezo a contestar ahora?')) linesWhenOffered = ctx.out.lines.length
+      return inner(question)
+    }
     await runSetup(ctx)
     ctx.expectDrained()
     const warningAt = ctx.out.lines.findIndex((line) => /tema de colores/i.test(line))
     expect(warningAt).toBeGreaterThanOrEqual(0)
     expect(ctx.out.lines[warningAt]).toMatch(/primera vez/i)
-    // Before the handover, not after it — after it the only thing on screen is Claude. `at` is
-    // how many lines had been printed when the terminal was handed over.
-    const responderCall = ctx.interactiveCalls.find((c) => c.args.includes('plugin:agentbridge@agentbridge-local'))
-    expect(responderCall?.at).toBeGreaterThan(warningAt)
+    expect(linesWhenOffered).toBeGreaterThan(warningAt)
   })
 
   it('offers to start after a login that happened during this very run', async () => {
