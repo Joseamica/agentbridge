@@ -36,10 +36,11 @@ es lo que **no** hace, y por qué.
 - **El aviso de carpeta sincronizada mira solo la carpeta de la identidad, y solo su nombre
   literal.** No revisa el perfil dedicado de Claude (que es donde queda la credencial del inicio de
   sesión) y no resuelve enlaces simbólicos, así que un `~/.agentbridge` que sea un enlace hacia
-  OneDrive se le pasa. En Windows, el "Known Folder Move" de OneDrive mueve Documentos, Escritorio
-  e Imágenes, pero no la raíz del perfil de usuario, así que la ubicación predeterminada casi nunca
-  va a coincidir — este chequeo se gana el sueldo sobre todo cuando alguien elige la carpeta él
-  mismo.
+  OneDrive se le pasa. Además —y esto es razonado, no probado aquí: no hay forma de comprobarlo en
+  esta máquina— en Windows el "Known Folder Move" de OneDrive mueve Documentos, Escritorio e
+  Imágenes, pero no la raíz del perfil de usuario, así que la ubicación predeterminada casi nunca
+  va a coincidir. Si eso es correcto, este chequeo se gana el sueldo sobre todo cuando alguien
+  elige la carpeta él mismo.
 - **El comando de todos los días es largo.** No instalamos nada en el PATH, así que ponerse a
   contestar al día siguiente se escribe `npx -y @joseamica/agentbridge@latest responder`. `setup` lo
   arranca por ti la primera vez, y eso cubre el peor momento; el resto de los días sigue siendo una
