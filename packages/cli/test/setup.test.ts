@@ -1,4 +1,14 @@
-import { CLI_COMMAND, decodeLink, getProfile, loadIdentity, loadOrCreateIdentity, openStore, sanitizeRelayList, setProfile } from '@agentbridge/core'
+import {
+  CLI_COMMAND,
+  decodeLink,
+  getProfile,
+  loadIdentity,
+  loadOrCreateIdentity,
+  openStore,
+  sanitizeRelayList,
+  setProfile,
+  UserFacingError,
+} from '@agentbridge/core'
 import { access, mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -225,6 +235,39 @@ describe('the asking side', () => {
     await runSetup(context({ prompt, connectWith: async (link: string) => void links.push(link) }))
     expectDrained()
     expect(links).toEqual(['agentbridge:nprofile1ejemplo'])
+  })
+
+  // Whole-branch review, Important 2. `connect` was the one step in the flow with no error
+  // handling around it, and `askWithRetries(parseNonEmpty)` only checks the string is non-empty —
+  // so a truncated, line-wrapped or mistyped paste reached `decodeLink` and ended the whole run
+  // on the link error: no summary, no MCP step, and on role 3 no verdict and no offer to start
+  // answering, after the browser login had already succeeded.
+  it('keeps going after a link that does not decode, instead of ending the run on it', async () => {
+    await seedIdentityAndProfile()
+    const out = memoryOutput()
+    const { prompt, expectDrained } = scripted(['2', 's', 'agentbridge:nprofile1-esto-esta-mal', 'n'])
+    await runSetup(
+      context({
+        prompt,
+        out,
+        // Exactly what `decodeLink` throws on a mispasted link, reproduced by the reviewer live.
+        connectWith: async () => {
+          throw new UserFacingError('Ese enlace de AgentBridge no es válido. Pide que te lo copien completo.')
+        },
+      }),
+    )
+    expectDrained()
+    const text = out.lines.join('\n')
+    // What went wrong, said in its own words…
+    expect(text).toContain('Ese enlace de AgentBridge no es válido.')
+    // …that nothing else was lost…
+    expect(text).toMatch(/no se perdió/i)
+    // …the run reached its end…
+    expect(text).toMatch(/== Resumen ==/)
+    // …and the command that finishes this one job later is in the list of what is left.
+    expect(text.slice(text.indexOf('== Resumen =='))).toMatch(/connect <enlace>/)
+    // The step after it ran too, instead of being skipped along with everything else.
+    expect(text).toMatch(/servidor MCP/i)
   })
 
   it('says what to do later when the person does not have a link yet', async () => {
@@ -617,6 +660,26 @@ describe('the guided flow as a whole', () => {
     const responderCall = ctx.interactiveCalls.find((c) => c.args.includes('plugin:agentbridge@agentbridge-local'))
     expect(mcpLine).toBeGreaterThanOrEqual(0)
     expect(responderCall?.at).toBeGreaterThan(mcpLine)
+  })
+
+  // The role-3 half of Important 2, which is the one that would actually catch a person: the
+  // folder, the dedicated profile and the browser login have all already succeeded when the link
+  // they were sent over WhatsApp turns out to be mispasted. Losing the verdict AND the offer to
+  // start answering over that is the failure class this whole branch exists to end.
+  it('keeps the verdict and the offer to start answering when the pasted link is bad on role 3', async () => {
+    const ctx = await responderSetupContext({ answers: ['Dani', '3', shareDir, '', 's', 'enlace-mal-pegado', 'n', 's'] })
+    ctx.connectWith = async () => {
+      throw new UserFacingError('Ese enlace de AgentBridge no es válido. Pide que te lo copien completo.')
+    }
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const text = ctx.out.lines.join('\n')
+    expect(text).toContain('Ese enlace de AgentBridge no es válido.')
+    expect(text).toMatch(/== Resumen ==/)
+    expect(text).toMatch(/Listo para contestar desde esta computadora/)
+    // It still offered — and still started.
+    expect(ctx.asked.some((q) => q.includes('¿Empiezo a contestar ahora?'))).toBe(true)
+    expect(ctx.interactiveCalls.some((c) => c.args.includes('plugin:agentbridge@agentbridge-local'))).toBe(true)
   })
 
   it('never says "Ya quedó" over a summary that still says "Te falta"', async () => {

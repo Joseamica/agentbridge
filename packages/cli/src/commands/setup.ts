@@ -8,6 +8,7 @@ import {
   nowSeconds,
   openStore,
   setProfile,
+  UserFacingError,
   type Profile,
 } from '@agentbridge/core'
 import type { Dirent } from 'node:fs'
@@ -850,12 +851,27 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
       // connect mines 22 bits of proof of work and says so before it starts (P5c). It also runs its
       // own short-lived cycle, which is why the store above was closed first.
       const connectWith = ctx.connectWith ?? ((value: string, inner: CliContext) => connect([value], inner))
-      await connectWith(link, ctx)
-      // Deliberately not "I sent your request": `connect` also returns normally when the contact was
-      // already approved and when every board refused the publication, and claiming a send that did
-      // not happen is how a person ends up waiting for an answer that was never coming. What it
-      // printed is what actually happened; this line only says where to look next.
-      pending.push(`Revisa cómo va: ${CLI_COMMAND} contacts`)
+      try {
+        await connectWith(link, ctx)
+        // Deliberately not "I sent your request": `connect` also returns normally when the contact was
+        // already approved and when every board refused the publication, and claiming a send that did
+        // not happen is how a person ends up waiting for an answer that was never coming. What it
+        // printed is what actually happened; this line only says where to look next.
+        pending.push(`Revisa cómo va: ${CLI_COMMAND} contacts`)
+      } catch (err) {
+        // Wrapped for the same reason the MCP question below is: one mistyped answer must not
+        // throw away work that already succeeded. `askWithRetries(parseNonEmpty)` only checks the
+        // string is non-empty, so a truncated or line-wrapped paste reaches `decodeLink` and
+        // throws — and on role 3 that used to discard the verdict, the whole pending list and the
+        // offer to start answering, AFTER the folder, the profile and the browser login had all
+        // worked. Only the two error types whose messages are written to be read by this person
+        // are caught (CliError here, UserFacingError from core); anything else is a real fault and
+        // must not be swallowed behind a reassuring sentence.
+        if (!(err instanceof CliError || err instanceof UserFacingError)) throw err
+        out.log(err.message)
+        out.log('No se perdió nada de lo demás: lo que ya quedó listo sigue guardado en esta computadora.')
+        pending.push(`Conéctate con quien vayas a preguntar: ${CLI_COMMAND} connect <enlace>`)
+      }
     } else {
       out.log(`Cuando lo tengas: ${CLI_COMMAND} connect <enlace>`)
       pending.push(`Conéctate con quien vayas a preguntar: ${CLI_COMMAND} connect <enlace>`)
