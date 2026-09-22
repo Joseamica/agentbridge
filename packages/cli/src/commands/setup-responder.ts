@@ -304,6 +304,15 @@ export async function setupResponder(o: {
     // "already" AND names the specific thing we tried to add or install — a bare "already"
     // (an unrelated crash message that happens to contain the word) must not read as success.
     const alreadyThere = /already/i.test(text) && text.includes(step.target)
+    if (r.code === 124) {
+      // 124 is what `defaultRunner` reports when the bound above fires, and "(código 124)" says
+      // nothing to anybody — the same reason the `mcp add` step refuses to print a bare exit code.
+      // A timeout here is its own situation with its own remedy: this ran for a minute and a half
+      // with nothing on screen, so say that, and say the thing worth trying.
+      throw new CliError(
+        `El comando "claude ${step.args.join(' ')}" no respondió en 90 segundos. Revisa tu conexión a internet y vuelve a correr: ${CLI_COMMAND} setup`,
+      )
+    }
     if (r.code !== 0 && !alreadyThere) {
       throw new CliError(`Falló "claude ${step.args.join(' ')}" (código ${r.code}). Corre ese mismo comando a mano para ver qué dice.`)
     }

@@ -197,6 +197,29 @@ describe('setupResponder', () => {
     for (const c of calls) expect(c.env.CLAUDE_CONFIG_DIR).toBe(join(home, 'claude'))
   })
 
+  it('bounds both plugin steps, and says a timeout in words instead of an exit code', async () => {
+    // These two were the last `claude` calls in the guided flow with no deadline, and they run
+    // mid-setup with nothing on screen: one that never returned left the assistant hanging
+    // forever, with no message and nothing to press. 124 is what `defaultRunner` reports when a
+    // bound fires; "(código 124)" would say nothing to anybody, the same reason the `mcp add`
+    // step refuses to print a bare exit code.
+    const signals: (AbortSignal | undefined)[] = []
+    await expect(
+      setupResponder({
+        shareDir,
+        repoDir,
+        profileHome: home,
+        identityHome,
+        out: memoryOutput(),
+        run: async (_command, _args, opts) => {
+          signals.push(opts.signal)
+          return { code: 124, stdout: '', stderr: '' }
+        },
+      }),
+    ).rejects.toThrow(/no respondió en 90 segundos/)
+    expect(signals[0]).toBeInstanceOf(AbortSignal)
+  })
+
   it('keeps an existing CLAUDE.md in the shared folder', async () => {
     await mkdir(shareDir, { recursive: true })
     await writeFile(join(shareDir, 'CLAUDE.md'), 'mis reglas')
