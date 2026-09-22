@@ -270,6 +270,27 @@ describe('the asking side', () => {
     expect(text).toMatch(/servidor MCP/i)
   })
 
+  it('lets a real fault out instead of hiding it behind the reassuring sentence', async () => {
+    // The catch above is deliberately narrow — only the two error types whose messages are
+    // written to be read by this person. Widening it to swallow everything would leave the whole
+    // suite green while turning a programming fault into "el enlace no sirvió, nada más se
+    // perdió": a wrong diagnosis the person would act on, and a bug nobody would ever see.
+    await seedIdentityAndProfile()
+    const out = memoryOutput()
+    const { prompt } = scripted(['2', 's', 'agentbridge:nprofile1cualquiera', 'n'])
+    await expect(
+      runSetup(
+        context({
+          prompt,
+          out,
+          connectWith: async () => {
+            throw new TypeError('service.connect is not a function')
+          },
+        }),
+      ),
+    ).rejects.toThrow(TypeError)
+  })
+
   it('says what to do later when the person does not have a link yet', async () => {
     await seedIdentityAndProfile()
     const out = memoryOutput()
