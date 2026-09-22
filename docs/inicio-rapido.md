@@ -74,14 +74,16 @@ Eso es todo lo que hay que escribir para dejarlo instalado. Lo demás son pregun
   cosas. Se responde con `1`, `2` o `3`.
 - **Si vas a contestar, qué carpeta compartes.** Compartir una carpeta significa esto: **quien
   tenga tu permiso puede leer todo lo que esté ahí dentro**, así que pon copias de lo que quieras
-  compartir, nunca tu carpeta de trabajo. Te propone una carpeta nueva (`AgentBridge/compartido`,
-  dentro de tu carpeta de usuario): con Enter la aceptas, y antes de crear nada te muestra la ruta
-  completa y te pide confirmarla.
+  compartir, nunca tu carpeta de trabajo. La primera vez te propone una carpeta nueva
+  (`AgentBridge/compartido`, dentro de tu carpeta de usuario); si esta computadora ya compartía
+  una, te propone esa misma, así que con Enter sigues con la de siempre en vez de estrenar otra
+  vacía. Antes de crear nada te muestra la ruta completa y te pide confirmarla.
 
   **Hay carpetas que no te va a dejar usar**, digas lo que digas: tu carpeta de usuario; cualquiera
   que tenga dentro tu identidad de AgentBridge (tu llave) o el perfil dedicado del respondedor; y
   una ruta que no sea una carpeta — un archivo, un enlace roto, o algo que no pudo ni revisar. En
-  esos casos te dice cuál es el problema y termina, para que elijas otra.
+  esos casos te dice cuál es el problema y te pide otra ruta ahí mismo, sin perder lo que ya
+  llevabas; si insistes tres veces con una carpeta que no sirve, se detiene sin tocar nada.
 
   **Y hay carpetas que te deja usar solo si escribes `CONFIRMAR`.** Son siete avisos, y te dice
   cuál o cuáles saltaron: que dentro haya un repositorio con `.git`; archivos con pinta de
@@ -131,7 +133,9 @@ npx -y @joseamica/agentbridge@latest responder
 ```
 
 Ponerte a contestar. Es lo que corres mañana, y pasado, cuando quieras volver a dejar tu agente
-disponible. Ocupa la terminal hasta que lo pares con Ctrl+C.
+disponible. Ocupa la terminal hasta que lo pares con Ctrl+C. La primera vez, antes de quedar
+esperando preguntas, Claude te hace un par de preguntas suyas —el tema de colores y, si hace
+falta, el inicio de sesión—; eso es normal, no es que algo haya fallado.
 
 ```
 npx -y @joseamica/agentbridge@latest requests

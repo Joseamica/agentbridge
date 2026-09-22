@@ -19,7 +19,7 @@ describe('the publishable package', () => {
     assemble()
   })
 
-  it('declares 0.2.0, the supported Node floor and the files it ships', async () => {
+  it('declares 0.3.0, the supported Node floor and the files it ships', async () => {
     const pkg = JSON.parse(await readFile(join(packDir, 'package.json'), 'utf8')) as Record<string, unknown>
     expect(pkg.version).toBe('0.3.0')
     expect(pkg.engines).toEqual({ node: '>=22.13' })

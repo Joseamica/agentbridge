@@ -282,21 +282,49 @@ describe('the asking side', () => {
     expect(text).not.toMatch(/^\s*connect\b/m)
   })
 
-  it('registers the MCP server when asked to', async () => {
+  it('registers the MCP server when asked to, under a bound', async () => {
     await seedIdentityAndProfile()
     const calls: string[][] = []
+    let sawSignal: AbortSignal | undefined
     const { prompt, expectDrained } = scripted(['2', 'n', 's'])
     await runSetup(
       context({
         prompt,
-        run: async (command, args) => {
+        run: async (command, args, opts) => {
           calls.push([command, ...args])
+          sawSignal = opts.signal
           return { code: 0, stdout: '', stderr: '' }
         },
       }),
     )
     expectDrained()
     expect(calls.some((c) => c[0] === 'claude' && c.includes('mcp') && c.includes('add'))).toBe(true)
+    // Whole-branch review, Minor 5: this was the last unbounded `claude` spawn in the guided flow,
+    // while `auth status` next to it already had 15 s — and an unbounded one wedges `setup` with
+    // nothing on screen to say which step stalled.
+    expect(sawSignal).toBeInstanceOf(AbortSignal)
+  })
+
+  it('says so, in Spanish, when the MCP registration does not come back in time', async () => {
+    await seedIdentityAndProfile()
+    const out = memoryOutput()
+    const { prompt, expectDrained } = scripted(['2', 'n', 's'])
+    await runSetup(
+      context({
+        prompt,
+        out,
+        // What `defaultRunner` reports when the bound it was given actually fires. Nothing waits
+        // here: the runner's own kill-on-abort is proven against a real hung child in
+        // setup-responder.test.ts.
+        run: async (_command, args) => ({ code: args[0] === 'mcp' ? 124 : 0, stdout: '', stderr: '' }),
+      }),
+    )
+    expectDrained()
+    const text = out.lines.join('\n')
+    expect(text).toMatch(/no respondió en 15 segundos/)
+    // Never the bare exit code for this one: "terminó con código 124" says nothing to anybody.
+    expect(text).not.toMatch(/código 124/)
+    expect(text).toMatch(/claude mcp add agentbridge/)
   })
 })
 
@@ -317,8 +345,11 @@ describe('the answering side', () => {
 
   it('refuses a shared folder that would contain the identity', async () => {
     await seedIdentityAndProfile()
-    const { prompt } = scripted(['1', root, ''])
+    // Three folder attempts, because a hard refusal now re-asks instead of ending the interview
+    // (whole-branch review, Minor 3). Insisting on the same bad folder is what finally gives up.
+    const { prompt, expectDrained } = scripted(['1', root, '', root, '', root, ''])
     await expect(runSetup(context({ prompt }))).rejects.toThrow(/llave|identidad/i)
+    expectDrained()
   })
 
   it("tells the person to give their link to whoever will ask them", async () => {
@@ -815,6 +846,26 @@ describe('the shared-folder protection', () => {
     await expect(access(join(shareDir, 'CLAUDE.md'))).resolves.toBeUndefined()
   })
 
+  // Whole-branch review, Minor 1: the gate promised "Cualquier otra respuesta cancela." and then
+  // asked twice more — verified by the reviewer, who typed "no" and got "No entendí «no»…" twice
+  // before it finally cancelled. The person most likely to type "no" here is the person the gate
+  // exists for, and telling them the run is over when it is not is the defect this branch is about.
+  it('describes the CONFIRMAR gate the way it actually behaves', async () => {
+    await seedIdentityAndProfile()
+    await mkdir(join(shareDir, '.git'), { recursive: true })
+    const out = memoryOutput()
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'no', 'CONFIRMAR', '', 'n'])
+    await runSetup(context({ prompt, out }))
+    expectDrained()
+    const text = out.lines.join('\n')
+    expect(text).not.toMatch(/cualquier otra respuesta cancela/i)
+    expect(text).toMatch(/te lo vuelvo a preguntar/i)
+    // And the behaviour those words now describe: "no" really was asked again, and saying
+    // CONFIRMAR on the second try really did go through.
+    expect(text).toMatch(/No entendí "no"/)
+    await expect(access(join(shareDir, 'CLAUDE.md'))).resolves.toBeUndefined()
+  })
+
   it('leaves a dangerous folder untouched when the person never types CONFIRMAR', async () => {
     await seedIdentityAndProfile()
     await mkdir(join(shareDir, '.git'), { recursive: true })
@@ -851,13 +902,34 @@ describe('the shared-folder protection', () => {
 
   it('refuses the home directory outright — no CONFIRMAR can override it', async () => {
     await seedIdentityAndProfile()
-    const { prompt } = scripted(['1', homedir(), ''])
+    const { prompt, expectDrained } = scripted(['1', homedir(), '', homedir(), '', homedir(), ''])
     await expect(runSetup(context({ prompt }))).rejects.toThrow(/carpeta de usuario/i)
+    expectDrained()
+  })
+
+  // Minor 3: the loop was already there for "n" at "¿Está bien?", and the three hard verdicts
+  // threw straight past it — so one typo in a long path cost a full re-run of the interview, for
+  // the role where the interview is longest.
+  it('asks for another folder after an unusable one, instead of ending the interview', async () => {
+    await seedIdentityAndProfile()
+    const notAFolder = join(root, 'esto-es-un-archivo')
+    await writeFile(notAFolder, 'no soy una carpeta')
+    const out = memoryOutput()
+    const { prompt, expectDrained } = scripted(['1', notAFolder, '', shareDir, '', '', 'n'])
+    await runSetup(context({ prompt, out }))
+    expectDrained()
+    const text = out.lines.join('\n')
+    // It said what was wrong with the first one…
+    expect(text).toMatch(/No puedo usar esa carpeta/)
+    expect(text).toMatch(/Elige otra ruta/)
+    // …and then used the second one for real.
+    expect(text).toContain(`Voy a usar esta carpeta: ${shareDir}`)
+    await expect(access(join(shareDir, 'CLAUDE.md'))).resolves.toBeUndefined()
   })
 
   it('refuses a folder that would contain the identity, naming the key as the stake', async () => {
     await seedIdentityAndProfile()
-    const { prompt } = scripted(['1', root, ''])
+    const { prompt } = scripted(['1', root, '', root, '', root, ''])
     await expect(runSetup(context({ prompt }))).rejects.toThrow(/llave/i)
   })
 
@@ -867,7 +939,7 @@ describe('the shared-folder protection', () => {
     // holds identityHome as a sibling, so the conflict must be scoped to a fresh subtree.
     const conflictParent = join(root, 'perfil-en-conflicto')
     const conflictProfileHome = join(conflictParent, 'perfil')
-    const { prompt } = scripted(['1', conflictParent, ''])
+    const { prompt } = scripted(['1', conflictParent, '', conflictParent, '', conflictParent, ''])
     const err: unknown = await runSetup(context({ prompt, profileHome: conflictProfileHome })).catch((e) => e)
     expect(err).toBeInstanceOf(Error)
     expect((err as Error).message).toMatch(/settings\.json/)

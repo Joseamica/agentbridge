@@ -214,31 +214,71 @@ export function expandUserPath(raw: string): string {
 
 const MAX_FOLDER_ATTEMPTS = 3
 
+// The three verdicts no typed confirmation can override, as a sentence instead of a thrown
+// error. They used to end the whole interview: a typo in a long path cost a full re-run, for the
+// role whose interview is the longest, with the loop to feed it back into sitting right there
+// (whole-branch review, Minor 3). The sentence carries no "vuelve a correr setup" — inside the
+// loop that would be wrong advice, and the one place that does give up says it itself.
+function hardRefusal(assessment: ShareDirAssessment): string | null {
+  if (assessment.problem) return `No puedo usar esa carpeta: ${assessment.problem}.`
+  if (assessment.isHome) {
+    return 'Esa es tu carpeta de usuario, y compartirla dejaría visible todo lo que tienes en la computadora.'
+  }
+  if (assessment.credentialConflict) {
+    // What is actually at stake differs by branch (Q1: the dedicated profile holds no key or
+    // database) — naming the wrong one would either overclaim (a leaked settings.json is not
+    // "tu identidad entera") or underclaim (a leaked identity.json is worse than a permission
+    // file), so each says only what is true of it.
+    const stake =
+      assessment.credentialConflictKind === 'identity'
+        ? 'Tu llave secreta es tu identidad entera: quien la lea puede hacerse pasar por ti en cualquier tablero, para siempre, y no hay forma de revocarla.'
+        : 'Ahí viven settings.json y responder.json, que controlan qué puede hacer la sesión que contesta preguntas: quien los lea o los reescriba podría aflojar sus permisos o cambiar qué corre.'
+    return `Ahí dentro está ${assessment.credentialConflict}. ${stake}`
+  }
+  return null
+}
+
 // Expands `~`/`$HOME` and resolves a relative path against the current directory, then always
 // shows the fully resolved absolute path and asks for confirmation before anything is created —
 // a relative path or a surprising `~`/`$HOME` expansion is visible here, before it does
-// anything, rather than after a folder was already created somewhere unintended. Saying "no"
-// re-asks for a different folder (bounded, same 3-attempt shape as every other question here)
-// rather than ending the whole run.
-async function chooseShareDir(prompt: Prompt, out: Output, defaultShare: string): Promise<string> {
+// anything, rather than after a folder was already created somewhere unintended. Saying "no",
+// and now also naming a folder that cannot be used at all, re-asks for a different one
+// (bounded, same 3-attempt shape as every other question here) rather than ending the whole run.
+// The assessment travels back out with the folder so the caller does not have to run it twice.
+async function chooseShareDir(o: {
+  prompt: Prompt
+  out: Output
+  defaultShare: string
+  assess: (shareDir: string) => Promise<ShareDirAssessment>
+}): Promise<{ shareDir: string; assessment: ShareDirAssessment }> {
   for (let attempt = 1; attempt <= MAX_FOLDER_ATTEMPTS; attempt++) {
-    const rawShare = (await prompt(`Carpeta a compartir (Enter para usar ${defaultShare}): `)).trim()
-    const shareDir = resolve(expandUserPath(rawShare) || defaultShare)
+    const rawShare = (await o.prompt(`Carpeta a compartir (Enter para usar ${o.defaultShare}): `)).trim()
+    const shareDir = resolve(expandUserPath(rawShare) || o.defaultShare)
     // Logged explicitly (not just folded into the question text below) so it is always visible
     // — to a person at a real terminal AND to anything inspecting this command's output — even
     // though a real readline `.question()` would also echo its own question string to the
     // terminal on its own.
-    out.log(`Voy a usar esta carpeta: ${shareDir}`)
+    o.out.log(`Voy a usar esta carpeta: ${shareDir}`)
     const proceed = await askWithRetries(
-      prompt,
-      out,
+      o.prompt,
+      o.out,
       '¿Está bien? [S/n]: ',
       parseProceedOrRetry,
       'Escribe s (sí), n (no), o solo Enter para aceptar.',
       'No entendí tu respuesta.',
     )
-    if (proceed) return shareDir
-    if (attempt < MAX_FOLDER_ATTEMPTS) out.log('Bien, dime otra carpeta.')
+    if (proceed) {
+      const assessment = await o.assess(shareDir)
+      const refusal = hardRefusal(assessment)
+      if (!refusal) return { shareDir, assessment }
+      o.out.log(refusal)
+      if (attempt === MAX_FOLDER_ATTEMPTS) {
+        throw new CliError(`${refusal} No toqué nada. Vuelve a correr "${CLI_COMMAND} setup" cuando tengas otra carpeta en mente.`)
+      }
+      o.out.log('Elige otra ruta.')
+      continue
+    }
+    if (attempt < MAX_FOLDER_ATTEMPTS) o.out.log('Bien, dime otra carpeta.')
   }
   throw new CliError(`No pude confirmar una carpeta para compartir después de 3 intentos. Vuelve a correr "${CLI_COMMAND} setup".`)
 }
@@ -698,33 +738,23 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     const saved = await readResponderConfig(profileHome).catch(() => null)
     const defaultShare = saved?.shareDir ?? join(homedir(), 'AgentBridge', 'compartido')
 
-    const shareDir = await chooseShareDir(prompt, out, defaultShare)
+    const { shareDir, assessment } = await chooseShareDir({
+      prompt,
+      out,
+      defaultShare,
+      assess: (dir) => assessShareDir(dir, { identityHome: ctx.home, profileHome }),
+    })
 
-    const assessment = await assessShareDir(shareDir, { identityHome: ctx.home, profileHome })
-    if (assessment.problem) {
-      throw new CliError(`No puedo usar esa carpeta: ${assessment.problem}. Elige otra ruta y vuelve a correr "${CLI_COMMAND} setup".`)
-    }
-    if (assessment.isHome) {
-      throw new CliError(
-        `Esa es tu carpeta de usuario, y compartirla dejaría visible todo lo que tienes en la computadora. Vuelve a correr "${CLI_COMMAND} setup" con otra carpeta.`,
-      )
-    }
-    if (assessment.credentialConflict) {
-      // What is actually at stake differs by branch (Q1: the dedicated profile holds no key or
-      // database) — naming the wrong one would either overclaim (a leaked settings.json is not
-      // "tu identidad entera") or underclaim (a leaked identity.json is worse than a permission
-      // file), so each says only what is true of it.
-      const stake =
-        assessment.credentialConflictKind === 'identity'
-          ? 'Tu llave secreta es tu identidad entera: quien la lea puede hacerse pasar por ti en cualquier tablero, para siempre, y no hay forma de revocarla.'
-          : 'Ahí viven settings.json y responder.json, que controlan qué puede hacer la sesión que contesta preguntas: quien los lea o los reescriba podría aflojar sus permisos o cambiar qué corre.'
-      throw new CliError(`Ahí dentro está ${assessment.credentialConflict}. ${stake} Vuelve a correr "${CLI_COMMAND} setup" con otra carpeta.`)
-    }
     if (assessment.reasons.length > 0) {
       out.log('Ojo: esa carpeta se ve peligrosa para compartir —')
       for (const reason of assessment.reasons) out.log(`  - ${reason}`)
+      // Says what actually happens. It used to promise "Cualquier otra respuesta cancela." and
+      // then ask twice more — verified: typing "no" got "No entendí «no»…" twice before it
+      // finally cancelled. The person most likely to type "no" here is the person this gate
+      // exists for, and telling them the run is over when it is not is the same defect this
+      // whole branch is about (whole-branch review, Minor 1).
       out.log(
-        `Si de verdad quieres usarla de todos modos, escribe exactamente ${CONFIRM_WORD} (mayúsculas o minúsculas da igual). Cualquier otra respuesta cancela.`,
+        `Si de verdad quieres usarla de todos modos, escribe exactamente ${CONFIRM_WORD} (mayúsculas o minúsculas da igual). Si escribes otra cosa te lo vuelvo a preguntar, y si aun así no escribes ${CONFIRM_WORD}, no toco nada.`,
       )
       await askWithRetries(
         prompt,
@@ -905,10 +935,21 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     }
     let mcpRegistered = false
     if (wantsMcp) {
-      const result = await ctx.run('claude', ['mcp', 'add', 'agentbridge', '--scope', 'user', ...envArgs, '--', ...CLI_ARGV, 'mcp'], { env: ctx.env })
+      // Bounded like every other `claude` spawn this branch added (`auth status` gets the same 15 s,
+      // the clipboard 3 s): this one writes a line into a config file, so anything longer than that
+      // is a wedge, and an unbounded spawn here leaves `setup` frozen with no way to know which
+      // step stalled. `defaultRunner` hands the signal to `spawn` itself — Node's own kill-on-abort,
+      // not a promise race that leaves the real process alive — and reports 124 when it fires.
+      const result = await ctx.run('claude', ['mcp', 'add', 'agentbridge', '--scope', 'user', ...envArgs, '--', ...CLI_ARGV, 'mcp'], {
+        env: ctx.env,
+        signal: AbortSignal.timeout(15_000),
+      })
       if (result.code === 0) {
         mcpRegistered = true
         out.log('Listo: el servidor MCP quedó registrado.')
+      } else if (result.code === 124) {
+        out.log('No pude registrar el servidor MCP automáticamente: el comando claude no respondió en 15 segundos. Hazlo a mano:')
+        out.log(`  ${manual}`)
       } else {
         out.log(`No pude registrar el servidor MCP automáticamente (el comando terminó con código ${result.code}). Hazlo a mano:`)
         out.log(`  ${manual}`)
