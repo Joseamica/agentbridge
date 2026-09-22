@@ -556,7 +556,7 @@ export async function loginStep(o: {
   // Only now, after the retries: the re-run is safe (the folder question proposes the folder
   // already saved in responder.json, so pressing Enter cannot repoint a working responder at an
   // empty one), and everything else this command did is already on disk.
-  o.out.log(`La sesión no quedó iniciada, así que todavía no puedes contestar preguntas.`)
+  o.out.log('Lo dejamos por ahora: sin la sesión iniciada todavía no puedes contestar preguntas.')
   o.out.log(`Cuando quieras intentarlo otra vez: ${CLI_COMMAND} setup — no vas a perder nada de lo que ya quedó listo.`)
   return false
 }
@@ -932,7 +932,7 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
   if (canStartResponder && responderProfileHome) {
     // Said BEFORE the question, not after it: "sí" hands this terminal to Claude until Ctrl+C,
     // and someone who does not already know that cannot answer the question meaningfully.
-    out.log('Si digo que sí, esta terminal se queda contestando hasta que la pares con Ctrl+C.')
+    out.log('Si dices que sí, esta terminal se queda contestando hasta que la pares con Ctrl+C.')
     // The only question in this whole flow whose closed input is swallowed rather than reported.
     // Everywhere else a PromptEOF means answers are still missing and the run is incomplete; here
     // everything already succeeded and the only thing left is an offer, so ending on

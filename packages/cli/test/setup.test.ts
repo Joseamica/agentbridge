@@ -119,6 +119,9 @@ async function responderSetupContext(o: {
   // Puts the identity (and therefore the secret key) inside a folder a sync client uploads on its
   // own — a real, temp-only path that doctor's cloudSyncedPath recognises by segment name.
   keyInCloudFolder?: boolean
+  // `claude` cannot be spawned when the responder finally starts — the one failure `runResponder`
+  // reports by throwing rather than by a non-zero code.
+  responderSpawnFails?: boolean
 }): Promise<
   SetupContext & { out: ReturnType<typeof memoryOutput>; interactiveCalls: InteractiveCall[]; expectDrained: () => void; asked: string[] }
 > {
@@ -162,6 +165,8 @@ async function responderSetupContext(o: {
     },
     runInteractive: async (command, args, opts) => {
       interactiveCalls.push({ command, args, env: opts.env, cwd: opts.cwd, at: out.lines.length })
+      const isResponder = args.includes('plugin:agentbridge@agentbridge-local')
+      if (isResponder && o.responderSpawnFails) return { code: null, spawnFailed: true }
       return { code: 0, spawnFailed: false }
     },
     copyLink: o.copyLink ?? (async () => true),
@@ -454,12 +459,17 @@ describe('the login step', () => {
     // A retry loop with no bound is a dead end somebody has to Ctrl+C out of.
     const out = memoryOutput()
     let opened = 0
+    let offeredAgain = 0
     const ok = await loginStep({
       claudeConfigDir: '/perfil/claude',
       env: {},
       out,
       // Always Enter, always "sí": the loop itself has to be what stops.
-      prompt: async (question) => (question.includes('otra vez? [s/n]') ? 's' : ''),
+      prompt: async (question) => {
+        if (!question.includes('otra vez? [s/n]')) return ''
+        offeredAgain += 1
+        return 's'
+      },
       run: async () => ({ code: 0, stdout: '{"loggedIn":false}', stderr: '' }),
       runInteractive: async () => {
         opened += 1
@@ -469,6 +479,9 @@ describe('the login step', () => {
     })
     expect(ok).toBe(false)
     expect(opened).toBe(3)
+    // And the offer is never made on the last attempt: asking "¿otra vez?" and then ignoring the
+    // answer because the loop is over is its own small betrayal.
+    expect(offeredAgain).toBe(2)
   })
 
   it('explains that Claude Code is missing instead of pretending it opened', async () => {
@@ -673,6 +686,16 @@ describe('the guided flow as a whole', () => {
     expect(second.out.lines.join('\n')).toContain(`Voy a usar esta carpeta: ${shareDir}`)
     const config = JSON.parse(await readFile(join(profileHome, RESPONDER_CONFIG_FILE), 'utf8'))
     expect(config.shareDir).toBe(shareDir)
+  })
+
+  it('does not turn a finished setup into an error when Claude Code cannot be started', async () => {
+    // Review round 1, M3: `runResponder` reports one of its two failures by throwing and the other
+    // with a non-zero code. Everything this command was asked to do already worked by then, so
+    // both are said the same way — ending on "Error:" would read as if the setup itself failed.
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', 's'], responderSpawnFails: true })
+    await expect(runSetup(ctx)).resolves.toBeUndefined()
+    ctx.expectDrained()
+    expect(ctx.out.lines.join('\n')).toMatch(/No pude ejecutar Claude Code/)
   })
 
   it('still prints the link when no clipboard tool exists', async () => {
