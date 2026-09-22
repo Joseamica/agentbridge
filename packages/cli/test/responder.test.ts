@@ -187,6 +187,34 @@ describe('runResponder', () => {
     expect(code).toBe(3)
   })
 
+  // Found by running the packaged CLI in a real terminal (task 8): on a freshly created dedicated
+  // profile, the first thing printed was "Estás contestando preguntas" — and then Claude Code ran
+  // its OWN onboarding, a seven-option theme picker and, with no session, a login menu and the
+  // whole browser flow. The claim was false at the moment the person read it.
+  it('announces what is about to happen instead of claiming what has not happened yet', async () => {
+    const profileHome = await profileWith(workingConfig)
+    const out = memoryOutput()
+    let saidBeforeClaudeStarted = ''
+    await runResponder({
+      profileHome,
+      env: {},
+      out,
+      runInteractive: async () => {
+        saidBeforeClaudeStarted = out.lines.join('\n')
+        return { code: 0, spawnFailed: false }
+      },
+    })
+    // Nothing may assert that they are already answering: Claude has not even been handed the
+    // terminal yet at this point.
+    expect(saidBeforeClaudeStarted).not.toMatch(/Estás contestando preguntas/)
+    // What it says instead: what is about to happen, how to stop it…
+    expect(saidBeforeClaudeStarted).toMatch(/Ctrl\+C/)
+    // …and the heads-up that Claude asks a couple of questions of its own the first time, so a
+    // theme picker or a login menu is not a sign that something went wrong.
+    expect(saidBeforeClaudeStarted).toMatch(/primera vez/i)
+    expect(saidBeforeClaudeStarted).toMatch(/tema de colores/i)
+  })
+
   // Whole-branch review, Important 1. `claude` refuses a MISSING --settings file but accepts one
   // that exists and is not valid JSON, in silence (verified against the real 2.1.278 binary) — so
   // the one shape that leaves the answering session unfenced is the one Claude does not catch.

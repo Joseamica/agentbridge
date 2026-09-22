@@ -132,7 +132,17 @@ export async function runResponder(o: {
     // settings never touch their everyday Claude Code.
     CLAUDE_CONFIG_DIR: join(profileHome, 'claude'),
   }
-  o.out.log('Estás contestando preguntas. Déjalo abierto. Para parar: Ctrl+C.')
+  // Announced, never asserted. Found by running the packaged CLI in a real terminal: this used to
+  // say "Estás contestando preguntas" and then Claude Code ran its OWN onboarding — a seven-option
+  // theme picker and, with no session, a login menu and the whole browser flow — so the sentence
+  // was false at the moment the person read it, and in the bad case was followed by a raw English
+  // error from Claude. The warning is a heads-up, not a tutorial: the point is that a question
+  // about colours appearing instead of an agent waiting for questions is normal and not a sign
+  // that the install is broken. The marker Claude keeps for this lives in its own private
+  // `<perfil>/claude/.claude.json` and changes between versions, so this says what is about to
+  // happen rather than writing into a file we do not own.
+  o.out.log('Abro Claude para ponerte a contestar. Déjalo abierto. Para parar: Ctrl+C.')
+  o.out.log('La primera vez, Claude hace primero un par de preguntas suyas (el tema de colores y, si hace falta, el inicio de sesión).')
   const result = await o.runInteractive(
     'claude',
     responderArgs({ settingsPath: join(profileHome, 'settings.json'), model: config.model, effort: config.effort }),

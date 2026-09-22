@@ -629,6 +629,22 @@ describe('the guided flow as a whole', () => {
     expect(ctx.interactiveCalls.map((c) => c.args.join(' ')).join('\n')).toContain('plugin:agentbridge@agentbridge-local')
   })
 
+  // Task 8's end-to-end finding, the `setup` half: someone who says "sí" here is handed straight
+  // to Claude's own first-run wizard. Saying so BEFORE the question is what makes the question
+  // answerable — the same reason the "esta terminal se queda contestando" line moved above it.
+  it('warns about Claude\'s own first-run questions before asking whether to start', async () => {
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', 's'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const warningAt = ctx.out.lines.findIndex((line) => /tema de colores/i.test(line))
+    expect(warningAt).toBeGreaterThanOrEqual(0)
+    expect(ctx.out.lines[warningAt]).toMatch(/primera vez/i)
+    // Before the handover, not after it — after it the only thing on screen is Claude. `at` is
+    // how many lines had been printed when the terminal was handed over.
+    const responderCall = ctx.interactiveCalls.find((c) => c.args.includes('plugin:agentbridge@agentbridge-local'))
+    expect(responderCall?.at).toBeGreaterThan(warningAt)
+  })
+
   it('offers to start after a login that happened during this very run', async () => {
     // The first install, which is the ONLY way most people will ever see this command: doctor ran
     // before the login and recorded "no session". Deciding whether the responder can start from

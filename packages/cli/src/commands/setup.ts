@@ -952,6 +952,12 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     // Said BEFORE the question, not after it: "sí" hands this terminal to Claude until Ctrl+C,
     // and someone who does not already know that cannot answer the question meaningfully.
     out.log('Si dices que sí, esta terminal se queda contestando hasta que la pares con Ctrl+C.')
+    // Said before the question too, and not only at the handover: someone who says "sí" without
+    // knowing this meets Claude's own first-run wizard instead of an agent waiting for questions,
+    // and reads it as the install having gone wrong. The login is already done by the time this
+    // offer exists (canStartResponder requires it), so the only one left is the theme picker —
+    // naming the one they will actually see rather than both.
+    out.log('La primera vez, Claude te pregunta primero su tema de colores; lo contestas y ya se queda esperando preguntas.')
     // The only question in this whole flow whose closed input is swallowed rather than reported.
     // Everywhere else a PromptEOF means answers are still missing and the run is incomplete; here
     // everything already succeeded and the only thing left is an offer, so ending on
