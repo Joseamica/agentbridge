@@ -212,7 +212,7 @@ Dos cosas que confunden la primera vez:
 - **La herramienta no aparece en Claude Code.** Falta cerrar y volver a abrir la sesión.
 - **Una solicitud o una pregunta no llegan de inmediato.** No hace falta que hagas nada especial:
   se reintentan solas cada vez que corres un comando que habla con los tableros — `ask`, `ticket`,
-  `connect`, `contacts`, `requests`, `approve`, `reject`, `revoke` — y también mientras la
+  `connect`, `contacts`, `whoami`, `requests`, `approve`, `reject`, `revoke` — y también mientras la
   herramienta dentro de Claude Code esté abierta. Así hasta por una semana. Si quien responde
   tiene la computadora apagada, la pregunta simplemente espera.
   **`doctor` no cuenta:** diagnostica, pero no reintenta nada. Si estás esperando algo, el que lo
