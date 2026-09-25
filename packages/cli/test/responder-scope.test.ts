@@ -16,7 +16,11 @@ import {
 const home = '/Users/ana'
 const identityHome = '/Users/ana/.agentbridge'
 const profileHome = '/Users/ana/.agentbridge-responder'
-const paths = { identityHome, profileHome, home, platform: 'darwin' as const }
+// Outside the home on purpose: the `~/**` rules cannot reach it, so only the anchored shared-folder
+// rules protect its key files.
+const shareDir = '/srv/compartido'
+const paths = { shareDir, identityHome, profileHome, home, platform: 'darwin' as const }
+const SHARE_KEY_RULES = ['**/*.pem', '**/*.key', '**/*.p12', '**/*.pfx'].map((tail) => `Read(//srv/compartido/${tail})`)
 
 const FOLDER: ResponderScope = { kind: 'folder' }
 const FOLDERS: ResponderScope = { kind: 'folders', extra: ['/Users/ana/Proyectos', '/Volumes/Datos/notas'] }
@@ -65,6 +69,18 @@ describe('responderSettings, mode 2 (several folders)', () => {
     for (const rule of RESPONDER_DENY) expect(s.permissions.deny).toContain(rule)
   })
 
+  // The owner ruled that nobody opens the caja fuerte through setup. Without these rules in mode 2,
+  // choosing `~/.ssh` or `~/.claude` as an extra folder would open it, so mode 2 carries the list.
+  it('denies every caja fuerte rule too, so an extra folder such as ~/.ssh stays closed', () => {
+    for (const rule of CAJA_FUERTE_HOME) expect(s.permissions.deny).toContain(rule)
+    const ssh = responderSettings({ kind: 'folders', extra: ['/Users/ana/.ssh'] }, paths)
+    expect(ssh.permissions.deny).toContain('Read(~/.ssh/**)')
+  })
+
+  it('denies the key files in the shared folder, anchored to it', () => {
+    for (const rule of SHARE_KEY_RULES) expect(s.permissions.deny).toContain(rule)
+  })
+
   // Not verified on the real binary: how Claude Code anchors `C:\…` in a rule. Guessing a form
   // that silently matches nothing would be the V6 failure again — a rule that looks like
   // protection and covers nothing — so mode 2 is refused there instead.
@@ -73,6 +89,7 @@ describe('responderSettings, mode 2 (several folders)', () => {
   // of this test did when the mode-2 refusal was removed on purpose.
   it('is refused on Windows, offering the other two modes', () => {
     const win = {
+      shareDir: 'C:\\Users\\ana\\compartido',
       identityHome: 'C:\\Users\\ana\\.agentbridge',
       profileHome: 'C:\\Users\\ana\\.agentbridge-responder',
       home: 'C:\\Users\\ana',
@@ -103,6 +120,11 @@ describe('responderSettings, mode 3 (the whole personal folder)', () => {
     for (const rule of CAJA_FUERTE_HOME) expect(s.permissions.deny).toContain(rule)
   })
 
+  // `~/**/*.pem` does not reach a shared folder that lies outside the home.
+  it('denies the key files in the shared folder, anchored to it', () => {
+    for (const rule of SHARE_KEY_RULES) expect(s.permissions.deny).toContain(rule)
+  })
+
   it('denies the identity home and the profile as absolute paths, wherever they live', () => {
     const custom = responderSettings(HOME, { ...paths, identityHome: '/srv/ab/identidad', profileHome: '/Users/ana/otros/perfil' })
     expect(custom.permissions.deny).toContain('Read(//srv/ab/identidad/**)')
@@ -115,7 +137,8 @@ describe('responderSettings, mode 3 (the whole personal folder)', () => {
   it('covers exactly the approved caja fuerte', () => {
     expect([...CAJA_FUERTE_HOME]).toEqual([
       'Read(~/.claude/**)',
-      'Read(~/.claude.json)',
+      'Read(~/.claude.json*)',
+      'Read(~/Library/Application Support/Claude/**)',
       'Read(~/.ssh/**)',
       'Read(~/.gnupg/**)',
       'Read(~/.aws/**)',
@@ -128,14 +151,30 @@ describe('responderSettings, mode 3 (the whole personal folder)', () => {
       'Read(~/.pypirc)',
       'Read(~/.netrc)',
       'Read(~/.git-credentials)',
+      'Read(~/.cargo/credentials*)',
+      'Read(~/.terraform.d/**)',
+      'Read(~/.config/op/**)',
+      'Read(~/.zsh_history)',
+      'Read(~/.bash_history)',
+      'Read(~/.local/share/fish/**)',
+      'Read(~/.python_history)',
+      'Read(~/.node_repl_history)',
+      'Read(~/.psql_history)',
+      'Read(~/.mysql_history)',
+      'Read(~/.sqlite_history)',
       'Read(~/Library/Keychains/**)',
       'Read(~/Library/Cookies/**)',
       'Read(~/Library/Application Support/Google/Chrome/**)',
       'Read(~/Library/Application Support/Firefox/**)',
       'Read(~/Library/Safari/**)',
+      'Read(~/Library/Application Support/BraveSoftware/**)',
+      'Read(~/Library/Application Support/Microsoft Edge/**)',
+      'Read(~/Library/Application Support/Arc/**)',
       'Read(~/.mozilla/**)',
       'Read(~/.config/google-chrome/**)',
       'Read(~/.config/chromium/**)',
+      'Read(~/.config/BraveSoftware/**)',
+      'Read(~/.config/microsoft-edge/**)',
       'Read(~/.local/share/keyrings/**)',
       'Read(~/AppData/**)',
       'Read(~/**/.env)',
@@ -152,6 +191,7 @@ describe('responderSettings, mode 3 (the whole personal folder)', () => {
   // anchored with `~` there rather than with a guessed drive-letter syntax.
   it('anchors the identity home and profile with ~ on Windows', () => {
     const win = responderSettings(HOME, {
+      shareDir: 'C:\\Users\\ana\\compartido',
       identityHome: 'C:\\Users\\ana\\.agentbridge',
       profileHome: 'C:\\Users\\ana\\.agentbridge-responder',
       home: 'C:\\Users\\ana',
@@ -164,12 +204,25 @@ describe('responderSettings, mode 3 (the whole personal folder)', () => {
   it('refuses on Windows when the identity home lives outside the personal folder, instead of guessing a path form', () => {
     expect(() =>
       responderSettings(HOME, {
+        shareDir: 'C:\\Users\\ana\\compartido',
         identityHome: 'D:\\ab\\identidad',
         profileHome: 'C:\\Users\\ana\\.agentbridge-responder',
         home: 'C:\\Users\\ana',
         platform: 'win32',
       }),
     ).toThrow(/Windows/)
+  })
+
+  it('refuses on Windows when the shared folder lives outside the personal folder', () => {
+    expect(() =>
+      responderSettings(HOME, {
+        shareDir: 'D:\\compartido',
+        identityHome: 'C:\\Users\\ana\\.agentbridge',
+        profileHome: 'C:\\Users\\ana\\.agentbridge-responder',
+        home: 'C:\\Users\\ana',
+        platform: 'win32',
+      }),
+    ).toThrow(/D:\\compartido/)
   })
 })
 
@@ -189,7 +242,9 @@ describe('anchoring (the V6 finding)', () => {
       const deny = responderSettings(scope, paths).permissions.deny
       expect(deny.slice(0, RESPONDER_DENY.length)).toEqual([...RESPONDER_DENY])
       const added = deny.slice(RESPONDER_DENY.length)
-      expect(added.length).toBeGreaterThan(0)
+      // Both wider modes carry the whole fixed list and the shared folder's key files (I2, M8);
+      // they are checked here so the anchoring below is known to cover them.
+      for (const rule of [...CAJA_FUERTE_HOME, ...SHARE_KEY_RULES]) expect(added).toContain(rule)
       for (const rule of added) {
         const p = readPath(rule)
         expect(p, rule).not.toBeNull()
@@ -310,10 +365,37 @@ describe('inspectResponderSettings', () => {
     expect((await inspect(HOME)).problems.join(' ')).toMatch(/permisos de más: Bash/)
   })
 
+  // Pinned to mode 2's own sentence: with a looser /Windows/ this passed even with the mode-2
+  // refusal removed, because the outside-the-home refusal fired instead and also says Windows.
   it('reports a mode-2 profile on Windows as a problem instead of throwing', async () => {
-    await write(settingsFor(FOLDERS))
-    const report = await inspectResponderSettings(dir, FOLDERS, { ...paths, platform: 'win32' })
-    expect(report.problems.join(' ')).toMatch(/Windows/)
+    await write(settingsFor(FOLDER))
+    const scope: ResponderScope = { kind: 'folders', extra: ['C:\\Users\\ana\\Proyectos'] }
+    const report = await inspectResponderSettings(dir, scope, {
+      shareDir: 'C:\\Users\\ana\\compartido',
+      identityHome: 'C:\\Users\\ana\\.agentbridge',
+      home: 'C:\\Users\\ana',
+      platform: 'win32',
+    })
+    expect(report.problems.join(' ')).toMatch(/varias carpetas/)
+  })
+
+  // A hand edit can put any JSON value where a list belongs; that used to crash the check with an
+  // English `TypeError: deny.join is not a function`.
+  for (const key of ['allow', 'deny', 'additionalDirectories'] as const) {
+    it(`reports a permissions.${key} that is not a list, in Spanish, instead of throwing`, async () => {
+      const s = settingsFor(HOME) as unknown as { permissions: Record<string, unknown> }
+      s.permissions[key] = 'Bash'
+      await write(s)
+      const problems = (await inspect(HOME)).problems.join(' ')
+      expect(problems).toContain(`permissions.${key} no es una lista`)
+    })
+  }
+
+  it('reports a list holding something other than text', async () => {
+    const s = settingsFor(HOME) as unknown as { permissions: Record<string, unknown> }
+    s.permissions.deny = [...(s.permissions.deny as string[]), 7]
+    await write(s)
+    expect((await inspect(HOME)).problems.join(' ')).toContain('permissions.deny no es una lista')
   })
 
   it('reports a folder name with a glob character as a problem instead of throwing', async () => {

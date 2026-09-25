@@ -259,7 +259,7 @@ describe('runDoctor with a dedicated profile', () => {
     await seedIdentity()
     await mkdir(profileHome, { recursive: true })
     const { responderSettings } = await import('../src/commands/setup-responder')
-    await writeFile(join(profileHome, 'settings.json'), `${JSON.stringify(responderSettings({ kind: 'folder' }, { identityHome, profileHome, home: identityHome }), null, 2)}\n`, { mode: 0o600 })
+    await writeFile(join(profileHome, 'settings.json'), `${JSON.stringify(responderSettings({ kind: 'folder' }, { shareDir, identityHome, profileHome, home: identityHome }), null, 2)}\n`, { mode: 0o600 })
     expect(check(await runDoctor(doctorOptions({ profileHome })), 'Permisos del respondedor').ok).toBe(true)
   })
 
@@ -272,7 +272,7 @@ describe('runDoctor with a dedicated profile', () => {
     // (code 124) to the existing Spanish detail — fast, with no real waiting.
     await mkdir(profileHome, { recursive: true })
     const { responderSettings } = await import('../src/commands/setup-responder')
-    await writeFile(join(profileHome, 'settings.json'), `${JSON.stringify(responderSettings({ kind: 'folder' }, { identityHome, profileHome, home: identityHome }), null, 2)}\n`, { mode: 0o600 })
+    await writeFile(join(profileHome, 'settings.json'), `${JSON.stringify(responderSettings({ kind: 'folder' }, { shareDir, identityHome, profileHome, home: identityHome }), null, 2)}\n`, { mode: 0o600 })
     await mkdir(join(profileHome, 'claude'), { recursive: true })
     let sawSignal: AbortSignal | undefined
     const boundedRunner = async (_command: string, _args: string[], opts: { env: NodeJS.ProcessEnv; signal?: AbortSignal }) => {
@@ -353,7 +353,7 @@ describe('runDoctor login remediation text', () => {
   it('never asks a person to paste CLAUDE_CONFIG_DIR=... claude', async () => {
     await mkdir(profileHome, { recursive: true })
     const { responderSettings } = await import('../src/commands/setup-responder')
-    await writeFile(join(profileHome, 'settings.json'), `${JSON.stringify(responderSettings({ kind: 'folder' }, { identityHome, profileHome, home: identityHome }), null, 2)}\n`, { mode: 0o600 })
+    await writeFile(join(profileHome, 'settings.json'), `${JSON.stringify(responderSettings({ kind: 'folder' }, { shareDir, identityHome, profileHome, home: identityHome }), null, 2)}\n`, { mode: 0o600 })
     await mkdir(join(profileHome, 'claude'), { recursive: true })
     const notLoggedIn = async (_command: string, _args: string[], _opts: { env: NodeJS.ProcessEnv; signal?: AbortSignal }) => ({
       code: 0,

@@ -8,7 +8,8 @@ import { readResponderConfig, responderArgs, runResponder, RESPONDER_CONFIG_FILE
 import { responderSettings } from '../src/commands/setup-responder'
 
 // Mode 1 ignores the paths entirely; they are here only because the signature takes them.
-const modeOne = () => responderSettings({ kind: 'folder' }, { identityHome: '/tmp/identidad', profileHome: '/tmp/perfil', home: '/tmp/casa' })
+const modeOne = () =>
+  responderSettings({ kind: 'folder' }, { shareDir: '/tmp/compartido', identityHome: '/tmp/identidad', profileHome: '/tmp/perfil', home: '/tmp/casa' })
 
 // `settingsText` is what lands in the profile's settings.json — the file `--settings` points
 // `claude` at, and the only thing that actually fences the answering session. It defaults to
@@ -84,11 +85,30 @@ describe('responder configuration', () => {
       refuses({ kind: 'folders', extra: ['/tmp/compartido/sub'] }, /compartida/i))
     // The fence is what keeps the key and the database away from a question. An extra folder
     // that contains them puts them back inside the readable set.
-    it('refuses an extra folder that contains the identity home', () => refuses({ kind: 'folders', extra: ['/tmp'] }, /identidad/i))
-    it('refuses an extra folder that contains the dedicated profile', async () => {
-      const profileHome = await profileWith(v2({ kind: 'folders', extra: [tmpdir()] }))
-      await expect(readResponderConfig(profileHome)).rejects.toThrow(/perfil/i)
+    //
+    // Each of these two builds its own folders under a fresh mkdtemp, so the extra folder holds
+    // exactly one of the two and the assertion is about that one's clause. An earlier version used
+    // `tmpdir()` as the extra: on Linux that is `/tmp`, which also holds `/tmp/identidad`, so the
+    // identity clause fired and the profile test failed there while passing on macOS.
+    it('refuses an extra folder that contains the identity home', async () => {
+      const idRoot = await mkdtemp(join(tmpdir(), 'ab-id-'))
+      const profileHome = await profileWith({
+        ...v2({ kind: 'folders', extra: [idRoot] }),
+        identityHome: join(idRoot, 'identidad'),
+      })
+      await expect(readResponderConfig(profileHome)).rejects.toThrow(/carpeta de identidad/)
     })
+    it('refuses an extra folder that contains the dedicated profile', async () => {
+      const elsewhere = await mkdtemp(join(tmpdir(), 'ab-elsewhere-'))
+      const profileHome = await mkdtemp(join(tmpdir(), 'ab-responder-'))
+      const config = { ...goodConfig, version: 2, shareDir: join(elsewhere, 'compartido'), identityHome: join(elsewhere, 'identidad'), scope: { kind: 'folders', extra: [profileHome] } }
+      await writeFile(join(profileHome, RESPONDER_CONFIG_FILE), JSON.stringify(config), { mode: 0o600 })
+      await expect(readResponderConfig(profileHome)).rejects.toThrow(/perfil dedicado/)
+    })
+    // Stored the way setupResponder writes them, resolved: `/tmp/otra/../x` would otherwise sit
+    // beside `/tmp/x` as a different string and slip past the duplicate check.
+    it('refuses an extra folder that is not normalised', () => refuses({ kind: 'folders', extra: ['/tmp/otra/../x'] }, /normalizada/))
+    it('refuses an extra folder with a trailing slash', () => refuses({ kind: 'folders', extra: ['/tmp/otra/'] }, /normalizada/))
   })
 
   // Review round 1, Important 2: `model`/`effort` were re-validated on read but the two path

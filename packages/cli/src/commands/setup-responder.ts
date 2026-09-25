@@ -45,10 +45,13 @@ export type SettingsFile = {
 // Where the settings for a scope get their paths from. `home` and `platform` are passed in, never
 // read from `os.homedir()` / `process.platform` here, so the tests can describe any machine
 // without ever touching the real home.
-export type ScopePaths = { identityHome: string; profileHome: string; home: string; platform?: NodeJS.Platform }
+// `shareDir` is the working directory: modes 2 and 3 deny its key files by absolute path, because
+// it can lie outside every folder the `~/…` rules reach.
+export type ScopePaths = { shareDir: string; identityHome: string; profileHome: string; home: string; platform?: NodeJS.Platform }
 
-// The mode-3 caja fuerte: what stays unreadable when the whole personal folder is added. Fixed in
-// code — the owner decided nobody, themselves included, opens it through `setup`. Every entry is
+// The caja fuerte: what stays unreadable in modes 2 and 3. Fixed in code — the owner decided
+// nobody, themselves included, opens it through `setup`. Mode 2 carries it too: otherwise picking
+// `~/.ssh` or `~/.claude` as an extra folder would open exactly what that decision closed. Every entry is
 // anchored with `~/`: on Claude Code 2.1.282, with the home added as an additional directory, an
 // unanchored `Read(**/.env)` did not stop a direct Read of `~/proj/.env` (it returned the key),
 // while `Read(~/**/.env)` did (verificaciones.md, V6 and V7). An unanchored pattern is relative to
@@ -58,7 +61,10 @@ export type ScopePaths = { identityHome: string; profileHome: string; home: stri
 export const CAJA_FUERTE_HOME: readonly string[] = [
   // The owner's everyday Claude: its credentials and every conversation they ever had.
   'Read(~/.claude/**)',
-  'Read(~/.claude.json)',
+  // The trailing `*` also covers the `.claude.json.backup*` copies older builds leave beside it.
+  'Read(~/.claude.json*)',
+  // The desktop app: its MCP configuration carries tokens.
+  'Read(~/Library/Application Support/Claude/**)',
   'Read(~/.ssh/**)',
   'Read(~/.gnupg/**)',
   'Read(~/.aws/**)',
@@ -71,14 +77,31 @@ export const CAJA_FUERTE_HOME: readonly string[] = [
   'Read(~/.pypirc)',
   'Read(~/.netrc)',
   'Read(~/.git-credentials)',
+  'Read(~/.cargo/credentials*)',
+  'Read(~/.terraform.d/**)',
+  'Read(~/.config/op/**)',
+  // Shell and REPL histories: `export TOKEN=…` typed once lives on in them.
+  'Read(~/.zsh_history)',
+  'Read(~/.bash_history)',
+  'Read(~/.local/share/fish/**)',
+  'Read(~/.python_history)',
+  'Read(~/.node_repl_history)',
+  'Read(~/.psql_history)',
+  'Read(~/.mysql_history)',
+  'Read(~/.sqlite_history)',
   'Read(~/Library/Keychains/**)',
   'Read(~/Library/Cookies/**)',
   'Read(~/Library/Application Support/Google/Chrome/**)',
   'Read(~/Library/Application Support/Firefox/**)',
   'Read(~/Library/Safari/**)',
+  'Read(~/Library/Application Support/BraveSoftware/**)',
+  'Read(~/Library/Application Support/Microsoft Edge/**)',
+  'Read(~/Library/Application Support/Arc/**)',
   'Read(~/.mozilla/**)',
   'Read(~/.config/google-chrome/**)',
   'Read(~/.config/chromium/**)',
+  'Read(~/.config/BraveSoftware/**)',
+  'Read(~/.config/microsoft-edge/**)',
   'Read(~/.local/share/keyrings/**)',
   // Windows keeps application state, credentials and browser profiles here, and documents never.
   'Read(~/AppData/**)',
@@ -93,6 +116,11 @@ export const CAJA_FUERTE_HOME: readonly string[] = [
 // The secret-file patterns denied inside every extra folder of mode 2 — the same files the mode-3
 // list denies anywhere under `~`, anchored to each folder instead.
 const SECRET_FILE_TAILS = ['**/.env', '**/.env.*', '**/*.pem', '**/*.key', '**/*.p12', '**/*.pfx'] as const
+
+// The key files denied inside the working directory in modes 2 and 3. Its `.env` files are
+// already covered by the unanchored base rules, which hold there; these four are not in the base,
+// and the `~/**` rules miss them whenever the shared folder lies outside the home.
+const SHARE_KEY_TAILS = ['**/*.pem', '**/*.key', '**/*.p12', '**/*.pfx'] as const
 
 // Characters that make a path in a permission rule a pattern instead of a literal. A folder named
 // `proj[1]` would turn `//…/proj[1]/**` into a character class that never matches the real
@@ -122,7 +150,7 @@ function anchor(path: string, o: ScopePaths): string {
     return `~/${path.slice(home.length + 1).replaceAll('\\', '/')}`
   }
   throw new CliError(
-    `En Windows todavía no sé proteger una carpeta fuera de tu carpeta personal (${path}). Deja tu identidad y el perfil dedicado dentro de tu carpeta personal, o elige solo la carpeta compartida.`,
+    `En Windows todavía no sé proteger una carpeta fuera de tu carpeta personal (${path}). Deja la carpeta compartida, tu identidad y el perfil dedicado dentro de tu carpeta personal, o elige solo la carpeta compartida (opción 1).`,
   )
 }
 
@@ -132,18 +160,22 @@ const FOLDERS_ON_WINDOWS =
 
 // Every deny rule a scope adds on top of the mode-1 base. Mode 1 adds none: its only readable
 // directory is the working directory, where the unanchored base rules do hold. Modes 2 and 3 deny
-// the identity home and the dedicated profile by their real location, wherever that is — a
-// custom AGENTBRIDGE_HOME or --profile outside the default place must not fall out of the list.
+// the whole fixed list, the identity home and the dedicated profile by their real location
+// (a custom AGENTBRIDGE_HOME or --profile outside the default place must not fall out of the
+// list), and the key files in the shared folder; mode 2 adds the secret files of each extra folder.
 export function cajaFuerteFor(scope: ResponderScope, o: ScopePaths): string[] {
   if (scope.kind === 'folder') return []
   if (scope.kind === 'folders' && (o.platform ?? process.platform) === 'win32') throw new CliError(FOLDERS_ON_WINDOWS)
   const own = [`Read(${anchor(o.identityHome, o)}/**)`, `Read(${anchor(o.profileHome, o)}/**)`]
-  if (scope.kind === 'home') return [...CAJA_FUERTE_HOME, ...own]
+  const share = anchor(o.shareDir, o)
+  const shareKeys = SHARE_KEY_TAILS.map((tail) => `Read(${share}/${tail})`)
+  const common = [...CAJA_FUERTE_HOME, ...own, ...shareKeys]
+  if (scope.kind === 'home') return common
   const perFolder = scope.extra.flatMap((dir) => {
     const anchored = anchor(dir, o)
     return SECRET_FILE_TAILS.map((tail) => `Read(${anchored}/${tail})`)
   })
-  return [...own, ...perFolder]
+  return [...common, ...perFolder]
 }
 
 function additionalDirectoriesFor(scope: ResponderScope, o: ScopePaths): string[] {
@@ -217,10 +249,10 @@ function listSome(items: string[]): string {
 export async function inspectResponderSettings(
   profileHome: string,
   scope: ResponderScope,
-  o: { identityHome: string; home: string; platform?: NodeJS.Platform },
+  o: { shareDir: string; identityHome: string; home: string; platform?: NodeJS.Platform },
 ): Promise<ResponderSettingsReport> {
   type ReadSettings = {
-    permissions?: { allow?: string[]; deny?: string[]; additionalDirectories?: string[]; blockReadsOutsideWorkingDirectories?: boolean }
+    permissions?: { allow?: unknown; deny?: unknown; additionalDirectories?: unknown; blockReadsOutsideWorkingDirectories?: unknown }
   }
   const settingsPath = join(resolve(profileHome), 'settings.json')
   let settings: ReadSettings | null = null
@@ -252,9 +284,21 @@ export async function inspectResponderSettings(
     if (!(err instanceof CliError)) throw err
     scopeError = err.message
   }
-  const allow = settings?.permissions?.allow ?? []
-  const deny = settings?.permissions?.deny ?? []
-  const dirs = settings?.permissions?.additionalDirectories ?? []
+  // A hand edit can leave any JSON value where a list belongs. Read as-is, a string `deny` would
+  // crash this check with an English TypeError; instead the wrong shape is itself a problem, said
+  // in Spanish, and the field counts as empty — so everything it should have held is reported
+  // missing and the verdict fails closed.
+  const shapeProblems: string[] = []
+  const listAt = (key: 'allow' | 'deny' | 'additionalDirectories'): string[] => {
+    const value = settings?.permissions?.[key]
+    if (value === undefined) return []
+    if (Array.isArray(value) && value.every((v) => typeof v === 'string')) return value as string[]
+    shapeProblems.push(`permissions.${key} no es una lista de textos`)
+    return []
+  }
+  const allow = listAt('allow')
+  const deny = listAt('deny')
+  const dirs = listAt('additionalDirectories')
   const requiredDeny = expected?.permissions.deny ?? [...RESPONDER_DENY]
   const requiredDirs = expected?.permissions.additionalDirectories ?? []
   const missingBase = RESPONDER_DENY.filter((rule) => !deny.includes(rule))
@@ -271,6 +315,7 @@ export async function inspectResponderSettings(
   if (settingsProblem) {
     problems.push(settingsProblem)
   } else {
+    problems.push(...shapeProblems)
     if (missingBase.length) problems.push(`faltan denegaciones: ${missingBase.join(', ')}`)
     if (missingCaja.length) problems.push(`faltan protecciones de la caja fuerte: ${listSome(missingCaja)}`)
     if (extraDirs.length) problems.push(`carpetas legibles que no elegiste: ${extraDirs.join(', ')}`)
@@ -462,6 +507,7 @@ export async function setupResponder(o: {
     if (problem) throw new CliError(`No puedo usar esas carpetas: ${problem}.`)
   }
   const settings = responderSettings(scope, {
+    shareDir,
     identityHome,
     profileHome,
     home: o.home ?? homedir(),
@@ -488,7 +534,11 @@ export async function setupResponder(o: {
   await chmod(temporary, 0o600)
   await rename(temporary, settingsPath)
   if (previous !== null && previous !== settingsText) {
-    o.out.log('Actualicé los permisos del perfil dedicado para que coincidan con lo que elegiste.')
+    // 0.3 promised never to touch this file once it existed, so someone may have edited it by hand;
+    // they are told those edits are gone rather than finding out later.
+    o.out.log(
+      'Actualicé los permisos del perfil dedicado para que coincidan con lo que elegiste. Si habías editado ese archivo a mano, esos cambios se descartaron.',
+    )
   }
 
   const personaPath = join(shareDir, 'CLAUDE.md')

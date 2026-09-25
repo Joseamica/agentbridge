@@ -467,6 +467,8 @@ async function addProfileChecks(
   // and one folder is the strictest reading — that failure is reported on its own line below.
   const saved = await readResponderConfig(o.profileHome).catch(() => null)
   const fence = await inspectResponderSettings(o.profileHome, saved?.scope ?? { kind: 'folder' }, {
+    // Unused in mode 1, the only scope doctor falls back to when there is no saved one.
+    shareDir: saved?.shareDir ?? '',
     identityHome: saved?.identityHome ?? o.identityHome,
     home: homedir(),
   })

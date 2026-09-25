@@ -90,6 +90,13 @@ function readScope(raw: unknown): ResponderScope {
   if (r.kind === 'folder' || r.kind === 'home') return { kind: r.kind }
   if (r.kind !== 'folders') throw invalid()
   if (!Array.isArray(r.extra) || r.extra.length === 0 || !r.extra.every((d) => typeof d === 'string' && d.length > 0)) throw invalid()
+  // Stored exactly as setupResponder writes them: `resolve()`d. A `/a/b/../c` or a trailing slash
+  // would slip past the duplicate and containment checks as a different string from `/a/c`, and
+  // would reach the anchored rules unnormalised while Claude resolves the directory itself.
+  // Relative entries are left for scopeProblem, which says so in its own words.
+  if ((r.extra as string[]).some((d) => isAbsolute(d) && resolve(d) !== d)) {
+    throw new CliError(`El alcance guardado del respondedor tiene una carpeta escrita de forma no normalizada. Vuelve a correr: ${CLI_COMMAND} setup`)
+  }
   return { kind: 'folders', extra: [...(r.extra as string[])] }
 }
 
@@ -129,7 +136,11 @@ export async function runResponder(o: {
   // and nothing said. `responder --profile <any directory>` makes that reachable on purpose, so
   // the check belongs here and not only in `doctor`. The reader itself lives beside the writer
   // (setup-responder.ts) so this and doctor's own check can never disagree.
-  const fence = await inspectResponderSettings(profileHome, config.scope, { identityHome: config.identityHome, home: homedir() })
+  const fence = await inspectResponderSettings(profileHome, config.scope, {
+    shareDir: config.shareDir,
+    identityHome: config.identityHome,
+    home: homedir(),
+  })
   if (fence.problems.length > 0) {
     throw new CliError(
       `No puedo ponerte a contestar: los permisos del perfil dedicado no están como deben (${fence.problems.join(' · ')}). Sin ellos, la sesión que contesta podría leer archivos fuera de la carpeta compartida. Vuelve a correr: ${CLI_COMMAND} setup`,

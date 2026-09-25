@@ -68,7 +68,7 @@ describe('responderSettings', () => {
   // key back out to the top level fails this test even if every other assertion in this file
   // is only comparing the written file against the same, now-wrong, function output.
   it('nests blockReadsOutsideWorkingDirectories inside permissions, where Claude Code actually reads it', () => {
-    expect(responderSettings({ kind: 'folder' }, { identityHome: '/x/id', profileHome: '/x/perfil', home: '/x' })).toEqual({
+    expect(responderSettings({ kind: 'folder' }, { shareDir: '/x/compartido', identityHome: '/x/id', profileHome: '/x/perfil', home: '/x' })).toEqual({
       permissions: {
         allow: ['mcp__plugin_agentbridge_agentbridge__reply'],
         deny: ['Bash', 'Edit', 'Write', 'NotebookEdit', 'WebFetch', 'WebSearch', 'Agent', 'Read(**/.env)', 'Read(**/.env.*)'],
@@ -236,15 +236,17 @@ describe('setupResponder', () => {
   it('rewrites a mode-3 settings.json when the scope is now mode 1, and says so', async () => {
     await mkdir(home, { recursive: true })
     const personal = join(root, 'casa')
-    const wide = responderSettings({ kind: 'home' }, { identityHome, profileHome: home, home: personal })
+    const wide = responderSettings({ kind: 'home' }, { shareDir, identityHome, profileHome: home, home: personal })
     await writeFile(join(home, 'settings.json'), `${JSON.stringify(wide, null, 2)}\n`)
     const out = memoryOutput()
     const result = await setupResponder({ shareDir, repoDir, profileHome: home, identityHome, home: personal, scope: { kind: 'folder' }, run: runner, out })
     const written = JSON.parse(await readFile(result.settingsPath, 'utf8'))
     expect(written.permissions.additionalDirectories).toBeUndefined()
-    expect(written).toEqual(responderSettings({ kind: 'folder' }, { identityHome, profileHome: home, home: personal }))
+    expect(written).toEqual(responderSettings({ kind: 'folder' }, { shareDir, identityHome, profileHome: home, home: personal }))
     expect((await stat(result.settingsPath)).mode & 0o777).toBe(0o600)
     expect(out.lines.join('\n')).toMatch(/Actualicé los permisos/)
+    // 0.3 promised never to touch this file, so a hand edit is possible; it is said to be gone.
+    expect(out.lines.join('\n')).toMatch(/editado ese archivo a mano, esos cambios se descartaron/)
   })
 
   it('says nothing about the permissions when the file already matches', async () => {
@@ -281,22 +283,31 @@ describe('setupResponder', () => {
   })
 
   // The same guard readResponderConfig runs on the way in, run on the way out too, against real
-  // paths: an extra folder that holds the key must never reach disk in the first place.
-  it('refuses an extra folder that contains the identity home, before writing anything', async () => {
-    const err = await setupResponder({
-      shareDir,
-      repoDir,
-      profileHome: home,
-      identityHome,
-      scope: { kind: 'folders', extra: [root] },
-      platform: 'darwin',
-      run: runner,
-      out: memoryOutput(),
-    }).catch((e: unknown) => e)
-    expect(err).toBeInstanceOf(CliError)
-    await expect(access(join(home, 'settings.json'))).rejects.toThrow()
-    await expect(access(join(home, RESPONDER_CONFIG_FILE))).rejects.toThrow()
-  })
+  // paths: an extra folder that holds the key must never reach disk in the first place. Each extra
+  // holds exactly one of the two, and each message is pinned: with `root` as the extra and only a
+  // CliError asserted, removing the identity clause still passed, because the profile clause fired.
+  for (const [what, extraOf, message] of [
+    ['the identity home', () => identityHome, /carpeta de identidad/],
+    ['the dedicated profile', () => home, /perfil dedicado/],
+  ] as const) {
+    it(`refuses an extra folder that contains ${what}, before writing anything`, async () => {
+      await mkdir(extraOf(), { recursive: true })
+      const err = await setupResponder({
+        shareDir,
+        repoDir,
+        profileHome: home,
+        identityHome,
+        scope: { kind: 'folders', extra: [extraOf()] },
+        platform: 'darwin',
+        run: runner,
+        out: memoryOutput(),
+      }).catch((e: unknown) => e)
+      expect(err).toBeInstanceOf(CliError)
+      expect((err as CliError).message).toMatch(message)
+      await expect(access(join(home, 'settings.json'))).rejects.toThrow()
+      await expect(access(join(home, RESPONDER_CONFIG_FILE))).rejects.toThrow()
+    })
+  }
 
   it('refuses several folders on Windows, before writing anything', async () => {
     const err = await setupResponder({
