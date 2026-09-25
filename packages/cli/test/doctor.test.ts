@@ -395,6 +395,16 @@ describe('runDoctor with the scope saved in responder.json', () => {
       expect(check(await doctorWith(), name).ok).toBe(true)
     })
 
+    // Review round 1, Minor: a missing or unreadable CLAUDE.md is not one that "no menciona" the file.
+    it('says it cannot find or read CLAUDE.md, instead of saying it does not mention the scope file', async () => {
+      await profileFor({ kind: 'home' })
+      await shareWith(null, scopeDescription({ kind: 'home' }, home))
+      const line = check(await doctorWith(), name)
+      expect(line.ok).toBe(false)
+      expect(line.detail).toMatch(/No encuentro o no puedo leer el CLAUDE\.md/)
+      expect(line.detail).not.toContain('no menciona')
+    })
+
     it('fails when the scope file describes another mode', async () => {
       await profileFor({ kind: 'home' })
       await shareWith(RESPONDER_PERSONA, scopeDescription({ kind: 'folder' }, home))
