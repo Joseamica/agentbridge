@@ -19,9 +19,9 @@ describe('the publishable package', () => {
     assemble()
   })
 
-  it('declares 0.3.0, the supported Node floor and the files it ships', async () => {
+  it('declares 0.4.0, the supported Node floor and the files it ships', async () => {
     const pkg = JSON.parse(await readFile(join(packDir, 'package.json'), 'utf8')) as Record<string, unknown>
-    expect(pkg.version).toBe('0.3.0')
+    expect(pkg.version).toBe('0.4.0')
     expect(pkg.engines).toEqual({ node: '>=22.13' })
     expect(pkg.bin).toEqual({ agentbridge: 'bin/agentbridge.js' })
     expect(pkg.files).toEqual(['bin', 'plugins', '.claude-plugin', 'README.md', 'LICENSE'])
@@ -45,13 +45,13 @@ describe('the publishable package', () => {
     const manifest = JSON.parse(
       await readFile(join(packDir, 'plugins/agentbridge/.claude-plugin/plugin.json'), 'utf8'),
     ) as { version?: string }
-    expect(manifest.version).toBe('0.3.0')
+    expect(manifest.version).toBe('0.4.0')
     await expect(readFile(join(packDir, 'plugins/agentbridge/dist/server.js'), 'utf8')).resolves.toContain('agentbridge')
   })
 
-  it('publishes version 0.3.0', async () => {
+  it('publishes version 0.4.0', async () => {
     const manifest = JSON.parse(await readFile(join(repoRoot, 'plugins/agentbridge/.claude-plugin/plugin.json'), 'utf8'))
-    expect(manifest.version).toBe('0.3.0')
+    expect(manifest.version).toBe('0.4.0')
   })
 
   it('exposes the responder command from the packaged bundle', () => {

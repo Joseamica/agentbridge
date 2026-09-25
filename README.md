@@ -44,7 +44,8 @@ flowchart LR
    it — but a board operator can watch which key receives envelopes, and correlate sizes and
    timing across boards.
 4. The responder's agent runs in a dedicated, permission-restricted Claude Code session that can
-   read one folder and nothing else, and answers with a single `reply` tool.
+   read what its owner chose — one folder by default — and nothing else, and answers with a single
+   `reply` tool.
 5. The answer comes back through `check_answer` or `ticket`. Nobody had to be online at the same
    moment; a question is retried for up to seven days.
 
@@ -62,20 +63,65 @@ fence holds. So the boundary is enforced by configuration, not by asking the mod
 **What the responder session cannot do**, in every permission mode:
 
 - Run shell commands, edit or write files, fetch the web, or spawn subagents — all denied.
-- Read anything outside the shared folder. Enforced by
+- Read anything outside the folders its owner chose. Enforced by
   `permissions.blockReadsOutsideWorkingDirectories`, which must be nested inside `permissions`;
-  a copy at the top level of the settings file is accepted and silently ignored.
+  a copy at the top level of the settings file is accepted and silently ignored. The wider scopes
+  below add directories to `permissions.additionalDirectories`; they never turn the fence off.
 
 **What it can do — the part you must accept:**
 
-- **Everything inside the shared folder is readable**, including a `.env` or a key file, because
-  `Grep` is not denied and the two `Read(**/.env*)` rules do not cover it. The correct mental
-  model is: *that folder is public to anyone allowed to ask you.* Curate it deliberately. Do not
-  point it at a working repo.
+- **Everything it can read is readable by anyone allowed to ask you.** In the shared folder that
+  includes a key file, an `id_rsa` or a password written in a document; only files named `.env`
+  or `.env.*` are denied there in every scope. The correct mental model is: *that folder is public
+  to anyone allowed to ask you.* Curate it deliberately. Do not point it at a working repo.
 - **Project configuration that lands in that folder later** — `.claude/settings.json` hooks,
   `.mcp.json`, `.claude/agents`, `.claude/skills`, `.claude/commands`, `CLAUDE.local.md`,
   `AGENTS.md` — takes effect at the next session start. The `doctor` command flags all of them;
   nothing prevents a sync client or a `git pull` from placing them.
+
+### What the responder can see: three scopes
+
+`setup` asks the answerer once, for every contact at once (there is no per-contact scope):
+
+| Scope | Readable | Denied on top of the fence |
+| --- | --- | --- |
+| **1 — one folder** (default, recommended) | the shared folder | `.env` and `.env.*` in it |
+| **2 — several folders** | the shared folder plus the folders the answerer names | the caja fuerte; `.env`, `.env.*`, `*.pem`, `*.key`, `*.p12`, `*.pfx` inside each extra folder and the shared folder |
+| **3 — the whole personal folder** | the shared folder plus the home directory | the caja fuerte |
+
+The **caja fuerte** ("safe") is a fixed list in code (`CAJA_FUERTE_HOME` in
+`packages/cli/src/commands/setup-responder.ts`) that nobody can open through `setup`: the
+AgentBridge identity folder and the dedicated profile wherever they live, the owner's everyday
+Claude (`~/.claude`, `~/.claude.json*`, the desktop app's configuration), the best-known credential
+stores (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker`,
+`~/.config/gh`, `~/.npmrc`, `~/.pypirc`, `~/.netrc`, `~/.git-credentials`, cargo credentials,
+`~/.terraform.d`, `~/.config/op`), shell and REPL histories, the macOS keychain and browser
+profiles, their Linux equivalents, all of `~/AppData` on Windows, and every `.env`, `.env.*`,
+`*.pem`, `*.key`, `*.p12` and `*.pfx` under the home. It closes the best-known places, **not every
+secret a person has**: a password written in a document, mail and chats saved on disk, or a key
+file with an unusual name stay readable in scope 3.
+
+Scope 3 needs a typed `CONFIRMAR` after a screen that says, plainly, that anyone the answerer
+approves can then ask about any file in their personal folder outside the caja fuerte. Scope 2 is
+not offered on Windows, and scope 3 on Windows only when the shared folder, the identity and the
+profile are all inside the personal folder: how Claude Code anchors a drive-letter path in a
+permission rule is unverified, and even the `~/…` rules have not been checked on Windows.
+
+**Every rule that must hold outside the working directory is anchored** — `~/…` for the home,
+`//<absolute path>/…` per extra folder. That is the one fact this design rests on: on Claude Code
+2.1.282, with the home added as a readable directory, an unanchored `Read(**/.env)` did not stop a
+direct read of `~/proj/.env`; `Read(~/**/.env)` did. The same binary also showed that Grep and Glob
+respect these denies, including when they recurse from an allowed ancestor; that case variants and
+symlinked spellings of a denied path are refused too; and that nothing from an extra folder's own
+configuration (`CLAUDE.md`, `.claude/`, `.mcp.json`, `CLAUDE.local.md`, `AGENTS.md`) reaches the
+model. Those are behaviours of one Claude Code version, so the acceptance runbook re-checks them
+against the installed one.
+
+The scope is stored in `responder.json` (version 2; a 0.3 version-1 file reads as scope 1). `setup`
+rewrites the profile's `settings.json` from it on every run, and writes `.agentbridge-scope.md` into
+the shared folder so the model knows its reach — the persona `CLAUDE.md` imports it. `responder`
+refuses to start, and `doctor` fails, when `settings.json` does not match the saved scope exactly:
+a missing caja fuerte rule, or a readable directory nobody chose.
 
 `npx -y @joseamica/agentbridge@latest doctor` is how you verify all of this on a real install,
 including that every board you use actually accepts and returns what you publish. Run it before
@@ -106,17 +152,19 @@ you trust it.
   questions.
 - **Protecting the key from other programs you run.** The 0600 permission on `identity.json`
   keeps other users of the machine out, not other programs of yours. The locked-down responder
-  session cannot read it, by the same permission rule that keeps it out of everything else outside
-  the shared folder — but an ordinary Claude Code session on the same machine could.
+  session cannot read it — in scope 1 because it lies outside the fence, in scopes 2 and 3 because
+  its folder is denied by name — but an ordinary Claude Code session on the same machine could.
 
-And the one that matters most in practice: **everything in the shared folder is readable by
-anyone you've given permission to ask you.** That includes a stray `.env` or key file — say it out
-loud to the other person before either of you puts anything in there.
+And the one that matters most in practice: **everything the responder can read is readable by
+anyone you've given permission to ask you.** In the shared folder that includes a stray key file;
+in scope 3 it is every file in your personal folder outside the caja fuerte. Say it out loud to the
+other person before either of you puts anything in there.
 
 ## Requirements
 
 - Node.js >= 22.13
-- Claude Code (developed against 2.1.270) on the responder's machine
+- Claude Code on the responder's machine (developed against 2.1.270; the permission behaviours the
+  0.4 scopes rest on were verified on 2.1.282)
 
 There is nothing to deploy, host or pay for. Both machines only ever talk *out* to public Nostr
 boards; neither is exposed to the internet, and there's no server of ours in the middle.
@@ -134,9 +182,11 @@ person who granted permission (the answerer) can take it back instantly with `re
 asker simply stops asking — there's no `revoke` for that side.
 
 The "locked room" is the important idea. The answerer picks one folder and copies into it only
-what they're willing to share. Their agent can read that folder and **nothing else on the
-machine** — that's enforced by configuration, not by asking the model nicely. Everything in the
-room is fair game, so the room is curated on purpose. It is not your working repo.
+what they're willing to share. By default their agent can read that folder and **nothing else on
+the machine** — that's enforced by configuration, not by asking the model nicely. Everything in the
+room is fair game, so the room is curated on purpose. It is not your working repo. The answerer can
+widen the room to more folders or to their whole personal folder minus the caja fuerte — see
+[What the responder can see](#what-the-responder-can-see-three-scopes).
 
 ```mermaid
 sequenceDiagram
@@ -179,6 +229,10 @@ did not read, project configuration already sitting there (`.claude/settings*.js
 `AGENTS.md`, `CLAUDE.local.md`, `.claude/agents|skills|commands`), a tree too deeply nested to
 walk fully, and a tree too large to walk fully — the last two because it cannot then promise none
 of the others is hiding further in. It never creates that folder silently.
+
+Next it asks what the answering agent can see — the shared folder only, that folder plus others the
+answerer names one by one (each goes through the same checks), or the whole personal folder minus
+the caja fuerte, behind a typed `CONFIRMAR`. Enter keeps what the machine already has.
 
 Then it *performs* the rest instead of printing it. It opens Claude's login in the dedicated
 profile — the browser opens, you type your password, you come back — and afterwards checks for
@@ -240,8 +294,11 @@ npx -y @joseamica/agentbridge@latest setup-responder --share <a folder Dev is wi
 This creates the shared folder if it isn't there, creates a dedicated Claude Code profile at
 `~/.agentbridge-responder` (override with `--profile`), writes the restricted permissions, writes
 a `responder.json` recording the folder, the model and the effort, installs the plugin into that
-profile, and drops a persona `CLAUDE.md` into the shared folder. It refuses to run if that
-profile — or Dev's identity folder — would land inside the shared folder. Copy into that folder
+profile, and drops a persona `CLAUDE.md` and `.agentbridge-scope.md` into the shared folder. It
+refuses to run if that profile — or Dev's identity folder — would land inside the shared folder.
+`setup-responder` always writes scope 1, and rewrites `settings.json` and `responder.json` every time:
+run by hand on a profile that had a wider scope, it narrows it back to one folder. The wider scopes
+are chosen only through `setup`. Copy into that folder
 only what Dev is willing to share: not the working repo, nothing with credentials.
 
 Logging that dedicated profile in is a browser and a password, so it is `setup`'s job, not a line
@@ -299,7 +356,7 @@ automatically for up to a week — and lands the moment he starts it again.
 
 For the full pilot protocol in Spanish — including the security checklist you should run before
 trusting this with anything real — see
-[`docs/runbooks/aceptacion-0.3.md`](docs/runbooks/aceptacion-0.3.md). There is also a friendlier
+[`docs/runbooks/aceptacion-0.4.md`](docs/runbooks/aceptacion-0.4.md). There is also a friendlier
 Spanish quickstart at [`docs/inicio-rapido.md`](docs/inicio-rapido.md).
 
 ## CLI reference
@@ -395,15 +452,15 @@ running from.
 
 ## Status
 
-This is **0.3**: no server of ours, built for two people who already trust each other. 0.2 was
-installed for the first time by someone who does not program, on Windows, and the install is what
-broke — not the transport. 0.3 is the answer to that: `setup` performs the steps it used to print,
-and no instruction a person reads depends on which shell they happen to have. Known gaps,
+This is **0.4**: no server of ours, built for two people who already trust each other. 0.3 made
+`setup` perform the steps it used to print, after the first real install — by someone who does not
+program, on Windows — broke on them. 0.4 lets the answerer choose how far their agent can see: one
+folder, several, or the whole personal folder minus a fixed caja fuerte. Known gaps,
 deliberate deferrals and the full residual-exposure statement are written down in
 [`docs/known-gaps.md`](docs/known-gaps.md) — including the ones that matter before you add a third
 person, and the platforms that are reasoned about rather than tested.
 
-Not in 0.3: mobile clients, WhatsApp or Telegram, push notifications, organizations, billing,
+Not in 0.4: per-contact scopes, mobile clients, WhatsApp or Telegram, push notifications, organizations, billing,
 attachments, Codex as the responder, and a global binary on your PATH.
 
 Issues and questions are welcome. If you find a way around the fence, please open an issue.

@@ -1,13 +1,68 @@
 # AgentBridge — decisiones tomadas durante la implementación y trabajo pendiente
 
 Es la lista de las decisiones que se tomaron apartándose del plan durante la implementación —0.2
-primero, 0.3 después— y de lo que quedó deliberadamente sin arreglar. Lo más reciente va arriba.
+primero, 0.3 y 0.4 después— y de lo que quedó deliberadamente sin arreglar. Lo más reciente va arriba.
 (Hasta 0.1.x, AgentBridge corría sobre un relé
 propio en Render cuyo operador podía leer todo el contenido; 0.2 lo reemplaza por completo con
 tableros públicos de Nostr — ver
 `docs/superpowers/specs/2026-09-16-nostr-transport-design.md` y la sección de privacidad del
 README. Los pendientes que solo existían por ese relé desaparecieron con él y no están en esta
 lista.)
+
+## 0.4 — qué puede ver el agente que contesta: lo que queda fuera a propósito
+
+Esta versión deja que quien contesta elija el alcance de su agente: una carpeta (lo de siempre),
+varias, o toda su carpeta personal menos una caja fuerte fija. Esto es lo que **no** hace, y por qué.
+
+- **Una sola elección para todos los contactos.** No se puede dejar que Ana vea toda tu carpeta
+  personal y Beto solo la carpeta compartida. Hacerlo exige un agente que contesta por contacto
+  —otro perfil dedicado, otra sesión corriendo—, y eso es otro producto. Quien necesite alcances
+  distintos tiene que elegir el más estrecho que le sirva a todos.
+- **La caja fuerte es una lista fija.** Vive en el código (`CAJA_FUERTE_HOME` en
+  `packages/cli/src/commands/setup-responder.ts`, más la carpeta de la identidad y la del perfil
+  dedicado, dondequiera que estén) y nadie la puede abrir ni ampliar desde `setup`: lo decidió el
+  dueño del proyecto, a propósito. La consecuencia hay que decirla tal cual: **cierra los lugares
+  más conocidos donde se guardan contraseñas y llaves, no todos los secretos.** Una contraseña
+  escrita en un documento, los correos y chats guardados en la computadora, o un archivo de llaves
+  con un nombre poco común (un `id_rsa` fuera de `~/.ssh`, un `credentials.json`, la exportación de
+  un gestor de contraseñas) se leen en la opción 3, y en la opción 2 si están dentro de una carpeta
+  elegida. Ampliar la lista sin fin nunca la haría completa; los textos de `setup`, `doctor` y la
+  guía dicen lo que cubre y lo que no.
+- **La opción 2 no existe en Windows.** Proteger los archivos de llaves de cada carpeta extra exige
+  escribir su ruta absoluta dentro de una regla, y no está comprobado cómo ancla Claude Code una
+  ruta con letra de unidad (`C:\…`). Una forma adivinada que no coincide con nada parecería
+  protección y no cubriría nada —el mismo fallo que V6—, así que `setup` la rechaza con una frase.
+- **La opción 3 en Windows solo con todo dentro de la carpeta personal**, por la misma razón: la
+  carpeta compartida, la identidad y el perfil dedicado se protegen con reglas `~/…`, y fuera de la
+  carpeta personal habría que escribir una ruta con letra de unidad. Además, **que las reglas `~/…`
+  se sostengan en Windows tampoco está comprobado**: todas las verificaciones se hicieron en macOS.
+  La sección 8 del runbook es la forma de comprobarlo en una máquina Windows.
+- **Una ruta con `*`, `?`, `[`, `]`, `{` o `}` (en Mac y Linux también `\`) se rechaza**, no se
+  escapa: si Claude Code respeta un escape dentro de una regla no está comprobado, y una regla con
+  un comodín sin querer no protegería la carpeta.
+- **Lo verificado vale para Claude Code 2.1.282.** Todo lo que este diseño supone de Claude Code se
+  comprobó contra ese binario antes de escribir el código
+  (`.superpowers/sdd/2026-09-25-agentbridge-0.4-alcance/verificaciones.md`, V1–V19): que
+  `additionalDirectories` abre carpetas sin apagar la valla; que una regla anclada deniega dentro
+  de una carpeta abierta y una sin anclar no (V6); que Grep y Glob respetan esas reglas, también al
+  recorrer desde una carpeta de arriba; que una variante en mayúsculas o una ruta que pasa por un
+  enlace simbólico también se deniegan (V8, V11); que las reglas de un solo archivo y las de
+  asterisco final cierran (V14, V15); que la importación de `.agentbridge-scope.md` se carga sola y
+  sin pedir aprobación (V16, V17); y que **nada de la configuración de una carpeta extra llega al
+  modelo** —ni habilidades, ni comandos, ni subagentes, ni `.mcp.json`, ni `CLAUDE.local.md`, ni
+  `AGENTS.md` (V18)—, con el control de que esos mismos archivos en la carpeta de trabajo sí se
+  cargan (V19), sin el cual el "no llegó" no probaría nada. Una versión futura de Claude Code podría
+  cambiar cualquiera de estas cosas sin avisar. Por eso la sección 8 del runbook
+  (`docs/runbooks/aceptacion-0.4.md`) las vuelve a comprobar contra el Claude Code instalado.
+- **`doctor` recorre las carpetas extra con límite** (20000 elementos o 6 niveles de profundidad) y
+  dice cuando no terminó, sin marcarlo como falla; la carpeta compartida se sigue recorriendo
+  entera. Y en las carpetas extra no busca configuración de proyecto: por V18 no llega al modelo, y
+  marcarla era una falsa alarma bloqueante justo en la carpeta que más se añade, un proyecto.
+- **En Mac, macOS puede no dejar entrar a la terminal** en Documentos, Escritorio o Descargas.
+  `doctor` lo detecta por el error, no por el nombre de la carpeta, y dice dónde se da el permiso;
+  no lo puede dar por ti. En la opción 3 no hay un chequeo equivalente para cada carpeta de la
+  carpeta personal: si macOS le niega una a la terminal, tu agente tampoco la puede leer, y nadie
+  lo dice.
 
 ## 0.3 — el setup interactivo: lo que queda fuera a propósito
 
@@ -102,13 +157,18 @@ Nada de esto bloquea el piloto. Todo está verificado y acotado.
 
 ## Exposición residual, tal como quedó
 
-- **Todo lo que esté en la carpeta compartida es legible** por el agente que responde, incluido un
-  `.env` o una llave, porque `Grep` no está negado y las dos reglas `Read(**/.env*)` no lo cubren.
-  El modelo mental correcto es: esa carpeta es pública para quien te pueda preguntar.
+- **Todo lo que esté en la carpeta compartida es legible** por el agente que responde, incluido
+  un archivo de llaves, salvo los que se llaman `.env` o `.env.*` (y, en las opciones 2 y 3, los
+  `.pem`, `.key`, `.p12` y `.pfx`). En 0.3 esta línea decía que un `.env` también se leía, por
+  Grep; en Claude Code 2.1.282 Grep se salta los archivos denegados (V6, V13 de las
+  verificaciones de 0.4). El modelo mental correcto sigue siendo: esa carpeta es pública para quien
+  te pueda preguntar.
+- **En las opciones 2 y 3, lo mismo vale para todo lo que el agente puede leer**: las carpetas
+  elegidas, o toda la carpeta personal menos la caja fuerte.
 - **Configuración de proyecto que llegue después** a esa carpeta (por sincronización o `git pull`)
   toma efecto en el siguiente arranque. `doctor` la marca; nada la impide.
-- **Fuera de la carpeta compartida no hay alcance** por herramientas de archivo, en cualquier modo
-  de permisos.
+- **Fuera de lo que eligió quien contesta no hay alcance** por herramientas de archivo, en
+  cualquier modo de permisos: la valla sigue puesta en las tres opciones.
 
 ## Pendientes del comando guiado `setup`
 
