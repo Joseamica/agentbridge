@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { plainSocketFactory, startFakeBoard, type FakeBoard } from '../../core/test/support/fake-board'
 import { cloudSyncedPath, runDoctor } from '../src/commands/doctor'
 import { RESPONDER_CONFIG_FILE } from '../src/commands/responder'
+import { LEGACY_PERSONA, RESPONDER_PERSONA, SCOPE_FILE, scopeDescription } from '../src/commands/setup-responder'
 
 // The production policy only accepts wss://, and the fake board speaks ws:// on loopback. This is
 // the same three-line policy every other suite uses; importing it across the tests/ tree would tie
@@ -356,6 +357,54 @@ describe('runDoctor with the scope saved in responder.json', () => {
   it('does not print the caja fuerte line in mode 1, where there is no caja fuerte', async () => {
     await profileFor({ kind: 'folder' })
     expect((await doctorWith()).find((c) => c.name === 'Caja fuerte')).toBeUndefined()
+  })
+
+  // Task 4: the model has to be told the reach it has. doctor keeps saying so when it is not.
+  describe('whether the model is told its folders', () => {
+    const name = 'Tu agente sabe qué carpetas puede usar'
+    async function shareWith(persona: string | null, scopeText: string | null): Promise<void> {
+      if (persona !== null) await writeFile(join(shareDir, 'CLAUDE.md'), persona)
+      if (scopeText !== null) await writeFile(join(shareDir, SCOPE_FILE), scopeText)
+    }
+
+    it('passes in mode 3 when CLAUDE.md points at a scope file that says mode 3', async () => {
+      await profileFor({ kind: 'home' })
+      await shareWith(RESPONDER_PERSONA, scopeDescription({ kind: 'home' }, home))
+      const line = check(await doctorWith(), name)
+      expect(line.ok).toBe(true)
+      expect(line.blocking).toBe(false)
+    })
+
+    it('fails, without blocking, when the CLAUDE.md in mode 3 never mentions the scope file', async () => {
+      await profileFor({ kind: 'home' })
+      await shareWith('mis reglas', scopeDescription({ kind: 'home' }, home))
+      const line = check(await doctorWith(), name)
+      expect(line.ok).toBe(false)
+      expect(line.blocking).toBe(false)
+      expect(line.detail).toContain(`@${SCOPE_FILE}`)
+    })
+
+    it('fails when the scope file describes another mode', async () => {
+      await profileFor({ kind: 'home' })
+      await shareWith(RESPONDER_PERSONA, scopeDescription({ kind: 'folder' }, home))
+      const line = check(await doctorWith(), name)
+      expect(line.ok).toBe(false)
+      expect(line.detail).toContain(`${CLI_COMMAND} setup`)
+    })
+
+    it('fails in mode 1 when the persona points at a scope file that is gone', async () => {
+      await profileFor({ kind: 'folder' })
+      await shareWith(RESPONDER_PERSONA, null)
+      expect(check(await doctorWith(), name).ok).toBe(false)
+    })
+
+    // Every 0.3 install: a mode-1 profile whose CLAUDE.md predates the scope file. It describes one
+    // folder, which is what mode 1 is, so there is nothing to report.
+    it('says nothing in mode 1 about a CLAUDE.md from an earlier release', async () => {
+      await profileFor({ kind: 'folder' })
+      await shareWith(LEGACY_PERSONA, null)
+      expect((await doctorWith()).find((c) => c.name === name)).toBeUndefined()
+    })
   })
 
   describe('mode 2', () => {

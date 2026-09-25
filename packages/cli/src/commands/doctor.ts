@@ -24,8 +24,8 @@ import { parseArgs } from 'node:util'
 import { CliError, type CliContext } from '../context'
 import { isSameOrWithin, resolveComparablePath, resolveNonExisting } from '../fs-paths'
 import { readResponderConfig, RESPONDER_CONFIG_FILE } from './responder'
-import { scopeSummary, type ResponderScope } from './responder-config'
-import { defaultRunner, inspectResponderSettings, type CommandRunner } from './setup-responder'
+import { scopeSummary, type ResponderConfig } from './responder-config'
+import { defaultRunner, inspectResponderSettings, SCOPE_FILE, scopeDescription, type CommandRunner } from './setup-responder'
 
 export type Check = {
   name: string
@@ -483,11 +483,34 @@ const CAJA_FUERTE_LINE =
 // readable by the next question exactly like the shared folder's contents.
 async function addScopeChecks(
   add: (name: string, ok: boolean, detail: string, blocking: boolean, security?: boolean) => void,
-  scope: ResponderScope,
+  config: ResponderConfig,
+  home: string,
 ): Promise<void> {
+  const scope = config.scope
   const summary = scopeSummary(scope)
   add('Alcance del respondedor', true, scope.kind === 'folders' ? `${summary} Son: ${scope.extra.join(', ')}.` : summary, false)
   if (scope.kind === 'home') add('Caja fuerte', true, CAJA_FUERTE_LINE, false)
+
+  // Whether the model is told the reach it actually has. The permissions enforce the scope either
+  // way, so this never blocks and is not about safety; it is about an agent that refuses a folder
+  // it was given because its CLAUDE.md still says "only this folder". setup says this once, when
+  // it leaves an edited CLAUDE.md alone; this line keeps saying it until it is fixed. In mode 1 a
+  // CLAUDE.md that never mentions the scope file is every 0.3 install, and it describes mode 1
+  // correctly, so there is nothing to say unless it points at a scope file that is wrong.
+  const [persona, scopeText] = await Promise.all([
+    readFile(join(config.shareDir, 'CLAUDE.md'), 'utf8').catch(() => null),
+    readFile(join(config.shareDir, SCOPE_FILE), 'utf8').catch(() => null),
+  ])
+  const pointsAtScope = persona?.includes(SCOPE_FILE) ?? false
+  const scopeCurrent = scopeText === scopeDescription(scope, home)
+  if (scope.kind !== 'folder' || pointsAtScope) {
+    const detail = !pointsAtScope
+      ? `El CLAUDE.md de la carpeta compartida no menciona ${SCOPE_FILE}, así que tu agente puede creer que solo puede usar la carpeta compartida. Añade esta línea sola al principio de ese archivo: @${SCOPE_FILE}`
+      : !scopeCurrent
+        ? `${SCOPE_FILE} en la carpeta compartida falta o no coincide con lo que elegiste, así que tu agente leería un alcance equivocado. Lo vuelve a escribir: ${CLI_COMMAND} setup`
+        : `sí: CLAUDE.md apunta a ${SCOPE_FILE}, y ese archivo dice lo que elegiste`
+    add('Tu agente sabe qué carpetas puede usar', pointsAtScope && scopeCurrent, detail, false)
+  }
   if (scope.kind !== 'folders') return
   for (const dir of scope.extra) {
     const info = await stat(dir).catch(() => null)
@@ -541,7 +564,7 @@ async function addProfileChecks(
   add('Permisos del respondedor', fence.problems.length === 0, fence.problems.length ? fence.problems.join(' · ') : fence.detail, true, true)
   // Only with a readable responder.json: without one there is no mode to name, and its absence is
   // reported on its own line below.
-  if (saved) await addScopeChecks(add, saved.scope)
+  if (saved) await addScopeChecks(add, saved, o.home)
 
   // What `start.sh`'s own executable-bit check used to stand in for: proof that this profile
   // was actually prepared by setup-responder, not just a folder someone pointed --profile at.
