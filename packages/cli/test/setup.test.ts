@@ -352,7 +352,7 @@ describe('the asking side', () => {
 describe('the answering side', () => {
   it('prepares the shared folder and the dedicated profile, and never writes AgentBridge state into it', async () => {
     await seedIdentityAndProfile()
-    const { prompt, expectDrained } = scripted(['1', shareDir, '', '', 'n'])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', '', '', 'n'])
     await runSetup(context({ prompt }))
     expectDrained()
     await expect(access(join(profileHome, RESPONDER_CONFIG_FILE))).resolves.toBeUndefined()
@@ -376,7 +376,7 @@ describe('the answering side', () => {
   it("tells the person to give their link to whoever will ask them", async () => {
     await seedIdentityAndProfile()
     const out = memoryOutput()
-    const { prompt, expectDrained } = scripted(['1', shareDir, '', '', 'n'])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', '', '', 'n'])
     await runSetup(context({ prompt, out }))
     expectDrained()
     const text = out.lines.join('\n')
@@ -393,7 +393,7 @@ describe('the answering side', () => {
     await seedIdentityAndProfile()
     const spacedProfile = join(root, 'mi respondedor')
     const out = memoryOutput()
-    const { prompt, expectDrained } = scripted(['1', shareDir, '', '', 'n'])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', '', '', 'n'])
     await runSetup(context({ prompt, out, profileHome: spacedProfile }))
     expectDrained()
     const text = out.lines.join('\n')
@@ -408,7 +408,7 @@ describe('the answering side', () => {
     // the only board refuses reads, so every board fails and doctor's aggregate "Tableros
     // públicos" check — the blocking one — fires.
     board.options = { ...board.options, rejectReads: true }
-    const { prompt, expectDrained } = scripted(['1', shareDir, '', '', 'n'])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', '', '', 'n'])
     await runSetup(context({ prompt, out }))
     expectDrained()
     const text = out.lines.join('\n')
@@ -628,7 +628,7 @@ describe('blockers', () => {
 
 describe('the guided flow as a whole', () => {
   it('prints no shell syntax and no technical check list when everything works', async () => {
-    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', 'n'] })
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '', 'n'] })
     await runSetup(ctx)
     ctx.expectDrained()
     const out = ctx.out
@@ -651,7 +651,7 @@ describe('the guided flow as a whole', () => {
     // never happened (blocking). Port 9 on loopback refuses immediately: nothing here needs a
     // network, and nothing waits on a timeout.
     const ctx = await responderSetupContext({
-      answers: ['Dani', '1', shareDir, '', ''],
+      answers: ['Dani', '1', shareDir, '', '', ''],
       loggedIn: false,
       relays: [board.url, 'wss://127.0.0.1:9/'],
     })
@@ -675,7 +675,7 @@ describe('the guided flow as a whole', () => {
   })
 
   it('starts answering when asked to', async () => {
-    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', 's'] })
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '', 's'] })
     await runSetup(ctx)
     ctx.expectDrained()
     expect(ctx.interactiveCalls.map((c) => c.args.join(' ')).join('\n')).toContain('plugin:agentbridge@agentbridge-local')
@@ -685,7 +685,7 @@ describe('the guided flow as a whole', () => {
   // to Claude's own first-run wizard. Saying so BEFORE the question is what makes the question
   // answerable — the same reason the "esta terminal se queda contestando" line moved above it.
   it('warns about Claude\'s own first-run questions before asking whether to start', async () => {
-    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', 's'] })
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '', 's'] })
     // Measured against the QUESTION, not against the handover: `runResponder` prints a heads-up of
     // its own right before spawning, and that one lands after the person has already answered. A
     // test that only checked "somewhere before the handover" passed on the responder's line and
@@ -709,7 +709,7 @@ describe('the guided flow as a whole', () => {
     // before the login and recorded "no session". Deciding whether the responder can start from
     // that recorded answer — instead of from what the login itself reported — refuses to start a
     // responder that works perfectly, on the single most common path through this flow.
-    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '', 's'], logsInDuringSetup: true })
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '', '', 's'], logsInDuringSetup: true })
     await runSetup(ctx)
     ctx.expectDrained()
     const text = ctx.out.lines.join('\n')
@@ -724,7 +724,7 @@ describe('the guided flow as a whole', () => {
     // The ordering bug this plan nearly shipped: starting the responder from inside the answering
     // branch would return before `connect` and the MCP registration ever ran, and the person would
     // have no way to know what they did not get.
-    const ctx = await responderSetupContext({ answers: ['Dani', '3', shareDir, '', 'n', 'n', 's'] })
+    const ctx = await responderSetupContext({ answers: ['Dani', '3', shareDir, '', '', 'n', 'n', 's'] })
     await runSetup(ctx)
     ctx.expectDrained()
     const text = ctx.out.lines.join('\n')
@@ -742,7 +742,7 @@ describe('the guided flow as a whole', () => {
   // they were sent over WhatsApp turns out to be mispasted. Losing the verdict AND the offer to
   // start answering over that is the failure class this whole branch exists to end.
   it('keeps the verdict and the offer to start answering when the pasted link is bad on role 3', async () => {
-    const ctx = await responderSetupContext({ answers: ['Dani', '3', shareDir, '', 's', 'enlace-mal-pegado', 'n', 's'] })
+    const ctx = await responderSetupContext({ answers: ['Dani', '3', shareDir, '', '', 's', 'enlace-mal-pegado', 'n', 's'] })
     ctx.connectWith = async () => {
       throw new UserFacingError('Ese enlace de AgentBridge no es válido. Pide que te lo copien completo.')
     }
@@ -763,7 +763,7 @@ describe('the guided flow as a whole', () => {
     // terminal until Ctrl+C, so the only way to do what they still owed was to kill the session
     // they had just been told to leave open. On role 3 this is not an edge case: the asking side
     // always ends with "reinicia tu sesión de Claude Code".
-    const ctx = await responderSetupContext({ answers: ['Dani', '3', shareDir, '', 'n', 'n', 's'] })
+    const ctx = await responderSetupContext({ answers: ['Dani', '3', shareDir, '', '', 'n', 'n', 's'] })
     await runSetup(ctx)
     ctx.expectDrained()
     const text = ctx.out.lines.join('\n')
@@ -777,7 +777,7 @@ describe('the guided flow as a whole', () => {
 
   it('still says "Ya quedó" when there is genuinely nothing left', async () => {
     // The other half of the same rule: the wording is gated on the truth, not removed.
-    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', 's'] })
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '', 's'] })
     await runSetup(ctx)
     ctx.expectDrained()
     const text = ctx.out.lines.join('\n')
@@ -790,7 +790,7 @@ describe('the guided flow as a whole', () => {
     // answer for a key sitting in OneDrive is yes — so filtering the install's report by
     // `blocking` alone silenced the single most serious thing this program can say, at the exact
     // moment the person is still choosing folders.
-    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', 'n'], keyInCloudFolder: true })
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '', 'n'], keyInCloudFolder: true })
     await runSetup(ctx)
     ctx.expectDrained()
     const text = ctx.out.lines.join('\n')
@@ -812,11 +812,11 @@ describe('the guided flow as a whole', () => {
     // the folder question used to offer a hard-coded `~/AgentBridge/compartido` no matter what was
     // already configured — so pressing Enter there (the quick start's own worked example) silently
     // repointed a working responder at a brand-new empty folder.
-    const first = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', 'n'] })
+    const first = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '', 'n'] })
     await runSetup(first)
     first.expectDrained()
 
-    const second = await responderSetupContext({ answers: ['1', '', '', 'n'] })
+    const second = await responderSetupContext({ answers: ['1', '', '', '', 'n'] })
     await runSetup(second)
     second.expectDrained()
     // The question offered the saved folder, and plain Enter kept it.
@@ -830,14 +830,14 @@ describe('the guided flow as a whole', () => {
     // Review round 1, M3: `runResponder` reports one of its two failures by throwing and the other
     // with a non-zero code. Everything this command was asked to do already worked by then, so
     // both are said the same way — ending on "Error:" would read as if the setup itself failed.
-    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', 's'], responderSpawnFails: true })
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '', 's'], responderSpawnFails: true })
     await expect(runSetup(ctx)).resolves.toBeUndefined()
     ctx.expectDrained()
     expect(ctx.out.lines.join('\n')).toMatch(/No pude ejecutar Claude Code/)
   })
 
   it('still prints the link when no clipboard tool exists', async () => {
-    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', 'n'], copyLink: async () => false })
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '', 'n'], copyLink: async () => false })
     await runSetup(ctx)
     ctx.expectDrained()
     const text = ctx.out.lines.join('\n')
@@ -857,7 +857,7 @@ describe('the shared-folder protection', () => {
     await mkdir(join(shareDir, '.git'), { recursive: true })
     await writeFile(join(shareDir, '.env'), 'SECRET=x')
     const out = memoryOutput()
-    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR', '', 'n'])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR', '', '', 'n'])
     await runSetup(context({ prompt, out }))
     expectDrained()
     const text = out.lines.join('\n')
@@ -875,7 +875,7 @@ describe('the shared-folder protection', () => {
     await seedIdentityAndProfile()
     await mkdir(join(shareDir, '.git'), { recursive: true })
     const out = memoryOutput()
-    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'no', 'CONFIRMAR', '', 'n'])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'no', 'CONFIRMAR', '', '', 'n'])
     await runSetup(context({ prompt, out }))
     expectDrained()
     const text = out.lines.join('\n')
@@ -902,7 +902,7 @@ describe('the shared-folder protection', () => {
     await mkdir(shareDir, { recursive: true })
     await symlink(root, join(shareDir, 'enlace'))
     const out = memoryOutput()
-    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR', '', 'n'])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR', '', '', 'n'])
     await runSetup(context({ prompt, out }))
     expectDrained()
     expect(out.lines.join('\n')).toMatch(/enlaces simbólicos/)
@@ -913,7 +913,7 @@ describe('the shared-folder protection', () => {
     await mkdir(join(shareDir, 'node_modules', 'algun-paquete'), { recursive: true })
     await writeFile(join(shareDir, 'node_modules', 'algun-paquete', '.env'), 'SECRET=y')
     const out = memoryOutput()
-    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR', '', 'n'])
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR', '', '', 'n'])
     await runSetup(context({ prompt, out }))
     expectDrained()
     // Specifically the "did not look inside" reason, not "found credentials in there" — the
@@ -936,7 +936,7 @@ describe('the shared-folder protection', () => {
     const notAFolder = join(root, 'esto-es-un-archivo')
     await writeFile(notAFolder, 'no soy una carpeta')
     const out = memoryOutput()
-    const { prompt, expectDrained } = scripted(['1', notAFolder, '', shareDir, '', '', 'n'])
+    const { prompt, expectDrained } = scripted(['1', notAFolder, '', shareDir, '', '', '', 'n'])
     await runSetup(context({ prompt, out }))
     expectDrained()
     const text = out.lines.join('\n')
@@ -1070,5 +1070,274 @@ describe('--relays', () => {
     expect(await readFile(configPath, 'utf8')).toBe(before)
     const afterEntries = new Set(await import('node:fs/promises').then((fs) => fs.readdir(profileHome)))
     expect(afterEntries).toEqual(beforeEntries)
+  })
+})
+
+// 0.4: the question of how far the answering agent can see. Every folder answer below is a temp
+// path — the real home appears only as a string the flow compares against, never as a place it
+// creates or writes anything (see the afterEach guard at the top of this file).
+describe('what the answering agent can see', () => {
+  const SCOPE_QUESTION = '¿Qué puede ver tu agente cuando alguien te pregunta?'
+
+  async function savedConfig(): Promise<{ scope: { kind: string; extra?: string[] } }> {
+    return JSON.parse(await readFile(join(profileHome, RESPONDER_CONFIG_FILE), 'utf8'))
+  }
+  async function savedSettings(): Promise<{ permissions: { additionalDirectories?: string[]; deny: string[] } }> {
+    return JSON.parse(await readFile(join(profileHome, 'settings.json'), 'utf8'))
+  }
+  async function folder(name: string): Promise<string> {
+    const dir = join(root, name)
+    await mkdir(dir, { recursive: true })
+    return dir
+  }
+  function summaryOf(ctx: { out: { lines: string[] } }): string {
+    const text = ctx.out.lines.join('\n')
+    return text.slice(text.indexOf('== Resumen =='))
+  }
+
+  it('asks the question with its three options, and Enter keeps one folder', async () => {
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '', 'n'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const question = ctx.asked.find((q) => q.includes(SCOPE_QUESTION))
+    expect(question).toBeDefined()
+    expect(question).toContain('1) Solo esta carpeta (recomendado)')
+    expect(question).toContain('2) Esta carpeta y otras que elijas')
+    expect(question).toContain('3) Toda tu carpeta personal, menos tus secretos')
+    expect(question).toContain('Enter para la 1')
+    expect((await savedConfig()).scope).toEqual({ kind: 'folder' })
+    expect((await savedSettings()).permissions.additionalDirectories).toBeUndefined()
+    expect(summaryOf(ctx)).toContain('Tu agente puede ver: solo la carpeta compartida.')
+  })
+
+  it('mode 3: explains what stays shut and who can ask about the rest, then needs CONFIRMAR', async () => {
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '3', 'CONFIRMAR', 'n'] })
+    let linesWhenConfirmAsked = -1
+    const inner = ctx.prompt
+    ctx.prompt = async (question: string) => {
+      if (question.includes('CONFIRMAR para continuar')) linesWhenConfirmAsked = ctx.out.lines.length
+      return inner(question)
+    }
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const text = ctx.out.lines.join('\n')
+    const explained = ctx.out.lines.slice(0, linesWhenConfirmAsked).join('\n')
+    // Everything below had been said by the time the word was asked for — not after.
+    expect(explained).toContain(`cualquier archivo de tu carpeta personal (${homedir()})`)
+    expect(explained).toMatch(/cualquier persona a la que le des permiso de preguntarte puede preguntar por\ncualquier otro archivo de tu carpeta personal/)
+    expect(explained).toContain('caja fuerte')
+    expect(explained).toContain('tu llave de AgentBridge')
+    expect(explained).toMatch(/tus contraseñas y llaves/)
+    expect(explained).toMatch(/tus archivos \.env/)
+    expect(explained).toContain('tu Claude de todos los días')
+    expect(explained).toMatch(/archivos del sistema.*siguen cerrados/)
+    expect((await savedConfig()).scope).toEqual({ kind: 'home' })
+    expect((await savedSettings()).permissions.additionalDirectories).toEqual([homedir()])
+    // doctor judged the file by the saved scope and found nothing to block.
+    expect(ctx.out.lines.filter((line) => line.startsWith('Falta algo:'))).toEqual([])
+    expect(text).toMatch(/Listo para contestar/)
+    expect(summaryOf(ctx)).toContain('Tu agente puede ver: toda tu carpeta personal, menos tus secretos.')
+  })
+
+  it('mode 3: anything but CONFIRMAR falls back to one folder, and says so', async () => {
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '3', 'sí', 'n'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    expect(ctx.out.lines.join('\n')).toContain('No escribiste CONFIRMAR, así que dejo solo esta carpeta (opción 1).')
+    expect((await savedConfig()).scope).toEqual({ kind: 'folder' })
+    expect((await savedSettings()).permissions.additionalDirectories).toBeUndefined()
+  })
+
+  it('mode 2: adds the folders chosen one at a time, until an empty answer', async () => {
+    const a = await folder('proyectos')
+    const b = await folder('fotos')
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', a, b, '', 'n'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    expect((await savedConfig()).scope).toEqual({ kind: 'folders', extra: [a, b] })
+    expect((await savedSettings()).permissions.additionalDirectories).toEqual([a, b])
+    expect(ctx.out.lines.filter((line) => line.startsWith('Falta algo:'))).toEqual([])
+    expect(summaryOf(ctx)).toContain('Tu agente puede ver: la carpeta compartida y 2 carpetas más.')
+  })
+
+  it('mode 2 with no folder added is one folder, said plainly', async () => {
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', '', 'n'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    expect(ctx.out.lines.join('\n')).toContain('No añadiste ninguna carpeta, así que tu agente solo va a ver esta carpeta (opción 1).')
+    expect((await savedConfig()).scope).toEqual({ kind: 'folder' })
+  })
+
+  it('mode 2: refuses a folder inside the shared one, and keeps asking', async () => {
+    const inside = join(shareDir, 'sub')
+    await mkdir(inside, { recursive: true })
+    const ok = await folder('otra')
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', inside, ok, '', 'n'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const text = ctx.out.lines.join('\n')
+    expect(text).toMatch(/No puedo añadir esa carpeta: .*sub es la carpeta compartida o está dentro de ella\./)
+    expect(text).toContain('Dime otra, o presiona Enter para terminar.')
+    expect((await savedConfig()).scope).toEqual({ kind: 'folders', extra: [ok] })
+  })
+
+  it('mode 2: refuses a folder already chosen, or inside one already chosen', async () => {
+    const a = await folder('proyectos')
+    const inA = join(a, 'uno')
+    await mkdir(inA)
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', a, a, inA, '', 'n'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const refusals = ctx.out.lines.filter((line) => line.includes('está repetida o dentro de otra carpeta extra'))
+    expect(refusals).toHaveLength(2)
+    expect((await savedConfig()).scope).toEqual({ kind: 'folders', extra: [a] })
+  })
+
+  it('mode 2: refuses a folder that contains the identity, naming the key', async () => {
+    const parent = join(root, 'con-identidad')
+    identityHome = join(parent, 'identidad')
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', parent, '', 'n'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    // scopeProblem's own sentence — not the shared-folder gate's "Ahí dentro está tu identidad".
+    expect(ctx.out.lines.join('\n')).toContain(`No puedo añadir esa carpeta: ${parent} contiene tu carpeta de identidad (tu llave secreta).`)
+    expect((await savedConfig()).scope).toEqual({ kind: 'folder' })
+  })
+
+  it('mode 2: refuses a folder that contains the dedicated profile', async () => {
+    const parent = join(root, 'con-perfil')
+    profileHome = join(parent, 'perfil')
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', parent, '', 'n'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    expect(ctx.out.lines.join('\n')).toContain(`No puedo añadir esa carpeta: ${parent} contiene el perfil dedicado del respondedor.`)
+    expect((await savedConfig()).scope).toEqual({ kind: 'folder' })
+  })
+
+  it('mode 2: refuses a folder inside the caja fuerte, whatever its capitals, since nothing in it could be read', async () => {
+    // Real-home paths as strings only: every one is refused before anything touches the disk.
+    const ssh = join(homedir(), '.ssh')
+    const shouting = join(homedir(), '.SSH', 'viejas')
+    const insideIdentity = join(identityHome, 'algo')
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', ssh, shouting, insideIdentity, 'n'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const refusals = ctx.out.lines.filter((line) => line.startsWith('No puedo añadir esa carpeta: está dentro de la caja fuerte'))
+    expect(refusals).toHaveLength(3)
+    // Three refusals in a row end the list with what was already chosen — here, nothing.
+    expect(ctx.out.lines.join('\n')).toContain('Sigo con las carpetas que ya elegiste.')
+    expect((await savedConfig()).scope).toEqual({ kind: 'folder' })
+  })
+
+  it('mode 2: refuses the personal folder itself, pointing at option 3', async () => {
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', homedir(), '', 'n'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    expect(ctx.out.lines.join('\n')).toContain('No puedo añadir esa carpeta: es tu carpeta personal, o la contiene.')
+    expect((await savedConfig()).scope).toEqual({ kind: 'folder' })
+  })
+
+  it('mode 2: refuses a folder whose name Claude Code would read as a pattern', async () => {
+    const odd = await folder('proyecto[1]')
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', odd, '', 'n'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    expect(ctx.out.lines.join('\n')).toContain(`La ruta ${odd} tiene un carácter que Claude Code tomaría como comodín`)
+    expect((await savedConfig()).scope).toEqual({ kind: 'folder' })
+  })
+
+  it('mode 2: refuses a folder that does not exist, and a file that is not a folder', async () => {
+    const missing = join(root, 'no-existe')
+    const aFile = join(root, 'un-archivo')
+    await writeFile(aFile, 'hola')
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', missing, aFile, '', 'n'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const text = ctx.out.lines.join('\n')
+    expect(text).toContain('No puedo añadir esa carpeta: no existe.')
+    expect(text).toContain('No puedo usar esa carpeta: ya existe y no es una carpeta (es un archivo).')
+    // Nothing created it.
+    await expect(access(missing)).rejects.toThrow()
+  })
+
+  it('mode 2: a risky folder needs CONFIRMAR, and anything else leaves it out', async () => {
+    const repo = await folder('trabajo')
+    await mkdir(join(repo, '.git'))
+    const other = await folder('otro-trabajo')
+    await mkdir(join(other, '.git'))
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', repo, 'no', other, 'CONFIRMAR', '', 'n'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const text = ctx.out.lines.join('\n')
+    expect(text).toMatch(/repositorio de git/)
+    expect(text).toContain('No la añadí.')
+    expect((await savedConfig()).scope).toEqual({ kind: 'folders', extra: [other] })
+  })
+
+  it('on Windows, explains that option 2 and an outside folder for option 3 are not available, and asks again', async () => {
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', '3', '1', 'n'] })
+    ctx.platform = 'win32'
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const text = ctx.out.lines.join('\n')
+    expect(text).toContain('En Windows todavía no se puede elegir varias carpetas')
+    // The temp folders lie outside the personal folder: task 1 cannot anchor them on Windows.
+    expect(text).toContain('En Windows todavía no sé proteger una carpeta fuera de tu carpeta personal')
+    expect(ctx.asked.filter((q) => q.includes(SCOPE_QUESTION))).toHaveLength(3)
+    // Refused before the explanation or the word: nothing was asked in between.
+    expect(ctx.asked.some((q) => q.includes('CONFIRMAR'))).toBe(false)
+    expect((await savedConfig()).scope).toEqual({ kind: 'folder' })
+  })
+
+  it('falls back to one folder, without ending the interview, when the answer is never understood', async () => {
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', 'x', 'y', 'z', 'n'] })
+    await expect(runSetup(ctx)).resolves.toBeUndefined()
+    ctx.expectDrained()
+    expect(ctx.out.lines.join('\n')).toContain('No entendí qué opción querías, así que dejo solo esta carpeta (opción 1).')
+    expect((await savedConfig()).scope).toEqual({ kind: 'folder' })
+  })
+
+  it('a re-run proposes the mode already chosen, and Enter keeps it', async () => {
+    const first = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '3', 'CONFIRMAR', 'n'] })
+    await runSetup(first)
+    first.expectDrained()
+
+    const second = await responderSetupContext({ answers: ['1', '', '', '', 'CONFIRMAR', 'n'] })
+    await runSetup(second)
+    second.expectDrained()
+    expect(second.asked.find((q) => q.includes(SCOPE_QUESTION))).toContain('Enter para dejar la 3, la que tienes ahora')
+    expect((await savedConfig()).scope).toEqual({ kind: 'home' })
+  })
+
+  it('a re-run in mode 2 offers the saved folders, and checks them again before keeping them', async () => {
+    const a = await folder('proyectos')
+    const b = await folder('fotos')
+    const first = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', a, b, '', 'n'] })
+    await runSetup(first)
+    first.expectDrained()
+    // Since then, one of them became a repository.
+    await mkdir(join(b, '.git'))
+
+    const second = await responderSetupContext({ answers: ['1', '', '', '', '', 'no', '', 'n'] })
+    await runSetup(second)
+    second.expectDrained()
+    expect(second.asked.find((q) => q.includes(SCOPE_QUESTION))).toContain('Enter para dejar la 2, la que tienes ahora')
+    const text = second.out.lines.join('\n')
+    expect(text).toContain('La vez pasada elegiste además estas carpetas:')
+    expect(text).toContain('No la añadí.')
+    expect((await savedConfig()).scope).toEqual({ kind: 'folders', extra: [a] })
+  })
+
+  it('going back from the whole personal folder to one folder removes the extra reach from the settings (D2)', async () => {
+    const first = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '3', 'CONFIRMAR', 'n'] })
+    await runSetup(first)
+    first.expectDrained()
+    expect((await savedSettings()).permissions.additionalDirectories).toEqual([homedir()])
+
+    const second = await responderSetupContext({ answers: ['1', '', '', '1', 'n'] })
+    await runSetup(second)
+    second.expectDrained()
+    expect((await savedSettings()).permissions.additionalDirectories).toBeUndefined()
+    expect((await savedConfig()).scope).toEqual({ kind: 'folder' })
   })
 })
