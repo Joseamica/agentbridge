@@ -1,13 +1,20 @@
 import { CLI_COMMAND } from '@agentbridge/core'
 import { spawn } from 'node:child_process'
-import { access, chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { access, chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { CliError, type CliContext, type Output } from '../context'
 import { isSameOrWithin, resolveComparablePath } from '../fs-paths'
-import { ALLOWED_EFFORTS, RESPONDER_CONFIG_FILE, SAFE_MODEL_PATTERN, type ResponderConfig } from './responder-config'
+import {
+  ALLOWED_EFFORTS,
+  RESPONDER_CONFIG_FILE,
+  SAFE_MODEL_PATTERN,
+  scopeProblem,
+  type ResponderConfig,
+  type ResponderScope,
+} from './responder-config'
 
 export const REPLY_TOOL_NAME = 'mcp__plugin_agentbridge_agentbridge__reply'
 
@@ -25,6 +32,125 @@ export const RESPONDER_DENY = [
   'Read(**/.env)',
   'Read(**/.env.*)',
 ] as const
+
+export type SettingsFile = {
+  permissions: {
+    allow: string[]
+    deny: string[]
+    additionalDirectories?: string[]
+    blockReadsOutsideWorkingDirectories: true
+  }
+}
+
+// Where the settings for a scope get their paths from. `home` and `platform` are passed in, never
+// read from `os.homedir()` / `process.platform` here, so the tests can describe any machine
+// without ever touching the real home.
+export type ScopePaths = { identityHome: string; profileHome: string; home: string; platform?: NodeJS.Platform }
+
+// The mode-3 caja fuerte: what stays unreadable when the whole personal folder is added. Fixed in
+// code — the owner decided nobody, themselves included, opens it through `setup`. Every entry is
+// anchored with `~/`: on Claude Code 2.1.282, with the home added as an additional directory, an
+// unanchored `Read(**/.env)` did not stop a direct Read of `~/proj/.env` (it returned the key),
+// while `Read(~/**/.env)` did (verificaciones.md, V6 and V7). An unanchored pattern is relative to
+// the working directory, so outside it it looks like protection and covers nothing. macOS, Linux
+// and Windows locations are all listed on every platform: a rule for a path that does not exist
+// costs nothing.
+export const CAJA_FUERTE_HOME: readonly string[] = [
+  // The owner's everyday Claude: its credentials and every conversation they ever had.
+  'Read(~/.claude/**)',
+  'Read(~/.claude.json)',
+  'Read(~/.ssh/**)',
+  'Read(~/.gnupg/**)',
+  'Read(~/.aws/**)',
+  'Read(~/.azure/**)',
+  'Read(~/.config/gcloud/**)',
+  'Read(~/.kube/**)',
+  'Read(~/.docker/**)',
+  'Read(~/.config/gh/**)',
+  'Read(~/.npmrc)',
+  'Read(~/.pypirc)',
+  'Read(~/.netrc)',
+  'Read(~/.git-credentials)',
+  'Read(~/Library/Keychains/**)',
+  'Read(~/Library/Cookies/**)',
+  'Read(~/Library/Application Support/Google/Chrome/**)',
+  'Read(~/Library/Application Support/Firefox/**)',
+  'Read(~/Library/Safari/**)',
+  'Read(~/.mozilla/**)',
+  'Read(~/.config/google-chrome/**)',
+  'Read(~/.config/chromium/**)',
+  'Read(~/.local/share/keyrings/**)',
+  // Windows keeps application state, credentials and browser profiles here, and documents never.
+  'Read(~/AppData/**)',
+  'Read(~/**/.env)',
+  'Read(~/**/.env.*)',
+  'Read(~/**/*.pem)',
+  'Read(~/**/*.key)',
+  'Read(~/**/*.p12)',
+  'Read(~/**/*.pfx)',
+]
+
+// The secret-file patterns denied inside every extra folder of mode 2 — the same files the mode-3
+// list denies anywhere under `~`, anchored to each folder instead.
+const SECRET_FILE_TAILS = ['**/.env', '**/.env.*', '**/*.pem', '**/*.key', '**/*.p12', '**/*.pfx'] as const
+
+// Characters that make a path in a permission rule a pattern instead of a literal. A folder named
+// `proj[1]` would turn `//…/proj[1]/**` into a character class that never matches the real
+// folder — the rule would be written, pass every check, and protect nothing, the same failure as
+// V6. Refused rather than escaped: whether Claude Code honours an escape here is unverified. A
+// backslash is one too, except on Windows, where it is the path separator.
+const GLOB_CHARACTERS = /[*?[\]{}]/
+const GLOB_CHARACTERS_POSIX = /[*?[\]{}\\]/
+
+// Turns an absolute path into the anchored form of a rule. On macOS and Linux that is `//<path>`
+// (V1: `Read(//<abs>/extra/secret/**)` refused on the real binary). On Windows it is unverified
+// how a drive-letter path is anchored, and a guessed form that silently matches nothing is worse
+// than no feature — so a path under the home is written with `~/`, the form mode 3 already rests
+// on, and anything else is refused.
+function anchor(path: string, o: ScopePaths): string {
+  const windows = (o.platform ?? process.platform) === 'win32'
+  if ((windows ? GLOB_CHARACTERS : GLOB_CHARACTERS_POSIX).test(path)) {
+    throw new CliError(
+      `La ruta ${path} tiene un carácter que Claude Code tomaría como comodín (* ? [ ] { }${windows ? '' : ' o \\'}), así que no puedo protegerla bien. Cambia el nombre de esa carpeta o elige otra.`,
+    )
+  }
+  if (!windows) return `/${path}`
+  const home = o.home.replace(/[\\/]+$/, '')
+  const lowerPath = path.toLowerCase()
+  const lowerHome = home.toLowerCase()
+  if (lowerPath.startsWith(`${lowerHome}\\`) || lowerPath.startsWith(`${lowerHome}/`)) {
+    return `~/${path.slice(home.length + 1).replaceAll('\\', '/')}`
+  }
+  throw new CliError(
+    `En Windows todavía no sé proteger una carpeta fuera de tu carpeta personal (${path}). Deja tu identidad y el perfil dedicado dentro de tu carpeta personal, o elige solo la carpeta compartida.`,
+  )
+}
+
+// Mode 2's refusal on Windows, said once so setupResponder and the inspector say the same thing.
+const FOLDERS_ON_WINDOWS =
+  'En Windows todavía no se puede elegir varias carpetas: no está comprobado cómo proteger los secretos dentro de cada carpeta extra. Elige solo esta carpeta (opción 1) o toda tu carpeta personal menos tus secretos (opción 3).'
+
+// Every deny rule a scope adds on top of the mode-1 base. Mode 1 adds none: its only readable
+// directory is the working directory, where the unanchored base rules do hold. Modes 2 and 3 deny
+// the identity home and the dedicated profile by their real location, wherever that is — a
+// custom AGENTBRIDGE_HOME or --profile outside the default place must not fall out of the list.
+export function cajaFuerteFor(scope: ResponderScope, o: ScopePaths): string[] {
+  if (scope.kind === 'folder') return []
+  if (scope.kind === 'folders' && (o.platform ?? process.platform) === 'win32') throw new CliError(FOLDERS_ON_WINDOWS)
+  const own = [`Read(${anchor(o.identityHome, o)}/**)`, `Read(${anchor(o.profileHome, o)}/**)`]
+  if (scope.kind === 'home') return [...CAJA_FUERTE_HOME, ...own]
+  const perFolder = scope.extra.flatMap((dir) => {
+    const anchored = anchor(dir, o)
+    return SECRET_FILE_TAILS.map((tail) => `Read(${anchored}/${tail})`)
+  })
+  return [...own, ...perFolder]
+}
+
+function additionalDirectoriesFor(scope: ResponderScope, o: ScopePaths): string[] {
+  if (scope.kind === 'folders') return [...scope.extra]
+  if (scope.kind === 'home') return [o.home]
+  return []
+}
 
 // The real fence is `permissions.blockReadsOutsideWorkingDirectories: true` below — nested
 // INSIDE `permissions`, not a sibling of it. This placement is load-bearing: Claude Code's
@@ -44,11 +170,27 @@ export const RESPONDER_DENY = [
 // readable through it. Never put real secrets in the shared folder; do not add per-path deny
 // rules for the home directory here — next to a real working-directory fence they would be
 // theatre.
-export function responderSettings() {
+export function responderSettings(scope: ResponderScope, o: ScopePaths): SettingsFile {
+  // Mode 1 is written exactly as 0.3 wrote it, key for key and in the same order, so the file on
+  // every existing install is byte-identical to what setupResponder now produces and nobody is
+  // told their permissions changed when they did not.
+  if (scope.kind === 'folder') {
+    return {
+      permissions: {
+        allow: [REPLY_TOOL_NAME],
+        deny: [...RESPONDER_DENY],
+        blockReadsOutsideWorkingDirectories: true,
+      },
+    }
+  }
+  const caja = cajaFuerteFor(scope, o)
   return {
     permissions: {
       allow: [REPLY_TOOL_NAME],
-      deny: [...RESPONDER_DENY],
+      deny: [...RESPONDER_DENY, ...caja],
+      // Widens the set of working directories; the fence below stays on for everything else
+      // (V2: with the home added, `/private/etc/hosts` was still refused).
+      additionalDirectories: additionalDirectoriesFor(scope, o),
       blockReadsOutsideWorkingDirectories: true,
     },
   }
@@ -62,12 +204,26 @@ export function responderSettings() {
 // place. `problems` is empty when the fence is intact; `detail` is what to say when it is.
 export type ResponderSettingsReport = { problems: string[]; detail: string }
 
-export async function inspectResponderSettings(profileHome: string): Promise<ResponderSettingsReport> {
-  type SettingsFile = {
-    permissions?: { allow?: string[]; deny?: string[]; blockReadsOutsideWorkingDirectories?: boolean }
+// A long list of missing rules (a mode-3 scope over a mode-1 file lacks thirty-odd) is shortened
+// so the sentence `responder` prints stays readable; the first few name what kind of rule is gone.
+function listSome(items: string[]): string {
+  return items.length <= 4 ? items.join(', ') : `${items.slice(0, 4).join(', ')} y ${items.length - 4} más`
+}
+
+// Checks the file against the scope it is supposed to enforce, exactly (D3). Too little is a
+// problem, and so is too much: an `additionalDirectories` entry the scope does not call for is the
+// D2 hazard — a profile switched from mode 3 back to mode 1 whose file still lets the whole home
+// through, while every mode-1 deny rule and the fence look perfectly fine.
+export async function inspectResponderSettings(
+  profileHome: string,
+  scope: ResponderScope,
+  o: { identityHome: string; home: string; platform?: NodeJS.Platform },
+): Promise<ResponderSettingsReport> {
+  type ReadSettings = {
+    permissions?: { allow?: string[]; deny?: string[]; additionalDirectories?: string[]; blockReadsOutsideWorkingDirectories?: boolean }
   }
   const settingsPath = join(resolve(profileHome), 'settings.json')
-  let settings: SettingsFile | null = null
+  let settings: ReadSettings | null = null
   // Missing and corrupt are different problems — "you never ran setup-responder" vs. "someone
   // hand-edited this and broke the JSON" — and deserve different Spanish messages, not the
   // same "no existe" for both. The corrupt case is the one that matters most: `claude` itself
@@ -77,7 +233,7 @@ export async function inspectResponderSettings(profileHome: string): Promise<Res
   try {
     const text = await readFile(settingsPath, 'utf8')
     try {
-      settings = JSON.parse(text) as SettingsFile
+      settings = JSON.parse(text) as ReadSettings
     } catch {
       settingsProblem = `${settingsPath} existe pero no es JSON válido`
     }
@@ -85,25 +241,52 @@ export async function inspectResponderSettings(profileHome: string): Promise<Res
     settingsProblem =
       (err as NodeJS.ErrnoException).code === 'ENOENT' ? `no existe ${settingsPath}` : `no se pudo leer ${settingsPath}`
   }
+  // What the scope requires, computed by the writer itself. A scope this machine cannot enforce
+  // (mode 2 on Windows, a folder name with a glob character) is a problem to report, not a crash:
+  // doctor has to print a verdict and responder has to refuse in Spanish.
+  let expected: SettingsFile | null = null
+  let scopeError: string | null = null
+  try {
+    expected = responderSettings(scope, { ...o, profileHome: resolve(profileHome) })
+  } catch (err) {
+    if (!(err instanceof CliError)) throw err
+    scopeError = err.message
+  }
   const allow = settings?.permissions?.allow ?? []
   const deny = settings?.permissions?.deny ?? []
-  const missingDeny = RESPONDER_DENY.filter((rule) => !deny.includes(rule))
+  const dirs = settings?.permissions?.additionalDirectories ?? []
+  const requiredDeny = expected?.permissions.deny ?? [...RESPONDER_DENY]
+  const requiredDirs = expected?.permissions.additionalDirectories ?? []
+  const missingBase = RESPONDER_DENY.filter((rule) => !deny.includes(rule))
+  const missingCaja = requiredDeny.filter((rule) => !(RESPONDER_DENY as readonly string[]).includes(rule) && !deny.includes(rule))
+  const extraDirs = dirs.filter((d) => !requiredDirs.includes(d))
+  const missingDirs = requiredDirs.filter((d) => !dirs.includes(d))
   const extraAllow = allow.filter((rule) => rule !== REPLY_TOOL_NAME)
   // Read from nested inside `permissions`, never from the top level — see the comment on
   // responderSettings() above. A copy beside `permissions` is accepted in silence and never
   // engages, so reading it from there would report a genuinely unfenced responder as fine.
   const fenced = settings?.permissions?.blockReadsOutsideWorkingDirectories === true
   const problems: string[] = []
+  if (scopeError) problems.push(scopeError)
   if (settingsProblem) {
     problems.push(settingsProblem)
   } else {
-    if (missingDeny.length) problems.push(`faltan denegaciones: ${missingDeny.join(', ')}`)
+    if (missingBase.length) problems.push(`faltan denegaciones: ${missingBase.join(', ')}`)
+    if (missingCaja.length) problems.push(`faltan protecciones de la caja fuerte: ${listSome(missingCaja)}`)
+    if (extraDirs.length) problems.push(`carpetas legibles que no elegiste: ${extraDirs.join(', ')}`)
+    if (missingDirs.length) problems.push(`faltan carpetas que elegiste: ${missingDirs.join(', ')}`)
     if (extraAllow.length) problems.push(`permisos de más: ${extraAllow.join(', ')}`)
     if (!fenced) problems.push('permissions.blockReadsOutsideWorkingDirectories no está en true')
   }
+  const reach =
+    scope.kind === 'folder'
+      ? 'lecturas limitadas a la carpeta de trabajo'
+      : scope.kind === 'home'
+        ? 'lecturas limitadas a la carpeta de trabajo y a tu carpeta personal, sin la caja fuerte'
+        : `lecturas limitadas a la carpeta de trabajo y ${scope.extra.length} carpeta(s) más`
   return {
     problems,
-    detail: `Deniega ${deny.join(', ')}; permite solo ${allow.join(', ') || 'nada'}; lecturas limitadas a la carpeta de trabajo`,
+    detail: `Deniega ${deny.join(', ')}; permite solo ${allow.join(', ') || 'nada'}; ${reach}`,
   }
 }
 
@@ -221,6 +404,11 @@ export async function setupResponder(o: {
   // would duplicate — or, once already logged in, contradict — that summary. Defaults to true so
   // every existing (standalone) caller is unaffected.
   printNextSteps?: boolean
+  // What the answering agent may read. Defaults to one folder, what every caller before 0.4 meant.
+  scope?: ResponderScope
+  // Injected so tests describe a machine without touching the real one; default to this one.
+  home?: string
+  platform?: NodeJS.Platform
 }): Promise<{ configPath: string; claudeConfigDir: string; settingsPath: string }> {
   const shareDir = resolve(o.shareDir)
   const repoDir = resolve(o.repoDir)
@@ -259,19 +447,48 @@ export async function setupResponder(o: {
     throw new CliError(`Esfuerzo no soportado: "${effort}". Usa uno de: ${ALLOWED_EFFORTS.join(', ')}`)
   }
 
+  // Extra folders are stored resolved, like the shared folder, and checked against real paths
+  // here — the same check readResponderConfig repeats on every read against the stored strings.
+  // Everything that can refuse runs before the first directory or file is created, so a refused
+  // scope leaves nothing half-written behind.
+  const requested = o.scope ?? { kind: 'folder' }
+  const scope: ResponderScope = requested.kind === 'folders' ? { kind: 'folders', extra: requested.extra.map((d) => resolve(d)) } : requested
+  if (scope.kind === 'folders') {
+    const extraReal = await Promise.all(scope.extra.map((d) => resolveComparablePath(d)))
+    const problem = scopeProblem(
+      { kind: 'folders', extra: extraReal },
+      { shareDir: shareReal, identityHome: identityReal, profileHome: profileReal },
+    )
+    if (problem) throw new CliError(`No puedo usar esas carpetas: ${problem}.`)
+  }
+  const settings = responderSettings(scope, {
+    identityHome,
+    profileHome,
+    home: o.home ?? homedir(),
+    platform: o.platform ?? process.platform,
+  })
+
   await ensureOwnedDir(profileHome, 0o700)
   const claudeConfigDir = join(profileHome, 'claude')
   await ensureOwnedDir(claudeConfigDir, 0o700)
   await ensureOwnedDir(shareDir, 0o700)
 
+  // Always written (D2). It used to be left alone once it existed, which is safe while there is
+  // only one mode and wrong the moment there are three: switching from the whole personal folder
+  // back to one folder would keep `additionalDirectories: [home]` on disk and say nothing. The
+  // file is generated and owned by AgentBridge, so the scope decides its content every time, and
+  // the person hears about it only when the content actually changed. Written to a temporary
+  // name and renamed so an interrupted run never leaves a half-written file behind — `claude`
+  // accepts a corrupt settings file in silence.
   const settingsPath = join(profileHome, 'settings.json')
-  if (await exists(settingsPath)) {
-    o.out.log(
-      `Ya existe ${settingsPath}; no lo toqué. Verifica que siga denegando Bash, Edit, Write, NotebookEdit, WebFetch, WebSearch, Agent y lecturas de .env, y que permissions.blockReadsOutsideWorkingDirectories esté en true (dentro de "permissions", no junto a él).`,
-    )
-  } else {
-    await writeFile(settingsPath, `${JSON.stringify(responderSettings(), null, 2)}\n`, { mode: 0o600 })
-    await chmod(settingsPath, 0o600)
+  const settingsText = `${JSON.stringify(settings, null, 2)}\n`
+  const previous = await readFile(settingsPath, 'utf8').catch(() => null)
+  const temporary = `${settingsPath}.${process.pid}.tmp`
+  await writeFile(temporary, settingsText, { mode: 0o600 })
+  await chmod(temporary, 0o600)
+  await rename(temporary, settingsPath)
+  if (previous !== null && previous !== settingsText) {
+    o.out.log('Actualicé los permisos del perfil dedicado para que coincidan con lo que elegiste.')
   }
 
   const personaPath = join(shareDir, 'CLAUDE.md')
@@ -282,7 +499,7 @@ export async function setupResponder(o: {
   }
 
   const configPath = join(profileHome, RESPONDER_CONFIG_FILE)
-  const config: ResponderConfig = { version: 1, shareDir, identityHome, model, effort }
+  const config: ResponderConfig = { version: 2, shareDir, identityHome, model, effort, scope }
   await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 })
   await chmod(configPath, 0o600)
 

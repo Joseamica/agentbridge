@@ -7,12 +7,15 @@ import { memoryOutput } from '../src/context'
 import { readResponderConfig, responderArgs, runResponder, RESPONDER_CONFIG_FILE } from '../src/commands/responder'
 import { responderSettings } from '../src/commands/setup-responder'
 
+// Mode 1 ignores the paths entirely; they are here only because the signature takes them.
+const modeOne = () => responderSettings({ kind: 'folder' }, { identityHome: '/tmp/identidad', profileHome: '/tmp/perfil', home: '/tmp/casa' })
+
 // `settingsText` is what lands in the profile's settings.json — the file `--settings` points
 // `claude` at, and the only thing that actually fences the answering session. It defaults to
 // exactly what setupResponder writes, because every test that reaches the spawn needs a profile
 // that is genuinely safe to start; the fence tests below pass their own broken shapes, and
 // `null` leaves the file out altogether.
-async function profileWith(config: unknown, settingsText: string | null = JSON.stringify(responderSettings())): Promise<string> {
+async function profileWith(config: unknown, settingsText: string | null = JSON.stringify(modeOne())): Promise<string> {
   const profileHome = await mkdtemp(join(tmpdir(), 'ab-responder-'))
   await writeFile(join(profileHome, RESPONDER_CONFIG_FILE), JSON.stringify(config), { mode: 0o600 })
   if (settingsText !== null) await writeFile(join(profileHome, 'settings.json'), settingsText, { mode: 0o600 })
@@ -22,9 +25,18 @@ async function profileWith(config: unknown, settingsText: string | null = JSON.s
 const goodConfig = { version: 1, shareDir: '/tmp/compartido', identityHome: '/tmp/identidad', model: 'sonnet', effort: 'low' }
 
 describe('responder configuration', () => {
-  it('reads the config setup wrote', async () => {
+  // Every 0.3 install has a version-1 file and no `scope`. It must keep working without re-running
+  // setup, and it means exactly what it meant then: one folder.
+  it('reads a version-1 config as mode 1', async () => {
     const profileHome = await profileWith(goodConfig)
-    await expect(readResponderConfig(profileHome)).resolves.toEqual(goodConfig)
+    await expect(readResponderConfig(profileHome)).resolves.toEqual({ ...goodConfig, version: 2, scope: { kind: 'folder' } })
+  })
+
+  it('reads a version-2 config with each of the three scopes', async () => {
+    for (const scope of [{ kind: 'folder' }, { kind: 'home' }, { kind: 'folders', extra: ['/tmp/otra', '/srv/notas'] }]) {
+      const profileHome = await profileWith({ ...goodConfig, version: 2, scope })
+      await expect(readResponderConfig(profileHome)).resolves.toEqual({ ...goodConfig, version: 2, scope })
+    }
   })
 
   it('says to run setup when the profile was never prepared', async () => {
@@ -46,8 +58,37 @@ describe('responder configuration', () => {
   })
 
   it('refuses a config from a future version instead of guessing its shape', async () => {
-    const profileHome = await profileWith({ ...goodConfig, version: 2 })
+    const profileHome = await profileWith({ ...goodConfig, version: 3, scope: { kind: 'folder' } })
     await expect(readResponderConfig(profileHome)).rejects.toThrow(/versión/i)
+  })
+
+  // The scope decides which folders the answering session can read, so a hand-edited or
+  // half-written value is refused, never guessed at — the same discipline as the two paths above.
+  describe('a version-2 scope', () => {
+    const v2 = (scope: unknown) => ({ ...goodConfig, version: 2, scope })
+    const refuses = async (scope: unknown, pattern: RegExp) => {
+      const profileHome = await profileWith(v2(scope))
+      await expect(readResponderConfig(profileHome)).rejects.toThrow(pattern)
+    }
+
+    it('is required', () => refuses(undefined, /alcance/i))
+    it('must have a known kind', () => refuses({ kind: 'todo' }, /alcance/i))
+    it('needs at least one extra folder in mode 2', () => refuses({ kind: 'folders', extra: [] }, /alcance/i))
+    it('needs every extra folder to be an absolute path', () => refuses({ kind: 'folders', extra: ['otra'] }, /absoluta/i))
+    it('refuses an extra folder that is not a string', () => refuses({ kind: 'folders', extra: [7] }, /alcance/i))
+    it('refuses the same folder twice', () => refuses({ kind: 'folders', extra: ['/tmp/otra', '/tmp/otra'] }, /repetid|dentro de otra/i))
+    it('refuses an extra folder inside another extra folder', () =>
+      refuses({ kind: 'folders', extra: ['/tmp/otra', '/tmp/otra/sub'] }, /repetid|dentro de otra/i))
+    it('refuses an extra folder equal to the shared folder', () => refuses({ kind: 'folders', extra: ['/tmp/compartido'] }, /compartida/i))
+    it('refuses an extra folder inside the shared folder', () =>
+      refuses({ kind: 'folders', extra: ['/tmp/compartido/sub'] }, /compartida/i))
+    // The fence is what keeps the key and the database away from a question. An extra folder
+    // that contains them puts them back inside the readable set.
+    it('refuses an extra folder that contains the identity home', () => refuses({ kind: 'folders', extra: ['/tmp'] }, /identidad/i))
+    it('refuses an extra folder that contains the dedicated profile', async () => {
+      const profileHome = await profileWith(v2({ kind: 'folders', extra: [tmpdir()] }))
+      await expect(readResponderConfig(profileHome)).rejects.toThrow(/perfil/i)
+    })
   })
 
   // Review round 1, Important 2: `model`/`effort` were re-validated on read but the two path
@@ -251,7 +292,7 @@ describe('runResponder', () => {
     })
 
     it('refuses to start when a deny rule is gone, naming it, and never spawns', async () => {
-      const weakened = responderSettings()
+      const weakened = modeOne()
       weakened.permissions.deny = weakened.permissions.deny.filter((rule) => rule !== 'Bash')
       const { error, spawned } = await startWith(JSON.stringify(weakened))
       expect((error as Error).message).toContain('Bash')
@@ -259,7 +300,7 @@ describe('runResponder', () => {
     })
 
     it('refuses to start when the read fence is not true, and never spawns', async () => {
-      const unfenced = responderSettings()
+      const unfenced = modeOne() as { permissions: { blockReadsOutsideWorkingDirectories: boolean } }
       unfenced.permissions.blockReadsOutsideWorkingDirectories = false
       const { error, spawned } = await startWith(JSON.stringify(unfenced))
       expect((error as Error).message).toContain('blockReadsOutsideWorkingDirectories')
@@ -271,7 +312,7 @@ describe('runResponder', () => {
     // so a checker that reads it from the top level would wave through a genuinely unfenced
     // profile. This is the shape that proves the check reads the nested place.
     it('refuses a fence written beside `permissions` instead of inside it', async () => {
-      const misplaced = responderSettings() as Record<string, unknown> & { permissions: Record<string, unknown> }
+      const misplaced = modeOne() as Record<string, unknown> & { permissions: Record<string, unknown> }
       delete misplaced.permissions.blockReadsOutsideWorkingDirectories
       misplaced.blockReadsOutsideWorkingDirectories = true
       const { error, spawned } = await startWith(JSON.stringify(misplaced))

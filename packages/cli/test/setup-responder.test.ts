@@ -68,7 +68,7 @@ describe('responderSettings', () => {
   // key back out to the top level fails this test even if every other assertion in this file
   // is only comparing the written file against the same, now-wrong, function output.
   it('nests blockReadsOutsideWorkingDirectories inside permissions, where Claude Code actually reads it', () => {
-    expect(responderSettings()).toEqual({
+    expect(responderSettings({ kind: 'folder' }, { identityHome: '/x/id', profileHome: '/x/perfil', home: '/x' })).toEqual({
       permissions: {
         allow: ['mcp__plugin_agentbridge_agentbridge__reply'],
         deny: ['Bash', 'Edit', 'Write', 'NotebookEdit', 'WebFetch', 'WebSearch', 'Agent', 'Read(**/.env)', 'Read(**/.env.*)'],
@@ -180,7 +180,7 @@ describe('setupResponder', () => {
 
     expect(result.configPath).toBe(join(home, RESPONDER_CONFIG_FILE))
     const config = JSON.parse(await readFile(result.configPath, 'utf8'))
-    expect(config).toEqual({ version: 1, shareDir, identityHome, model: 'sonnet', effort: 'low' })
+    expect(config).toEqual({ version: 2, shareDir, identityHome, model: 'sonnet', effort: 'low', scope: { kind: 'folder' } })
     expect((await stat(result.configPath)).mode & 0o777).toBe(0o600)
 
     // The shared folder must not be left world-readable by the default umask on a
@@ -229,14 +229,90 @@ describe('setupResponder', () => {
     expect(out.lines.join('\n')).toContain('Ya existe')
   })
 
-  it('keeps an existing settings.json in the responder home untouched', async () => {
+  // D2. settings.json used to be left alone once it existed. With scopes that is the dangerous
+  // direction: someone who switches from their whole personal folder back to one folder would
+  // keep `additionalDirectories: [home]` on disk, with nothing said. The file is AgentBridge's
+  // own, so it is rewritten from the scope every time.
+  it('rewrites a mode-3 settings.json when the scope is now mode 1, and says so', async () => {
     await mkdir(home, { recursive: true })
-    const hardened = JSON.stringify({ permissions: { allow: [], deny: ['Bash', 'Read'] }, hooks: { custom: true } })
-    await writeFile(join(home, 'settings.json'), hardened)
+    const personal = join(root, 'casa')
+    const wide = responderSettings({ kind: 'home' }, { identityHome, profileHome: home, home: personal })
+    await writeFile(join(home, 'settings.json'), `${JSON.stringify(wide, null, 2)}\n`)
     const out = memoryOutput()
-    const result = await setupResponder({ shareDir, repoDir, profileHome: home, identityHome, run: runner, out })
-    expect(await readFile(result.settingsPath, 'utf8')).toBe(hardened)
-    expect(out.lines.join('\n')).toContain('Ya existe')
+    const result = await setupResponder({ shareDir, repoDir, profileHome: home, identityHome, home: personal, scope: { kind: 'folder' }, run: runner, out })
+    const written = JSON.parse(await readFile(result.settingsPath, 'utf8'))
+    expect(written.permissions.additionalDirectories).toBeUndefined()
+    expect(written).toEqual(responderSettings({ kind: 'folder' }, { identityHome, profileHome: home, home: personal }))
+    expect((await stat(result.settingsPath)).mode & 0o777).toBe(0o600)
+    expect(out.lines.join('\n')).toMatch(/Actualicé los permisos/)
+  })
+
+  it('says nothing about the permissions when the file already matches', async () => {
+    await setupResponder({ shareDir, repoDir, profileHome: home, identityHome, run: runner, out: memoryOutput() })
+    const out = memoryOutput()
+    await setupResponder({ shareDir, repoDir, profileHome: home, identityHome, run: runner, out })
+    expect(out.lines.join('\n')).not.toMatch(/Actualicé los permisos/)
+  })
+
+  it('writes the settings and responder.json for the whole personal folder', async () => {
+    const personal = join(root, 'casa')
+    const result = await setupResponder({ shareDir, repoDir, profileHome: home, identityHome, home: personal, scope: { kind: 'home' }, run: runner, out: memoryOutput() })
+    const written = JSON.parse(await readFile(result.settingsPath, 'utf8'))
+    expect(written.permissions.additionalDirectories).toEqual([personal])
+    expect(written.permissions.blockReadsOutsideWorkingDirectories).toBe(true)
+    await expect(readResponderConfig(home)).resolves.toMatchObject({ version: 2, scope: { kind: 'home' } })
+  })
+
+  it('writes several folders resolved, and reads them back', async () => {
+    const extra = join(root, 'proyectos')
+    const result = await setupResponder({
+      shareDir,
+      repoDir,
+      profileHome: home,
+      identityHome,
+      scope: { kind: 'folders', extra: [`${extra}/`] },
+      platform: 'darwin',
+      run: runner,
+      out: memoryOutput(),
+    })
+    const written = JSON.parse(await readFile(result.settingsPath, 'utf8'))
+    expect(written.permissions.additionalDirectories).toEqual([extra])
+    await expect(readResponderConfig(home)).resolves.toMatchObject({ scope: { kind: 'folders', extra: [extra] } })
+  })
+
+  // The same guard readResponderConfig runs on the way in, run on the way out too, against real
+  // paths: an extra folder that holds the key must never reach disk in the first place.
+  it('refuses an extra folder that contains the identity home, before writing anything', async () => {
+    const err = await setupResponder({
+      shareDir,
+      repoDir,
+      profileHome: home,
+      identityHome,
+      scope: { kind: 'folders', extra: [root] },
+      platform: 'darwin',
+      run: runner,
+      out: memoryOutput(),
+    }).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(CliError)
+    await expect(access(join(home, 'settings.json'))).rejects.toThrow()
+    await expect(access(join(home, RESPONDER_CONFIG_FILE))).rejects.toThrow()
+  })
+
+  it('refuses several folders on Windows, before writing anything', async () => {
+    const err = await setupResponder({
+      shareDir,
+      repoDir,
+      profileHome: home,
+      identityHome,
+      scope: { kind: 'folders', extra: [join(root, 'proyectos')] },
+      platform: 'win32',
+      run: runner,
+      out: memoryOutput(),
+    }).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(CliError)
+    expect((err as CliError).message).toMatch(/Windows/)
+    await expect(access(join(home, 'settings.json'))).rejects.toThrow()
+    expect(calls).toEqual([])
   })
 
   it('does not re-permission a pre-existing home directory (a misaimed --profile is not silently narrowed)', async () => {
@@ -437,12 +513,12 @@ describe('setupResponder', () => {
     const spaced = join(root, 'mi respondedor')
     const result = await setupResponder({ shareDir, repoDir, profileHome: spaced, identityHome, run: runner, out: memoryOutput() })
     expect(result.configPath).toBe(join(spaced, RESPONDER_CONFIG_FILE))
-    await expect(readResponderConfig(spaced)).resolves.toEqual({ version: 1, shareDir, identityHome, model: 'sonnet', effort: 'low' })
+    await expect(readResponderConfig(spaced)).resolves.toEqual({ version: 2, shareDir, identityHome, model: 'sonnet', effort: 'low', scope: { kind: 'folder' } })
 
     const withApostrophe = join(root, "o'brien")
     const result2 = await setupResponder({ shareDir, repoDir, profileHome: withApostrophe, identityHome, run: runner, out: memoryOutput() })
     expect(result2.configPath).toBe(join(withApostrophe, RESPONDER_CONFIG_FILE))
-    await expect(readResponderConfig(withApostrophe)).resolves.toEqual({ version: 1, shareDir, identityHome, model: 'sonnet', effort: 'low' })
+    await expect(readResponderConfig(withApostrophe)).resolves.toEqual({ version: 2, shareDir, identityHome, model: 'sonnet', effort: 'low', scope: { kind: 'folder' } })
   })
 })
 

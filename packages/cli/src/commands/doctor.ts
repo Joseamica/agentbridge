@@ -18,6 +18,7 @@ import {
 } from '@agentbridge/core'
 import { randomUUID } from 'node:crypto'
 import { access, lstat, readdir, readFile, readlink, realpath, stat } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { dirname, join, resolve, sep } from 'node:path'
 import { parseArgs } from 'node:util'
 import { CliError, type CliContext } from '../context'
@@ -453,7 +454,7 @@ async function addShareChecks(
 // is in the picture at all.
 async function addProfileChecks(
   add: (name: string, ok: boolean, detail: string, blocking: boolean, security?: boolean) => void,
-  o: { profileHome: string; repoDir?: string; run: CommandRunner },
+  o: { profileHome: string; identityHome: string; repoDir?: string; run: CommandRunner },
 ): Promise<void> {
   // Everything below lives under `profileHome`, independent of whether a shared folder was given —
   // a profile with no settings.json (or a weakened one) must fail loudly even when doctor is run
@@ -461,7 +462,14 @@ async function addProfileChecks(
   // The reading itself lives beside the writer, in setup-responder.ts: `responder` refuses to
   // start on exactly this verdict (whole-branch review, Important 1), and a second copy here
   // would be free to drift from the one that decides whether a session is safe to spawn.
-  const fence = await inspectResponderSettings(o.profileHome)
+  // Checked against the scope responder.json records, so doctor and `responder` judge the same
+  // file by the same standard. With no readable responder.json there is no scope to hold it to,
+  // and one folder is the strictest reading — that failure is reported on its own line below.
+  const saved = await readResponderConfig(o.profileHome).catch(() => null)
+  const fence = await inspectResponderSettings(o.profileHome, saved?.scope ?? { kind: 'folder' }, {
+    identityHome: saved?.identityHome ?? o.identityHome,
+    home: homedir(),
+  })
   add('Permisos del respondedor', fence.problems.length === 0, fence.problems.length ? fence.problems.join(' · ') : fence.detail, true, true)
 
   // What `start.sh`'s own executable-bit check used to stand in for: proof that this profile
@@ -663,7 +671,7 @@ export async function runDoctor(o: {
   // one check that needs both (the cross-containment check) lives inside addShareChecks and
   // only fires when profileHome is also present — see the comment there.
   if (o.shareDir) await addShareChecks(add, { shareDir: o.shareDir, profileHome: o.profileHome })
-  if (o.profileHome) await addProfileChecks(add, { profileHome: o.profileHome, repoDir: o.repoDir, run })
+  if (o.profileHome) await addProfileChecks(add, { profileHome: o.profileHome, identityHome: o.identityHome, repoDir: o.repoDir, run })
   return checks
 }
 
