@@ -536,7 +536,7 @@ const SCOPE_QUESTION_LINES = [
   '¿Qué puede ver tu agente cuando alguien te pregunta?',
   '  1) Solo esta carpeta (recomendado)',
   '  2) Esta carpeta y otras que elijas',
-  '  3) Toda tu carpeta personal, menos tus secretos',
+  '  3) Toda tu carpeta personal, menos la caja fuerte',
 ]
 
 type ScopeChoice = 1 | 2 | 3
@@ -557,7 +557,7 @@ function parseScopeChoice(raw: string, onEnter: ScopeChoice): ScopeChoice | null
 // The summary line. One line, because it is the part people scroll back to.
 export function scopeSummary(scope: ResponderScope): string {
   if (scope.kind === 'folder') return 'Tu agente puede ver: solo la carpeta compartida.'
-  if (scope.kind === 'home') return 'Tu agente puede ver: toda tu carpeta personal, menos tus secretos.'
+  if (scope.kind === 'home') return 'Tu agente puede ver: toda tu carpeta personal, menos la caja fuerte.'
   const more = scope.extra.length === 1 ? 'una carpeta más' : `${scope.extra.length} carpetas más`
   return `Tu agente puede ver: la carpeta compartida y ${more}.`
 }

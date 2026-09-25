@@ -1103,7 +1103,7 @@ describe('what the answering agent can see', () => {
     expect(question).toBeDefined()
     expect(question).toContain('1) Solo esta carpeta (recomendado)')
     expect(question).toContain('2) Esta carpeta y otras que elijas')
-    expect(question).toContain('3) Toda tu carpeta personal, menos tus secretos')
+    expect(question).toContain('3) Toda tu carpeta personal, menos la caja fuerte')
     expect(question).toContain('Enter para la 1')
     expect((await savedConfig()).scope).toEqual({ kind: 'folder' })
     expect((await savedSettings()).permissions.additionalDirectories).toBeUndefined()
@@ -1147,7 +1147,7 @@ describe('what the answering agent can see', () => {
     // doctor judged the file by the saved scope and found nothing to block.
     expect(ctx.out.lines.filter((line) => line.startsWith('Falta algo:'))).toEqual([])
     expect(text).toMatch(/Listo para contestar/)
-    expect(summaryOf(ctx)).toContain('Tu agente puede ver: toda tu carpeta personal, menos tus secretos.')
+    expect(summaryOf(ctx)).toContain('Tu agente puede ver: toda tu carpeta personal, menos la caja fuerte.')
     expect(text).toContain(`Si cambias de opinión, vuelve a correr "${CLI_COMMAND} setup" y elige la opción 1.`)
   })
 

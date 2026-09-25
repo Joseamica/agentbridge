@@ -156,7 +156,7 @@ function anchor(path: string, o: ScopePaths): string {
 
 // Mode 2's refusal on Windows, said once so setupResponder and the inspector say the same thing.
 const FOLDERS_ON_WINDOWS =
-  'En Windows todavía no se puede elegir varias carpetas: no está comprobado cómo proteger los secretos dentro de cada carpeta extra. Elige solo esta carpeta (opción 1) o toda tu carpeta personal menos tus secretos (opción 3).'
+  'En Windows todavía no se puede elegir varias carpetas: no está comprobado cómo proteger los secretos dentro de cada carpeta extra. Elige solo esta carpeta (opción 1) o toda tu carpeta personal menos la caja fuerte (opción 3).'
 
 // Every deny rule a scope adds on top of the mode-1 base. Mode 1 adds none: its only readable
 // directory is the working directory, where the unanchored base rules do hold. Modes 2 and 3 deny
