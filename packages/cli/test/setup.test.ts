@@ -1260,7 +1260,12 @@ describe('what the answering agent can see', () => {
     const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', homedir(), '', 'n'] })
     await runSetup(ctx)
     ctx.expectDrained()
-    expect(ctx.out.lines.join('\n')).toContain('No puedo añadir esa carpeta: es tu carpeta personal, o la contiene.')
+    const text = ctx.out.lines.join('\n')
+    expect(text).toContain('No puedo añadir esa carpeta: es tu carpeta personal, o la contiene.')
+    // Option 3 named in the words of its own label, never as closing "tus secretos": the caja
+    // fuerte closes the best-known places, not every secret a person has (task 2 ruling 3).
+    expect(text).toContain('elige la opción 3: toda tu carpeta personal, menos la caja fuerte.')
+    expect(text).not.toMatch(/tus secretos/)
     expect((await savedConfig()).scope).toEqual({ kind: 'folder' })
   })
 

@@ -799,7 +799,7 @@ async function considerExtraFolder(o: ScopeInterview, paths: ScopePaths, dir: st
   }
   if (isSameOrWithin(homeReal, dirReal)) {
     return refuse(
-      'No puedo añadir esa carpeta: es tu carpeta personal, o la contiene. Si quieres que tu agente vea toda tu carpeta personal, elige la opción 3, que deja cerrados tus secretos.',
+      'No puedo añadir esa carpeta: es tu carpeta personal, o la contiene. Si quieres que tu agente vea toda tu carpeta personal, elige la opción 3: toda tu carpeta personal, menos la caja fuerte.',
     )
   }
   // How this folder relates to the ones already on the list, said about the folder just typed.
