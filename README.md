@@ -75,9 +75,10 @@ fence holds. So the boundary is enforced by configuration, not by asking the mod
   or `.env.*` are denied there in every scope. The correct mental model is: *that folder is public
   to anyone allowed to ask you.* Curate it deliberately. Do not point it at a working repo.
 - **Project configuration that lands in that folder later** — `.claude/settings.json` hooks,
-  `.mcp.json`, `.claude/agents`, `.claude/skills`, `.claude/commands`, `CLAUDE.local.md`,
-  `AGENTS.md` — takes effect at the next session start. The `doctor` command flags all of them;
-  nothing prevents a sync client or a `git pull` from placing them.
+  `.mcp.json`, `.claude/agents`, `.claude/skills`, `.claude/commands`, `CLAUDE.local.md` — takes
+  effect at the next session start. The `doctor` command flags all of them, and an `AGENTS.md`
+  too: Claude Code 2.1.282 does not read it at all, but a later version might. Nothing prevents a
+  sync client or a `git pull` from placing them.
 
 ### What the responder can see: three scopes
 
@@ -90,7 +91,8 @@ fence holds. So the boundary is enforced by configuration, not by asking the mod
 | **3 — the whole personal folder** | the shared folder plus the home directory | the caja fuerte |
 
 The **caja fuerte** ("safe") is a fixed list in code (`CAJA_FUERTE_HOME` in
-`packages/cli/src/commands/setup-responder.ts`) that nobody can open through `setup`: the
+`packages/cli/src/commands/setup-responder.ts`) that nobody, the answerer included, can open
+through `setup`: the
 AgentBridge identity folder and the dedicated profile wherever they live, the owner's everyday
 Claude (`~/.claude`, `~/.claude.json*`, the desktop app's configuration), the best-known credential
 stores (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker`,
@@ -99,13 +101,17 @@ stores (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube
 profiles, their Linux equivalents, all of `~/AppData` on Windows, and every `.env`, `.env.*`,
 `*.pem`, `*.key`, `*.p12` and `*.pfx` under the home. It closes the best-known places, **not every
 secret a person has**: a password written in a document, mail and chats saved on disk, or a key
-file with an unusual name stay readable in scope 3.
+file with an unusual name stay readable in scope 3. It also covers only the usual locations: an
+everyday Claude run with a custom `CLAUDE_CONFIG_DIR`, or a dedicated profile left over from an
+older `--profile`, is not in the list.
 
 Scope 3 needs a typed `CONFIRMAR` after a screen that says, plainly, that anyone the answerer
-approves can then ask about any file in their personal folder outside the caja fuerte. Scope 2 is
-not offered on Windows, and scope 3 on Windows only when the shared folder, the identity and the
-profile are all inside the personal folder: how Claude Code anchors a drive-letter path in a
-permission rule is unverified, and even the `~/…` rules have not been checked on Windows.
+approves can then ask about any file in their personal folder outside the caja fuerte. **On
+Windows only scope 1 exists for now.** Scope 2 needs each extra folder's absolute path in a rule,
+and how Claude Code anchors a drive-letter path is unverified. Scope 3 rests on the `~/…` rules,
+which have never been checked on Windows, and its consent screen tells the person the caja fuerte
+stays closed: a promise nobody has checked is not made at the moment they type `CONFIRMAR`. Running
+section 8 of the acceptance runbook on a Windows machine is what would lift this.
 
 **Every rule that must hold outside the working directory is anchored** — `~/…` for the home,
 `//<absolute path>/…` per extra folder. That is the one fact this design rests on: on Claude Code
@@ -231,8 +237,11 @@ walk fully, and a tree too large to walk fully — the last two because it canno
 of the others is hiding further in. It never creates that folder silently.
 
 Next it asks what the answering agent can see — the shared folder only, that folder plus others the
-answerer names one by one (each goes through the same checks), or the whole personal folder minus
-the caja fuerte, behind a typed `CONFIRMAR`. Enter keeps what the machine already has.
+answerer names one by one, or the whole personal folder minus the caja fuerte, behind a typed
+`CONFIRMAR` (on Windows, only the first for now). Each extra folder goes through the same checks,
+less two that are not true of it: project configuration, which does not load from an additional
+directory, and symlinks, whose real target Claude Code holds to the same fence and caja fuerte.
+Enter keeps what the machine already has.
 
 Then it *performs* the rest instead of printing it. It opens Claude's login in the dedicated
 profile — the browser opens, you type your password, you come back — and afterwards checks for

@@ -43,6 +43,15 @@ describe('the docs do not ask a person to paste shell', () => {
     expect(runbook).toContain('Hay cuatro, todos en la sección 1, en S6 y en la sección 9.')
     expect(runbook.match(/^```bash$/gm) ?? []).toHaveLength(4)
   })
+
+  it('names the one shell word the other machine types, and types no other', async () => {
+    // Section 8 enters the shared folder with `cd`, outside the bash blocks (final review, M3).
+    // The runbook says so; a second such line would make that sentence untrue again.
+    const runbook = await readFile(join(ROOT, 'docs/runbooks/aceptacion-0.4.md'), 'utf8')
+    expect(runbook).toContain('más un `cd "<carpeta>"` en la sección 8')
+    const outsideBash = runbook.replace(/^```bash\n[\s\S]*?^```$/gm, '')
+    expect(outsideBash.match(/^cd .*$/gm) ?? []).toEqual(['cd "<compartida>"'])
+  })
 })
 
 describe('the docs say what the scopes do, and no more', () => {
@@ -59,7 +68,16 @@ describe('the docs say what the scopes do, and no more', () => {
     for (const doc of DOCS) {
       expect(await readFile(join(ROOT, doc), 'utf8'), doc).not.toMatch(/(menos|todos|cerrados) tus secretos/)
     }
+    // Ruling 6: what is true is that nobody opens it through `setup` — not that it "nunca se abre".
+    // Every "nadie … puede abrir" has to say through what, in the same sentence.
+    for (const doc of DOCS) {
+      const text = (await readFile(join(ROOT, doc), 'utf8')).replace(/\s+/g, ' ')
+      expect(text, doc).not.toMatch(/nunca se abre|sigue cerrad[oa] siempre/)
+      for (const sentence of text.match(/nadie (?:la )?puede abrir[^.;(]*/g) ?? []) expect(sentence, doc).toContain('setup')
+    }
     const guide = await readFile(join(ROOT, 'docs/inicio-rapido.md'), 'utf8')
+    // Ruling 5, said where a person reads it slowly.
+    expect(guide).toContain('En Windows la opción 3 todavía no está disponible.')
     expect(guide).toContain('los lugares más conocidos donde se guardan contraseñas y llaves')
     expect(guide).toContain('La caja fuerte no lo cubre todo.')
     // Mode 3's one sentence a person must understand before choosing it.
@@ -79,5 +97,14 @@ describe('the docs say what the scopes do, and no more', () => {
     for (const heading of ['### 8.2 Opción 1', '### 8.3 Opción 2', '### 8.4 Opción 3', '### 8.7 Limpieza']) {
       expect(section).toContain(heading)
     }
+  })
+
+  it('never asks for a search across the whole personal folder', async () => {
+    // Claude Code cuts every search at 20 seconds, and a real personal folder takes longer: the
+    // first real run of section 8 could not finish row 3g as written (final review, I2).
+    const runbook = await readFile(join(ROOT, 'docs/runbooks/aceptacion-0.4.md'), 'utf8')
+    const section = runbook.slice(runbook.indexOf('## 8. '), runbook.indexOf('## 9. '))
+    expect(section).toContain('| 3g | Grep de `VALOR` en `<casa>/ab-sonda` |')
+    expect(section).not.toMatch(/Grep de `VALOR` en `<casa>`/)
   })
 })

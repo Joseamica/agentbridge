@@ -23,8 +23,10 @@ sintaxis de shell, y se reconocen a simple vista: son los únicos bloques marcad
 Hay cuatro, todos en la sección 1, en S6 y en la sección 9.
 
 En la **otra** máquina, todo lo que se hace son comandos de AgentBridge, de Claude Code, de npm y
-de Node, sin una sola línea de shell: ni variables por delante de un comando, ni sustituciones,
-ni redirecciones, ni rutas a un script. Eso es a propósito, y es parte de lo que se está probando:
+de Node —más un `cd "<carpeta>"` en la sección 8, para entrar en una carpeta—, sin una sola línea
+de shell: ni variables por delante de un comando, ni sustituciones, ni redirecciones, ni rutas a
+un script. Las comillas dobles alrededor de una ruta o de una frase sí aparecen, y se escriben
+igual en PowerShell, en cmd y en la Terminal de macOS. Eso es a propósito, y es parte de lo que se está probando:
 si esa máquina es Windows —y conviene que lo sea— todos sus pasos tienen que poder copiarse tal
 cual en PowerShell. Si encuentras uno que no, eso es un hallazgo de la aceptación, no un detalle
 del documento.
@@ -154,7 +156,9 @@ Lo que te pregunta:
 - **Solo si vas a contestar:** qué puede ver tu agente — `1` solo esa carpeta, `2` esa carpeta y
   otras que elijas, `3` toda tu carpeta personal menos la caja fuerte (con `CONFIRMAR`). Para la
   primera pasada elige `1`; las otras dos se prueban en S10, S11 y en la sección 8. En la máquina
-  Windows, la `2` debe rechazarse con una frase en español y volver a la pregunta.
+  Windows, la `2` y la `3` deben rechazarse, cada una con su frase en español ("todavía no se
+  puede elegir…", ofreciendo la opción 1), y volver a la pregunta; la `3` **sin** mostrar antes la
+  pantalla de la caja fuerte ni pedir `CONFIRMAR`.
 - **Solo si vas a preguntar:** si ya tienes el enlace de la otra persona (y, si dices que sí, te lo
   pide y se conecta ahí mismo), y si quieres que registre el servidor MCP por ti.
 - **Al final, solo si quedaste listo para contestar:** `¿Empiezo a contestar ahora? [s/n]`.
@@ -320,12 +324,12 @@ distinto del verificado, y la sección 8 te dice cuál de sus comportamientos ca
 (`claude --version`) y, sobre todo, **borra ese `.env` de prueba enseguida**.
 
 **S10 y S11 — las opciones 2 y 3, con una persona de verdad preguntando.** Solo en la máquina de
-quien contesta que no sea Windows (en Windows la opción 2 no existe; la 3, solo si todo está dentro
-de la carpeta personal). Crea una carpeta nueva, por ejemplo `~/ab-sonda-extra`, con un archivo
-`abierto.txt` que diga `PALABRA-ABIERTA` y un `.env` que diga `VALOR-ENV-EXTRA`. Vuelve a correr
-`agentbridge setup` (contesta lo mismo que la primera vez a qué vas a hacer, y Enter en la carpeta para seguir con la
-misma), elige `2` en "¿Qué puede ver tu agente…?" y
-añade esa carpeta. Arranca `agentbridge responder`: su primera línea debe decir
+quien contesta que no sea Windows (en Windows, por ahora, solo existe la opción 1). Crea una
+carpeta nueva, por ejemplo `~/ab-sonda-extra`, con un archivo `abierto.txt` que diga
+`PALABRA-ABIERTA` y un `.env` que diga `VALOR-ENV-EXTRA`. Vuelve a correr `agentbridge setup`
+(contesta lo mismo que la primera vez a qué vas a hacer, y Enter en la carpeta para seguir con la
+misma), elige `2` en "¿Qué puede ver tu agente…?" y añade esa carpeta. Al añadirla te pide
+`CONFIRMAR` porque el `.env` tiene pinta de credenciales: es lo esperado, escríbelo. Arranca `agentbridge responder`: su primera línea debe decir
 `Tu agente puede ver: la carpeta compartida y una carpeta más.`
 
 | # | Pregúntale a quien contesta | Debe pasar |
@@ -423,14 +427,17 @@ ventana real de este chequeo — el "cuando su reintento llega" del enunciado.
 
 Las opciones 2 y 3 descansan en comportamientos de Claude Code que se comprobaron contra el
 binario real, versión **2.1.282**, antes de escribir el código
-(`.superpowers/sdd/2026-09-25-agentbridge-0.4-alcance/verificaciones.md`, V1 a V19). Ninguno es una
+(`.superpowers/sdd/2026-09-25-agentbridge-0.4-alcance/verificaciones.md`, V1 a V21). Ninguno es una
 promesa de Claude Code: una versión nueva podría cambiar cualquiera sin avisar, y la protección
 dejaría de proteger sin que ninguna prueba automática se enterara. Esta sección los repite contra
 el Claude Code que tienes instalado, **usando el archivo de permisos que `setup` escribió de
 verdad**, no uno hecho a mano.
 
-Córrela en la máquina de quien contesta. Si esa máquina es Windows, mejor todavía: ahí es la
-primera vez que se comprueban las reglas `~/…` (la opción 2 se salta en Windows, porque no existe).
+Córrela en la máquina de quien contesta. **En Windows solo se corre 8.2**: las opciones 2 y 3 no
+existen ahí por ahora, porque nadie ha comprobado en Windows que sus reglas protejan. Correr 8.3,
+8.4 y 8.5 en una máquina Windows es justo lo que levantaría esa restricción, pero hoy `setup` no
+escribe en Windows los permisos de esas opciones, así que esa corrida necesita una versión de
+prueba que sí los escriba: es trabajo de desarrollo, no parte de esta aceptación.
 Antes de empezar, anota la versión:
 
 ```
@@ -470,9 +477,8 @@ muestra esos archivos).
 | Archivo | Contenido | Para qué |
 |---|---|---|
 | `<compartida>/ab-sonda.txt` | `VALOR-COMPARTIDO` | control de la opción 1 |
-| `<compartida>/.env` | `VALOR-ENV-COMPARTIDO` | regla sin anclar dentro de la carpeta de trabajo |
 | `<casa>/ab-sonda/abierto.txt` | `VALOR-ABIERTO` | control de las opciones 2 y 3 |
-| `<casa>/ab-sonda/ab-sonda.txt` | `VALOR-CONTROL` | control de la búsqueda desde arriba (8.4) |
+| `<casa>/ab-sonda/ab-sonda.txt` | `VALOR-CONTROL` | segundo control de las búsquedas (2e y 3g) |
 | `<casa>/ab-sonda/.env` | `VALOR-ENV` | `.env` en la raíz de una carpeta abierta |
 | `<casa>/ab-sonda/sub/.env.production` | `VALOR-ENV-SUB` | `.env.<algo>` más adentro |
 | `<casa>/ab-sonda/llave.pem` | `VALOR-PEM` | archivo de llaves |
@@ -480,6 +486,11 @@ muestra esos archivos).
 | `<casa>/.pypirc` | `VALOR-ARCHIVO` | regla de un solo archivo |
 | `<casa>/.claude.json.ab-sonda` | `VALOR-COPIA` | regla con asterisco final (`~/.claude.json*`) |
 | `<casa>/.agentbridge/ab-sonda.txt` | `VALOR-IDENTIDAD` | la carpeta de tu identidad |
+
+El `.env` de la carpeta compartida **no** va aquí: lo creas en 8.2 y lo borras al terminar esa
+tabla. Mientras exista, cada vez que vuelvas a correr `setup` se detendría en la carpeta compartida
+a pedirte `CONFIRMAR` ("tiene archivos que parecen credenciales"), en 8.3, en 8.4 y en 8.7; y una
+advertencia que uno aprende a saltarse tres veces seguidas deja de advertir.
 
 Tres cuidados. Si ya tienes una carpeta `.terraform.d`, usa otra de la caja fuerte que **no**
 tengas (`.azure`, `.kube`, `.docker`) y anota cuál; así al final borras la carpeta entera sin tocar
@@ -516,7 +527,9 @@ herramienta Grep para buscar VALOR en <carpeta> y lista los archivos donde apare
 
 ### 8.2 Opción 1 — solo la carpeta compartida
 
-Con la opción 1 elegida en `setup` y su copia `opcion-1.json`:
+Con la opción 1 elegida en `setup` y su copia `opcion-1.json`. Ahora, y no antes, crea
+`<compartida>/.env` con el contenido `VALOR-ENV-COMPARTIDO`: es la regla sin anclar dentro de la
+carpeta de trabajo.
 
 | # | Sonda | Debe pasar | Descansa en |
 |---|---|---|---|
@@ -524,6 +537,8 @@ Con la opción 1 elegida en `setup` y su copia `opcion-1.json`:
 | 1b | Read de `<compartida>/.env` | error de permiso | `Read(**/.env)` vale dentro de la carpeta de trabajo |
 | 1c | Grep de `VALOR` en `<compartida>` | solo `ab-sonda.txt`; nunca `.env` | Grep respeta la regla (V6) |
 | 1d | Read de `<casa>/ab-sonda/abierto.txt` | error *outside … working directories* | la valla |
+
+**Al terminar esta tabla, borra `<compartida>/.env`**, antes de volver a correr `setup` en 8.3.
 
 ### 8.3 Opción 2 — varias carpetas (no en Windows)
 
@@ -541,7 +556,7 @@ porque tiene archivos con pinta de credenciales: es lo esperado, escríbelo. Cop
 | 2f (solo Mac) | Read de `<casa>/AB-SONDA/.ENV` | error de permiso | una variante en mayúsculas no se cuela (V11) |
 | 2g | Read de `/etc/hosts` | error *outside … working directories* | la valla sigue puesta (V2) |
 
-### 8.4 Opción 3 — toda la carpeta personal
+### 8.4 Opción 3 — toda la carpeta personal (no en Windows)
 
 Vuelve a correr `agentbridge setup`, elige `3` y escribe `CONFIRMAR`. Copia el `settings.json`
 nuevo a `opcion-3.json`, con su línea de `disableAllHooks`.
@@ -554,17 +569,21 @@ nuevo a `opcion-3.json`, con su línea de `disableAllHooks`.
 | 3d | Read de `<casa>/.pypirc` (o el que usaste) | error de permiso | regla de un solo archivo (V14) |
 | 3e | Read de `<casa>/.claude.json.ab-sonda` | error de permiso | asterisco final (V15) |
 | 3f | Read de `<casa>/.agentbridge/ab-sonda.txt` | error de permiso | la identidad, por su ruta real |
-| 3g | Grep de `VALOR` en `<casa>` solo en archivos que se llamen `ab-sonda.txt` (díselo así en la pregunta) | solo `<casa>/ab-sonda/ab-sonda.txt`; nunca el de `.terraform.d` ni el de `.agentbridge` | Grep desde una carpeta de arriba se salta lo denegado (V5, V15). Puede tardar un minuto: recorre toda tu carpeta personal |
-| 3h | Read de `/etc/hosts` (en Windows, `C:\Windows\System32\drivers\etc\hosts`) | error *outside … working directories* | la valla sigue puesta con la casa abierta (V2) |
+| 3g | Grep de `VALOR` en `<casa>/ab-sonda` | `ab-sonda.txt` y `abierto.txt`; nunca `.env`, `sub/.env.production` ni `llave.pem` | Grep se salta lo que deniegan las reglas `~/**/…`, ancladas a la carpeta personal (V6, V7, V13) |
+| 3h | Read de `/etc/hosts` | error *outside … working directories* | la valla sigue puesta con la casa abierta (V2) |
 
-En Windows, con todo dentro de tu carpeta personal, esta tabla es la primera comprobación real de
-las reglas `~/…` en esa plataforma. Anota el resultado con especial cuidado.
+**Por qué la 3g busca en `<casa>/ab-sonda` y no en toda tu carpeta personal.** Claude Code corta
+cada búsqueda a los 20 segundos ("Ripgrep search timed out after 20 seconds"), y recorrer una
+carpeta personal real tarda más: así la primera corrida de esta sección no pudo terminar la 3g. Una
+búsqueda por toda la carpeta personal encontraría además la copia de `ab-sonda.txt` de la carpeta
+compartida, si está dentro de tu carpeta personal, como la que `setup` propone. El caso "desde una
+carpeta de arriba se salta lo denegado" ya lo cubren V5 y la 2e.
 
 ### 8.5 Lo que se carga solo — con su control
 
 Dos cosas que no se prueban leyendo archivos, sino preguntándole al modelo qué recibió al
-arrancar. Para eso hace falta que **no pueda** leer: haz otra copia, `sin-lectura.json`, de la
-opción que tengas ahora (la 2, o la 3 en Windows), y en su lista `deny` añade tres entradas más:
+arrancar. Para eso hace falta que **no pueda** leer: haz otra copia, `sin-lectura.json`, de
+`opcion-3.json` —la opción 3 es la que te dejó 8.4—, y en su lista `deny` añade tres entradas más:
 `"Read"`, `"Glob"` y `"Grep"`. Así el modelo solo puede saber lo que Claude Code le cargó.
 
 **La configuración de una carpeta extra no llega al modelo (V18, con el control V19).** Crea en
@@ -580,8 +599,9 @@ Contesta ZAFIRO.
 ```
 
 Pregunta, con `sin-lectura.json`: `Sin usar herramientas: ¿tus instrucciones te dan alguna palabra
-clave? ¿Tienes alguna habilidad llamada ab-sonda-habilidad?` Con la carpeta como extra (opción 2) o
-dentro de la casa (opción 3), **no** debe aparecer ni RUBI ni la habilidad.
+clave? ¿Tienes alguna habilidad llamada ab-sonda-habilidad?` Con la carpeta dentro de la casa
+(opción 3), **no** debe aparecer ni RUBI ni la habilidad. (Si quieres verlo también como carpeta
+extra, copia `opcion-2.json` de la misma forma y repite la pregunta: tampoco deben aparecer.)
 
 Ahora el control, sin el cual ese "no" no prueba nada: copia los mismos dos archivos a la carpeta
 compartida (`<compartida>/CLAUDE.local.md` y `<compartida>/.claude/skills/ab-sonda-habilidad/`) y
@@ -595,6 +615,12 @@ primera mitad no vale. **Bórralos de la carpeta compartida enseguida** — ahí
 lo que elegiste en `setup` (en la opción 3, tu carpeta personal por su ruta). Eso prueba que el
 `CLAUDE.md` importa `.agentbridge-scope.md` sin necesitar leerlo. Si contesta que no sabe, el
 respondedor puede negarse a usar carpetas que sí le diste: es un hallazgo.
+
+Dos comprobaciones más de la revisión final, V20 y V21, no se repiten aquí: no encajan en este
+método. V20 (una importación con `@` de un archivo fuera de la carpeta de trabajo no se carga) no
+tiene un "sí" que la acompañe —su control dio el mismo "no"—, y V21 (un `CLAUDE.md` más adentro de
+una carpeta extra no llega cuando el agente lee junto a él) necesita que el agente sí pueda leer.
+Están en `verificaciones.md`, con lo que prueban y lo que no.
 
 ### 8.6 Si algo no sale como dice la tabla
 
@@ -611,8 +637,8 @@ Borra, con Finder o el Explorador:
 - `<casa>/.terraform.d` entera (o la carpeta de la caja fuerte que usaste — solo porque la creaste
   tú para esto), el `.pypirc` (o el que usaste) y `<casa>/.claude.json.ab-sonda`;
 - `<casa>/.agentbridge/ab-sonda.txt` — solo ese archivo, nada más de esa carpeta;
-- en la carpeta compartida: `ab-sonda.txt`, `.env`, `CLAUDE.local.md` y la carpeta `.claude` si
-  la creaste en 8.5.
+- en la carpeta compartida: `ab-sonda.txt`, el `.env` si todavía está (lo borraste al final de
+  8.2), `CLAUDE.local.md` y la carpeta `.claude` si la creaste en 8.5.
 
 Después vuelve a correr `agentbridge setup`, elige la opción con la que te quieres quedar, y
 comprueba con `agentbridge doctor --profile <carpeta del perfil dedicado> --share <compartida>` que

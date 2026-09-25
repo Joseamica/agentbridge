@@ -25,8 +25,9 @@ sobres, y de qué tamaño y a qué hora, pero no puede leer el contenido ni sabe
 Quien contesta arma un **cuarto cerrado**: una carpeta donde copia solo lo que está dispuesto a
 compartir. Lo normal —y lo recomendado— es que su agente pueda leer esa carpeta y **nada más de su
 computadora**. Si quiere, puede abrirle más puertas: otras carpetas suyas, o toda su carpeta
-personal menos una "caja fuerte" que nunca se abre (lo explica la sección
-[Qué puede ver tu agente](#qué-puede-ver-tu-agente)). En cualquier caso, lo que el agente puede y
+personal menos una "caja fuerte" que nadie puede abrir desde `setup`, ni él mismo (lo explica la
+sección [Qué puede ver tu agente](#qué-puede-ver-tu-agente); en Windows, por ahora, solo existe la
+primera opción). En cualquier caso, lo que el agente puede y
 no puede leer no depende de que el modelo se porte bien: está impuesto por configuración.
 
 La consecuencia, que conviene tener clarísima: **todo lo que tu agente pueda leer es visible** para
@@ -96,13 +97,14 @@ Eso es todo lo que hay que escribir para dejarlo instalado. Lo demás son pregun
   cuál o cuáles saltaron: que dentro haya un repositorio con `.git`; archivos con pinta de
   credenciales (`.env`, `.pem`, `.key`, `id_rsa…`, `credentials…`); enlaces simbólicos, porque no
   mira qué hay del otro lado; un `node_modules` que no revisó por dentro; configuración de proyecto
-  que el agente cargaría sola al arrancar (`.claude/settings.json`, `.mcp.json`, `AGENTS.md`,
-  `CLAUDE.local.md`, `.claude/agents`, `.claude/skills`, `.claude/commands`); y —los dos últimos—
-  una carpeta tan anidada o tan grande que no alcanzó a recorrerla completa, así que no puede
-  prometerte que no haya nada de lo anterior más adentro.
+  que el agente cargaría sola al arrancar (`.claude/settings.json`, `.mcp.json`,
+  `CLAUDE.local.md`, `.claude/agents`, `.claude/skills`, `.claude/commands`), o un `AGENTS.md`, que
+  el Claude Code comprobado no carga pero una versión nueva podría; y —los dos últimos— una carpeta
+  tan anidada o tan grande que no alcanzó a recorrerla completa, así que no puede prometerte que
+  no haya nada de lo anterior más adentro.
 - **Si vas a contestar, qué puede ver tu agente**: `1` solo esa carpeta (la recomendada), `2` esa
-  carpeta y otras que elijas, o `3` toda tu carpeta personal menos la caja fuerte. Es una sola
-  elección para todas las personas que te pueden preguntar. Enter deja lo que ya tenías (la
+  carpeta y otras que elijas, o `3` toda tu carpeta personal menos la caja fuerte (en Windows, por
+  ahora, solo la `1`). Es una sola elección para todas las personas que te pueden preguntar. Enter deja lo que ya tenías (la
   primera vez, la `1`). Lo que significa cada opción está en
   [Qué puede ver tu agente](#qué-puede-ver-tu-agente), más abajo.
 
@@ -146,7 +148,7 @@ Solo importa si vas a contestar. Piénsalo como una casa:
 - **Opción 2 — Esta carpeta y otras que elijas.** Le abres, además, los cuartos que tú señales,
   uno por uno.
 - **Opción 3 — Toda tu carpeta personal, menos la caja fuerte.** Le abres la casa entera, menos
-  una caja fuerte que nadie puede abrir.
+  una caja fuerte que nadie puede abrir desde `setup`, ni tú.
 
 En las tres, lo que queda fuera de lo que elegiste está cerrado por configuración, no por
 cortesía del modelo: los archivos del sistema, por ejemplo, siguen cerrados incluso en la opción
@@ -166,7 +168,7 @@ Es lo que sigue cerrado en las opciones 2 y 3, y **nadie la puede abrir desde `s
 palabras de todos los días:
 
 - tu llave de AgentBridge (y el perfil dedicado del respondedor);
-- tu Claude de todos los días: tu sesión y todas tus conversaciones;
+- tu Claude de todos los días: tu sesión y tus conversaciones;
 - los lugares más conocidos donde se guardan contraseñas y llaves: las del navegador, las de tu
   llavero y las que dan acceso a servidores y a la nube;
 - tus archivos `.env`, donde los programas guardan sus contraseñas, y los archivos de llaves que
@@ -187,14 +189,21 @@ carpeta esté fuera de tu carpeta personal.
 
 **La caja fuerte no lo cubre todo.** Cierra los lugares más conocidos, no todos los secretos que
 puedas tener. Si tienes una contraseña escrita en un documento, correos o chats guardados en tu
-computadora, o un archivo de llaves con un nombre poco común, tu agente sí puede leerlos. La lista
-es fija: no se puede ampliar ni abrir desde `setup`.
+computadora, o un archivo de llaves con un nombre poco común, tu agente sí puede leerlos. Y cubre
+esos lugares donde suelen estar: si tu Claude de todos los días guarda sus archivos en otra carpeta
+que tú le indicaste, o te quedó de antes otro perfil dedicado en otra carpeta, esos no están en la
+lista. La lista es fija: no se puede ampliar ni abrir desde `setup`. Y descansa en cómo se comporta
+Claude Code: se comprobó con la versión 2.1.282, y el protocolo de aceptación lo vuelve a comprobar
+con la que tengas instalada.
 
 ### Opción 2, en detalle
 
 Te pide las carpetas una por una; cuando termines, deja la respuesta vacía y presiona Enter. Cada
-carpeta pasa por las mismas revisiones que la carpeta compartida —los siete avisos que piden
-`CONFIRMAR`— y además estas, que no se pueden saltar:
+carpeta pasa por los avisos que piden `CONFIRMAR` de la carpeta compartida, menos dos que en una
+carpeta extra no son ciertos: la configuración de proyecto (desde una carpeta extra no se carga,
+ver abajo) y los enlaces simbólicos (Claude Code sigue el enlace hasta su destino real y ahí aplica
+la misma valla y la misma caja fuerte, así que tu agente solo puede leer ese destino si ya está en
+una carpeta que elegiste). Y pasa además por estas revisiones, que no se pueden saltar:
 
 - tiene que existir ya: son carpetas tuyas, no se crean;
 - no puede ser tu carpeta personal ni contenerla (para eso está la opción 3);
@@ -211,10 +220,11 @@ que elegiste y te pregunta si las dejas; si dices que sí, las vuelve a revisar 
 
 Lo que tengan esas carpetas **se lee, pero no se carga**: si una trae su propio `CLAUDE.md`,
 `.mcp.json`, habilidades o comandos de Claude, tu agente no los recibe como instrucciones al
-arrancar. Eso se comprobó con Claude Code 2.1.282.
+arrancar, y un `CLAUDE.md` que esté más adentro tampoco le llega cuando lee archivos junto a él.
+Eso se comprobó con Claude Code 2.1.282.
 
 **En Windows la opción 2 todavía no está disponible**: no está comprobado cómo proteger los
-archivos de llaves dentro de cada carpeta extra. `setup` te lo dice y te deja elegir otra.
+archivos de llaves dentro de cada carpeta extra. `setup` te lo dice y te deja la opción 1.
 
 ### Opción 3, en detalle
 
@@ -227,10 +237,10 @@ de preguntarte puede preguntar por cualquier archivo de tu carpeta personal que 
 fuerte, y tu agente se lo va a leer.** No solo lo que tú pensabas compartir: tus documentos, tus
 fotos, tus proyectos, todo lo que tengas ahí.
 
-**En Windows** solo está disponible si la carpeta compartida, tu identidad de AgentBridge y el
-perfil dedicado están los tres dentro de tu carpeta personal; si no, `setup` te lo dice y te deja
-elegir otra. Y una advertencia honesta: que la caja fuerte se sostenga en Windows no está
-comprobado todavía con Claude Code real; en Mac sí.
+**En Windows la opción 3 todavía no está disponible.** La pantalla donde escribes `CONFIRMAR` te
+dice que la caja fuerte sigue cerrada, y en Windows eso no está comprobado todavía con Claude Code
+real (en Mac sí). Antes que prometerte algo que nadie comprobó, `setup` te lo dice y te deja la
+opción 1.
 
 ### Cómo sabe tu agente qué puede leer
 
@@ -350,9 +360,11 @@ Y sobre [qué puede ver tu agente](#qué-puede-ver-tu-agente):
   dice qué hacer; no bloquea, porque lo que tu agente puede leer lo deciden los permisos.
 - **En la opción 2, una línea por cada carpeta extra**: si ya no existe (se movió, se renombró o
   está en un disco desconectado), que `responder` no va a arrancar hasta que la quites o elijas
-  otra; y si existe, que no tenga enlaces simbólicos que salgan de ella. Una carpeta muy grande o
-  muy anidada no se revisa entera —se detiene a los 20000 elementos o a los 6 niveles de
-  profundidad— y lo dice, sin marcarlo como falla.
+  otra; y si existe, cuántos enlaces simbólicos salen de ella. Eso lo dice sin marcarlo como falla:
+  Claude Code sigue el enlace hasta su destino real y ahí aplica la misma valla y la misma caja
+  fuerte, así que tu agente solo puede leer ese destino si ya está en una carpeta que elegiste. Una
+  carpeta muy grande o muy anidada no se revisa entera —se detiene a los 20000 elementos o a los 6
+  niveles de profundidad— y lo dice, sin marcarlo como falla.
 - **En Mac, si el sistema no deja entrar a una carpeta** —la compartida o una extra, sobre todo si
   está en Documentos, Escritorio o Descargas—, lo dice así: que macOS no deja que este programa
   entre en esa carpeta, y dónde se arregla: Ajustes del Sistema › Privacidad y seguridad › Archivos

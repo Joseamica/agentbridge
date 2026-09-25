@@ -32,17 +32,20 @@ varias, o toda su carpeta personal menos una caja fuerte fija. Esto es lo que **
   escribir su ruta absoluta dentro de una regla, y no está comprobado cómo ancla Claude Code una
   ruta con letra de unidad (`C:\…`). Una forma adivinada que no coincide con nada parecería
   protección y no cubriría nada —el mismo fallo que V6—, así que `setup` la rechaza con una frase.
-- **La opción 3 en Windows solo con todo dentro de la carpeta personal**, por la misma razón: la
-  carpeta compartida, la identidad y el perfil dedicado se protegen con reglas `~/…`, y fuera de la
-  carpeta personal habría que escribir una ruta con letra de unidad. Además, **que las reglas `~/…`
-  se sostengan en Windows tampoco está comprobado**: todas las verificaciones se hicieron en macOS.
-  La sección 8 del runbook es la forma de comprobarlo en una máquina Windows.
+- **La opción 3 tampoco existe en Windows, por ahora.** Descansa en las reglas `~/…`, y **que se
+  sostengan en Windows no está comprobado**: todas las verificaciones se hicieron en macOS. Su
+  pantalla de consentimiento dice que la caja fuerte sigue cerrada, y una promesa que nadie
+  comprobó, justo cuando la persona escribe `CONFIRMAR`, es lo que este producto no hace. `setup`,
+  `setup-responder`, `responder` y `doctor` la rechazan con la misma frase y ofrecen la opción 1.
+  Costo: en Windows solo existe la opción 1. Lo que levantaría esto es correr la sección 8 del
+  runbook en una máquina Windows; como hoy `setup` no escribe ahí los permisos de las opciones 2 y
+  3, esa corrida necesita una versión de prueba que sí los escriba.
 - **Una ruta con `*`, `?`, `[`, `]`, `{` o `}` (en Mac y Linux también `\`) se rechaza**, no se
   escapa: si Claude Code respeta un escape dentro de una regla no está comprobado, y una regla con
   un comodín sin querer no protegería la carpeta.
 - **Lo verificado vale para Claude Code 2.1.282.** Todo lo que este diseño supone de Claude Code se
-  comprobó contra ese binario antes de escribir el código
-  (`.superpowers/sdd/2026-09-25-agentbridge-0.4-alcance/verificaciones.md`, V1–V19): que
+  comprobó contra ese binario
+  (`.superpowers/sdd/2026-09-25-agentbridge-0.4-alcance/verificaciones.md`, V1–V21): que
   `additionalDirectories` abre carpetas sin apagar la valla; que una regla anclada deniega dentro
   de una carpeta abierta y una sin anclar no (V6); que Grep y Glob respetan esas reglas, también al
   recorrer desde una carpeta de arriba; que una variante en mayúsculas o una ruta que pasa por un
@@ -51,13 +54,42 @@ varias, o toda su carpeta personal menos una caja fuerte fija. Esto es lo que **
   sin pedir aprobación (V16, V17); y que **nada de la configuración de una carpeta extra llega al
   modelo** —ni habilidades, ni comandos, ni subagentes, ni `.mcp.json`, ni `CLAUDE.local.md`, ni
   `AGENTS.md` (V18)—, con el control de que esos mismos archivos en la carpeta de trabajo sí se
-  cargan (V19), sin el cual el "no llegó" no probaría nada. Una versión futura de Claude Code podría
+  cargan (V19), sin el cual el "no llegó" no probaría nada; y que un `CLAUDE.md` más adentro de
+  una carpeta extra tampoco llega cuando el agente lee archivos junto a él (V21, con su control en
+  la carpeta de trabajo, donde sí llega). Una versión futura de Claude Code podría
   cambiar cualquiera de estas cosas sin avisar. Por eso la sección 8 del runbook
   (`docs/runbooks/aceptacion-0.4.md`) las vuelve a comprobar contra el Claude Code instalado.
 - **`doctor` recorre las carpetas extra con límite** (20000 elementos o 6 niveles de profundidad) y
   dice cuando no terminó, sin marcarlo como falla; la carpeta compartida se sigue recorriendo
   entera. Y en las carpetas extra no busca configuración de proyecto: por V18 no llega al modelo, y
   marcarla era una falsa alarma bloqueante justo en la carpeta que más se añade, un proyecto.
+  `setup` tampoco pide `CONFIRMAR` por ella al añadir una carpeta extra.
+- **Un enlace simbólico que sale de una carpeta extra no es una falla.** `doctor` lo cuenta y dice
+  por qué no es un riesgo, y `setup` no pide `CONFIRMAR` por él: Claude Code sigue el enlace hasta
+  su destino real y ahí aplica la misma valla y la misma caja fuerte (V8), así que el destino solo
+  se lee si ya está en una carpeta elegida. Bastaba el `.venv` de un proyecto de Python para que
+  `doctor` diera una falla bloqueante y `setup` no ofreciera arrancar. En la carpeta compartida no
+  cambió nada: ahí un enlace que sale sigue siendo una falla, como en 0.3.
+- **En la opción 3, una búsqueda por toda la carpeta personal no termina.** Claude Code corta cada
+  búsqueda a los 20 segundos ("Ripgrep search timed out after 20 seconds"), y recorrer una carpeta
+  personal real tarda más. Se encontró en la primera corrida real de la sección 8 del runbook. Una
+  pregunta que obligue al agente a buscar en toda la carpeta personal se queda sin respuesta; si la
+  pregunta dice dónde mirar ("en la carpeta Proyectos/…"), el agente contesta bien. No es una fuga:
+  la búsqueda que se corta no devuelve nada.
+- **La caja fuerte cubre los lugares de siempre, no donde tú los hayas movido.** Un perfil dedicado
+  viejo, de una corrida anterior con otro `--profile` (en Linux y Windows, con su propio inicio de
+  sesión de Claude), y el Claude de todos los días corrido con un `CLAUDE_CONFIG_DIR` propio no
+  están en la lista, así que en la opción 3 se leen. La lista protege la identidad y el perfil
+  dedicado actuales dondequiera que estén, y `~/.claude` donde Claude lo pone por defecto.
+- **Una importación con `@` no abre la caja fuerte, pero no por la razón que se esperaba.** V20: un
+  `CLAUDE.md` en la carpeta de trabajo que importa un archivo de fuera de ella —directo, o a través
+  de un enlace— no lo carga en `claude -p`; en una sesión interactiva, Claude Code pide aprobación
+  antes. Eso cierra la vía. Lo que V20 **no** prueba es que una regla deny detenga una
+  importación: el control sin la regla dio el mismo "no", así que lo que detuvo la carga fue la
+  política de importaciones externas, no la caja fuerte. Si una versión futura cargara esas
+  importaciones sin preguntar, la caja fuerte no está comprobada contra esa vía. Escribir ese
+  `CLAUDE.md` en la carpeta compartida exige poder escribir en ella: el dueño, un cliente de
+  sincronización o un `git pull` (el agente tiene Edit y Write denegados).
 - **En Mac, macOS puede no dejar entrar a la terminal** en Documentos, Escritorio o Descargas.
   `doctor` lo detecta por el error, no por el nombre de la carpeta, y dice dónde se da el permiso;
   no lo puede dar por ti. En la opción 3 no hay un chequeo equivalente para cada carpeta de la
@@ -187,8 +219,9 @@ Todo esto es preexistente o cosmético, verificado y acotado. Ninguno bloquea el
   los enlaces simbólicos, con un `node_modules` que no se revisó por dentro, y con un árbol
   demasiado grande o demasiado anidado para recorrerlo completo. El README y la guía en español ya
   los enumeran todos (0.3); si se añade otro disparador, hay que actualizarlos.
-- El candado avisa de cualquier enlace simbólico, incluso de los que `doctor` considera
-  inofensivos por no salir de la carpeta. Es a propósito: prefiere errar del lado seguro.
+- El candado de la carpeta compartida avisa de cualquier enlace simbólico, incluso de los que
+  `doctor` considera inofensivos por no salir de la carpeta. Es a propósito: prefiere errar del lado
+  seguro. En una carpeta extra de la opción 2 no avisa de enlaces (ver la sección de 0.4).
 
 ## 0.2 — respondedor: brechas verificadas y deliberadas
 
