@@ -197,12 +197,21 @@ function additionalDirectoriesFor(scope: ResponderScope, o: ScopePaths): string[
 // hand-typed `--permission-mode default` at the command line would otherwise remove the only
 // thing stopping an untrusted question from getting those tools to read arbitrary paths on
 // the machine. RESPONDER_DENY is what is left reachable inside that fence: no shell, no file
-// writes or edits, no outbound web, no sub-agents. The two Read(**/.env*) denies are a second
-// line of defense inside the same fence, not a standalone guarantee — Grep is not denied and
-// is not covered by those glob patterns, so a .env file left inside the shared folder is still
-// readable through it. Never put real secrets in the shared folder; do not add per-path deny
-// rules for the home directory here — next to a real working-directory fence they would be
-// theatre.
+// writes or edits, no outbound web, no sub-agents.
+//
+// The Read(...) denies — the two unanchored `.env` rules of mode 1, and the anchored caja fuerte
+// of modes 2 and 3 (cajaFuerteFor above) — are what holds inside the readable directories. On
+// Claude Code 2.1.282 Grep and Glob respect them: aimed at a denied folder they are refused, and
+// recursing from an allowed ancestor they silently skip the denied folder or file (V4, V5, V6,
+// V13 in .superpowers/sdd/2026-09-25-agentbridge-0.4-alcance/verificaciones.md). An earlier
+// version of this comment said the opposite — that Grep was not covered and that per-path home
+// rules would be theatre. That was written for a single readable folder; once the home is an
+// additional directory, per-path home rules are exactly the caja fuerte, and they hold (V2, V7,
+// V14, V15). What they need is an anchor: an unanchored pattern is relative to the working
+// directory, so outside it it covers nothing (V6). These are behaviours of one Claude Code
+// version, not a contract; docs/runbooks/aceptacion-0.4.md re-checks them against the installed
+// one. And in mode 1 only `.env` files are denied: any other secret in the shared folder is
+// readable, so never put real secrets there.
 export function responderSettings(scope: ResponderScope, o: ScopePaths): SettingsFile {
   // Mode 1 is written exactly as 0.3 wrote it, key for key and in the same order, so the file on
   // every existing install is byte-identical to what setupResponder now produces and nobody is

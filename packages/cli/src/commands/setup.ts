@@ -329,9 +329,11 @@ type ShareDirScan = {
   // here instead, which is what makes the CONFIRMAR gate fire on it.
   symlinks: string[]
   // node_modules is never descended into (same reasoning doctor.ts gives), but silently skipping
-  // it is exactly how `node_modules/pkg/.env` produced no warning even though Grep can still
-  // read it — named here so the gate can say so, the same way doctor.ts's own "skipped" list
-  // names it rather than claiming a clean sweep.
+  // it is exactly how a key file inside `node_modules/pkg/` produced no warning. (The reason
+  // once said Grep could read a `.env` there; on Claude Code 2.1.282 Grep skips denied `.env`
+  // files (verificaciones.md, V6 and V13), but an `id_rsa`, a `credentials.json` or — in mode 1 —
+  // a `.pem` is still readable.) Named here so the gate can say so, the same way doctor.ts's own
+  // "skipped" list names it rather than claiming a clean sweep.
   skippedNodeModules: string[]
   // True only when at least one branch was too deeply nested to fully explore — its own
   // recursion stops, but sibling directories elsewhere in the tree are still scanned. Kept
@@ -505,7 +507,7 @@ export async function assessShareDir(
     }
     if (scan.skippedNodeModules.length > 0) {
       const shown = scan.skippedNodeModules.slice(0, 5).join(', ') + (scan.skippedNodeModules.length > 5 ? ', …' : '')
-      reasons.push(`no revisé dentro de node_modules (${shown}) — Grep no está bloqueado, así que un .env ahí adentro seguiría siendo legible`)
+      reasons.push(`no revisé dentro de node_modules (${shown}) — si ahí adentro hay un archivo de llaves o de credenciales, tu agente lo puede leer y yo no lo vi`)
     }
     const projectConfig = await projectConfigArtifacts(shareDir)
     if (projectConfig.length > 0) reasons.push(`ya tiene configuración de proyecto que doctor vigila: ${projectConfig.join(', ')}`)

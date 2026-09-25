@@ -919,6 +919,10 @@ describe('the shared-folder protection', () => {
     // Specifically the "did not look inside" reason, not "found credentials in there" — the
     // latter would mean the scan recursed into node_modules after all, which it must never do.
     expect(out.lines.join('\n')).toMatch(/no revisé dentro de node_modules/)
+    // What is at stake, in words, and not the old claim that Grep reads a .env there: on Claude
+    // Code 2.1.282 Grep skips denied .env files (verificaciones.md, V6, V13).
+    expect(out.lines.join('\n')).toMatch(/archivo de llaves o de credenciales, tu agente lo puede leer/)
+    expect(out.lines.join('\n')).not.toMatch(/Grep/)
   })
 
   it('refuses the home directory outright — no CONFIRMAR can override it', async () => {
