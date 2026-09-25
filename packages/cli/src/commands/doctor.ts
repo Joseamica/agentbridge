@@ -47,7 +47,27 @@ export type Check = {
   security: boolean
 }
 
-type WalkResult = { escaping: string[]; unreadable: string[]; skipped: string[] }
+type WalkResult = {
+  escaping: string[]
+  unreadable: string[]
+  skipped: string[]
+  // Set only by a bounded walk (see WALK_LIMITS): whether a branch was too deep to finish, and
+  // whether the entry cap stopped the whole walk. Either way the result covers part of the folder,
+  // and the line built from it has to say so.
+  depthLimited?: boolean
+  truncated?: boolean
+  visited?: number
+}
+
+// The same bounds setup's own scan of a chosen folder uses (setup.ts imports them from here), so
+// the two stop at the same place and a large folder never takes longer here than there. The
+// working directory is walked without them, as it always was; the extra folders of mode 2 are the
+// ones people pick from their own home — a whole `~/Documents` — and an unbounded walk of one
+// could keep doctor, and setup's "Reviso que todo esté listo…", going for tens of seconds.
+export const MAX_SCAN_DEPTH = 6
+export const MAX_SCAN_ENTRIES = 20000
+type WalkLimits = { maxDepth: number; maxEntries: number }
+const WALK_LIMITS: WalkLimits = { maxDepth: MAX_SCAN_DEPTH, maxEntries: MAX_SCAN_ENTRIES }
 
 // Walks the shared folder looking for symlinks whose real target lands outside it.
 // - `.git` and `node_modules` are skipped for size, but named in `skipped` — callers must
@@ -57,7 +77,8 @@ type WalkResult = { escaping: string[]; unreadable: string[]; skipped: string[] 
 // - A dangling symlink (target does not exist) is resolved against its own literal target
 //   text via readlink + the link's own directory, not realpath (which requires the target to
 //   exist) — so a broken-but-internal link is not misreported as an escape.
-async function walkShareDir(dir: string, rootReal: string, result: WalkResult): Promise<void> {
+async function walkShareDir(dir: string, rootReal: string, result: WalkResult, limits?: WalkLimits, depth = 0): Promise<void> {
+  if (result.truncated) return
   let entries: string[]
   try {
     entries = await readdir(dir)
@@ -66,6 +87,14 @@ async function walkShareDir(dir: string, rootReal: string, result: WalkResult): 
     return
   }
   for (const entry of entries) {
+    if (limits) {
+      if (result.truncated) return
+      result.visited = (result.visited ?? 0) + 1
+      if (result.visited > limits.maxEntries) {
+        result.truncated = true
+        return
+      }
+    }
     const path = join(dir, entry)
     let info: Awaited<ReturnType<typeof lstat>>
     try {
@@ -90,8 +119,11 @@ async function walkShareDir(dir: string, rootReal: string, result: WalkResult): 
     } else if (info.isDirectory()) {
       if (entry === '.git' || entry === 'node_modules') {
         result.skipped.push(path)
+      } else if (limits && depth >= limits.maxDepth) {
+        // Only this branch stops, as in setup's scan; siblings are still walked.
+        result.depthLimited = true
       } else {
-        await walkShareDir(path, rootReal, result)
+        await walkShareDir(path, rootReal, result, limits, depth + 1)
       }
     }
   }
@@ -435,14 +467,16 @@ async function addShareChecks(
 // with three folders, "1 enlace(s) apuntan fuera de la carpeta" alone does not say which.
 async function addFolderContentChecks(
   add: (name: string, ok: boolean, detail: string, blocking: boolean, security?: boolean) => void,
-  o: { dir: string; linksName: string; configName: string; prefix?: string },
+  // `configName` absent: the project-configuration check is skipped (extra folders, see
+  // addScopeChecks). `limits` absent: the walk is unbounded (the working directory, as before).
+  o: { dir: string; linksName: string; configName?: string; prefix?: string; limits?: WalkLimits },
 ): Promise<void> {
   const prefix = o.prefix ?? ''
   // walkShareDir turns a missing or unreadable folder into an `unreadable` entry rather than
   // throwing.
   const rootReal = await realpath(o.dir).catch(() => o.dir)
   const walk: WalkResult = { escaping: [], unreadable: [], skipped: [] }
-  await walkShareDir(o.dir, rootReal, walk)
+  await walkShareDir(o.dir, rootReal, walk, o.limits)
   const linksOk = walk.escaping.length === 0 && walk.unreadable.length === 0
   // The folder's own paths never appear in this detail: they name its internal layout, which no
   // doctor line may print. Say how many and of what kind, not which. The folder itself may be
@@ -451,8 +485,18 @@ async function addFolderContentChecks(
   if (walk.escaping.length) linkBits.push(`${walk.escaping.length} enlace(s) apuntan fuera de la carpeta`)
   if (walk.unreadable.length) linkBits.push(`${walk.unreadable.length} ruta(s) no se pudieron revisar (sin permiso de lectura)`)
   if (walk.skipped.length) linkBits.push(`${walk.skipped.length} carpeta(s) no se revisaron por dentro (.git o node_modules)`)
+  // Partial is said, never passed off as a full sweep — but it does not fail the line: nothing
+  // wrong was found, and a folder being large is not a fault.
+  if (walk.truncated || walk.depthLimited) {
+    linkBits.push(
+      walk.truncated
+        ? `no terminé de revisarla: es muy grande, y me detuve después de ${MAX_SCAN_ENTRIES} elementos`
+        : `no revisé todo: tiene carpetas a más de ${MAX_SCAN_DEPTH} niveles de profundidad`,
+    )
+  }
   add(o.linksName, linksOk, linkBits.length ? `${linksOk ? '' : prefix}${linkBits.join(' · ')}` : 'Ninguno', true, true)
 
+  if (o.configName === undefined) return
   const projectConfig = await projectConfigArtifacts(o.dir)
   const execRisk = projectConfig.filter((rel) => PROJECT_CONFIG_EXEC_RISK.has(rel))
   const textInjection = projectConfig.filter((rel) => !PROJECT_CONFIG_EXEC_RISK.has(rel))
@@ -485,6 +529,7 @@ async function addScopeChecks(
   add: (name: string, ok: boolean, detail: string, blocking: boolean, security?: boolean) => void,
   config: ResponderConfig,
   home: string,
+  platform: NodeJS.Platform,
 ): Promise<void> {
   const scope = config.scope
   const summary = scopeSummary(scope)
@@ -504,7 +549,9 @@ async function addScopeChecks(
   const pointsAtScope = persona?.includes(SCOPE_FILE) ?? false
   const scopeCurrent = scopeText === scopeDescription(scope, home)
   if (scope.kind !== 'folder' || pointsAtScope) {
-    const detail = !pointsAtScope
+    const detail = persona === null
+      ? `No encuentro o no puedo leer el CLAUDE.md de la carpeta compartida, así que no sé si tu agente sabe qué carpetas puede usar. Si no existe, lo escribe: ${CLI_COMMAND} setup`
+      : !pointsAtScope
       ? `El CLAUDE.md de la carpeta compartida no menciona ${SCOPE_FILE}, así que tu agente puede creer que solo puede usar la carpeta compartida. Añade esta línea sola al principio de ese archivo: @${SCOPE_FILE}`
       : !scopeCurrent
         ? `${SCOPE_FILE} en la carpeta compartida falta o no coincide con lo que elegiste, así que tu agente leería un alcance equivocado. Lo vuelve a escribir: ${CLI_COMMAND} setup`
@@ -528,11 +575,39 @@ async function addScopeChecks(
       )
       continue
     }
+    // The folder itself cannot be opened — not a subfolder, the folder. On macOS that is almost
+    // always the privacy settings keeping the terminal out of Documents, Desktop or Downloads:
+    // `stat` passes and `readdir` gets EPERM. Walking would print "1 ruta(s) no se pudieron
+    // revisar" as a security failure with no cause and no way out. Blocking, because the agent
+    // started from the same terminal cannot read it either; not `security`, because a folder
+    // nobody can open exposes nothing. Detected by the error, never by the folder's name.
+    const opened = await readdir(dir).then(
+      () => null,
+      (err: NodeJS.ErrnoException) => err.code ?? 'ERR',
+    )
+    if (opened === 'EPERM' || opened === 'EACCES') {
+      add(
+        `Carpeta extra ${dir}`,
+        false,
+        platform === 'darwin'
+          ? `No puedo abrir ${dir}: macOS no deja que este programa entre en esa carpeta. Ve a Ajustes del Sistema › Privacidad y seguridad › Archivos y carpetas (o Acceso total al disco) y permite la app de terminal donde corres esto. Hasta entonces, tu agente tampoco puede leerla.`
+          : `No puedo abrir ${dir}: no tengo permiso para leer esa carpeta. Hasta que lo tenga, tu agente tampoco puede leerla.`,
+        true,
+        false,
+      )
+      continue
+    }
+    // Links only. The project-configuration check is the working directory's alone: with Read,
+    // Glob and Grep denied, nothing from an additional directory reached the model on the real
+    // binary — not a skill, a command, a subagent, `.mcp.json`, `CLAUDE.local.md` or `AGENTS.md` —
+    // while the same skill and `CLAUDE.local.md` in the working directory did load
+    // (verificaciones.md, V18 and V19). Flagging them in an extra folder was a false blocking
+    // alarm on the folder people add most: a project.
     await addFolderContentChecks(add, {
       dir,
       linksName: `Sin enlaces que salgan de la carpeta extra ${dir}`,
-      configName: `Sin configuración de proyecto en la carpeta extra ${dir}`,
       prefix: `En la carpeta extra ${dir}: `,
+      limits: WALK_LIMITS,
     })
   }
 }
@@ -543,7 +618,7 @@ async function addScopeChecks(
 // is in the picture at all.
 async function addProfileChecks(
   add: (name: string, ok: boolean, detail: string, blocking: boolean, security?: boolean) => void,
-  o: { profileHome: string; identityHome: string; repoDir?: string; run: CommandRunner; home: string },
+  o: { profileHome: string; identityHome: string; repoDir?: string; run: CommandRunner; home: string; platform: NodeJS.Platform },
 ): Promise<void> {
   // Everything below lives under `profileHome`, independent of whether a shared folder was given —
   // a profile with no settings.json (or a weakened one) must fail loudly even when doctor is run
@@ -564,7 +639,7 @@ async function addProfileChecks(
   add('Permisos del respondedor', fence.problems.length === 0, fence.problems.length ? fence.problems.join(' · ') : fence.detail, true, true)
   // Only with a readable responder.json: without one there is no mode to name, and its absence is
   // reported on its own line below.
-  if (saved) await addScopeChecks(add, saved, o.home)
+  if (saved) await addScopeChecks(add, saved, o.home, o.platform)
 
   // What `start.sh`'s own executable-bit check used to stand in for: proof that this profile
   // was actually prepared by setup-responder, not just a folder someone pointed --profile at.
@@ -769,7 +844,7 @@ export async function runDoctor(o: {
   // only fires when profileHome is also present — see the comment there.
   if (o.shareDir) await addShareChecks(add, { shareDir: o.shareDir, profileHome: o.profileHome })
   if (o.profileHome) {
-    await addProfileChecks(add, { profileHome: o.profileHome, identityHome: o.identityHome, repoDir: o.repoDir, run, home: o.home ?? homedir() })
+    await addProfileChecks(add, { profileHome: o.profileHome, identityHome: o.identityHome, repoDir: o.repoDir, run, home: o.home ?? homedir(), platform })
   }
   return checks
 }

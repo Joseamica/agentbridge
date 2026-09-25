@@ -1,6 +1,7 @@
 import { CLI_COMMAND } from '@agentbridge/core'
 import { spawn } from 'node:child_process'
-import { access, chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { access, chmod, lstat, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -385,6 +386,22 @@ Which folders you may answer from is written in ${SCOPE_FILE}, in this folder. A
 // rules are what enforce it; this is so the model does not refuse a folder it was given, or go
 // looking for one it was not. Mode 3's protected places are described by kind, not listed: the
 // model needs to know a refused read is deliberate, not the fifty rule strings.
+// A path as a Markdown code span. A folder name is free text, and CLAUDE.md imports are `@path`
+// written in the running text — a folder called `notas @x` would otherwise read as an import of
+// `x`. Claude Code does not evaluate imports inside code spans. The fence is one backtick longer
+// than the longest run inside the name, and padded with spaces, so a backtick in the name cannot
+// close it (CommonMark's own rule for code spans that contain backticks).
+function codeSpan(text: string): string {
+  const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length))
+  const fence = '`'.repeat(longest + 1)
+  return longest > 0 ? `${fence} ${text} ${fence}` : `${fence}${text}${fence}`
+}
+
+// What the model is told about what it reads, in modes 2 and 3 alike: the owner widened the reach
+// so the agent can answer, not so that everything it can reach is passed on.
+const NOT_A_REASON_TO_SHARE =
+  'Being able to read a file is not a reason to share it. Answer the question that was asked, and never pass on a password, token or key you come across, even outside the protected places.'
+
 export function scopeDescription(scope: ResponderScope, home: string): string {
   const header = `# What you may read
 
@@ -398,14 +415,16 @@ AgentBridge writes this file from your owner's choice and rewrites it every time
   if (scope.kind === 'folders') {
     return `${header}You may answer from the files in this folder (your working directory) and in these folders your owner chose:
 
-${scope.extra.map((dir) => `- ${dir}`).join('\n')}
+${scope.extra.map((dir) => `- ${codeSpan(dir)}`).join('\n')}
 
-Nothing outside them is readable. Inside them, .env files and key files (.pem, .key, .p12, .pfx) are closed on purpose; if a read is refused, do not look for another way to reach that file.
+Nothing outside them is readable. Inside them, .env files and key files (.pem, .key, .p12, .pfx) are closed on purpose, and so are the protected places; if a read is refused, do not look for another way to reach that file.
+
+${NOT_A_REASON_TO_SHARE}
 `
   }
-  return `${header}You may answer from the files in this folder (your working directory) and in your owner's personal folder, ${home}, except the protected places: your owner's AgentBridge key, their everyday Claude data, password and key stores, browser data, cloud and server credentials, shell histories, .env files and key files. Reads of those are refused on purpose; if a read is refused, do not look for another way to reach that file. Nothing outside these folders is readable.
+  return `${header}You may answer from the files in this folder (your working directory) and in your owner's personal folder, ${codeSpan(home)}, except the protected places: your owner's AgentBridge key, their everyday Claude data, password and key stores, browser data, cloud and server credentials, shell histories, .env files and key files. Reads of those are refused on purpose; if a read is refused, do not look for another way to reach that file. Nothing outside these folders is readable.
 
-Being able to read a file is not a reason to share it. Answer the question that was asked, and never pass on a password, token or key you come across, even outside the protected places.
+${NOT_A_REASON_TO_SHARE}
 `
 }
 
@@ -456,6 +475,18 @@ export const defaultRunner: CommandRunner = (command, args, opts) =>
     // bound is what ended this run, not however the killed child happened to exit.
     child.on('close', (code) => resolvePromise({ code: aborted ? 124 : (code ?? 1), stdout, stderr }))
   })
+
+// Writes a file in a folder other people's tools also write into — the shared folder, where a sync
+// client or a `git pull` can leave anything, including a symlink named like our file. `writeFile`
+// follows a symlink, so a planted `.agentbridge-scope.md -> ~/.ssh/id_rsa` would have that key
+// overwritten on every setup. Written to a fresh name with `wx` (fails rather than follow anything
+// already there) and renamed over the destination: rename replaces a symlink, it never writes
+// through it.
+async function replaceFile(path: string, text: string): Promise<void> {
+  const temporary = `${path}.${randomUUID()}.tmp`
+  await writeFile(temporary, text, { flag: 'wx' })
+  await rename(temporary, path)
+}
 
 async function exists(path: string): Promise<boolean> {
   try {
@@ -604,16 +635,22 @@ export async function setupResponder(o: {
 
   // AgentBridge's own file, so rewritten from the scope every time — the mode can change on any
   // run, and a stale description is exactly what this file exists to prevent.
-  await writeFile(join(shareDir, SCOPE_FILE), scopeDescription(scope, personalHome))
+  await replaceFile(join(shareDir, SCOPE_FILE), scopeDescription(scope, personalHome))
 
   const personaPath = join(shareDir, 'CLAUDE.md')
-  // Unreadable counts as the person's own content: never replaced, and it cannot be shown to
-  // point at the scope file.
-  const persona = (await exists(personaPath)) ? await readFile(personaPath, 'utf8').catch(() => '') : null
-  if (persona === null) {
-    await writeFile(personaPath, RESPONDER_PERSONA)
+  // `lstat`, not `access`: a dangling symlink named CLAUDE.md is "something is there", never
+  // "absent", or writing the persona would create whatever file it points at. Unreadable is the
+  // person's own content: never replaced, and said as what it is.
+  const personaThere = await lstat(personaPath).then(() => true, () => false)
+  const persona = personaThere ? await readFile(personaPath, 'utf8').catch(() => null) : undefined
+  if (persona === undefined) {
+    await replaceFile(personaPath, RESPONDER_PERSONA)
+  } else if (persona === null) {
+    o.out.log(`No pude leer ${personaPath}; no lo toqué. Revisa que se pueda abrir: tu agente tampoco podría leerlo.`)
   } else if (persona === LEGACY_PERSONA) {
-    await writeFile(personaPath, RESPONDER_PERSONA)
+    // The whole file, compared exactly: the old text with the person's own rules appended is
+    // theirs, and is left alone like any other edit.
+    await replaceFile(personaPath, RESPONDER_PERSONA)
     o.out.log(
       `Actualicé ${personaPath}: era el texto que AgentBridge escribió antes y no lo habías cambiado. Ahora le indica a tu agente dónde ver qué carpetas puede usar.`,
     )

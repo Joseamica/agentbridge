@@ -384,6 +384,17 @@ describe('runDoctor with the scope saved in responder.json', () => {
       expect(line.detail).toContain(`@${SCOPE_FILE}`)
     })
 
+    // Review round 1, I5: the line was only ever exercised in mode 3.
+    it('checks mode 2 too, against the mode-2 scope file', async () => {
+      const extra = [join(home, 'notas')]
+      await mkdir(extra[0] as string, { recursive: true })
+      await profileFor({ kind: 'folders', extra })
+      await shareWith('mis reglas', scopeDescription({ kind: 'folders', extra }, home))
+      expect(check(await doctorWith(), name).ok).toBe(false)
+      await shareWith(RESPONDER_PERSONA, null)
+      expect(check(await doctorWith(), name).ok).toBe(true)
+    })
+
     it('fails when the scope file describes another mode', async () => {
       await profileFor({ kind: 'home' })
       await shareWith(RESPONDER_PERSONA, scopeDescription({ kind: 'folder' }, home))
@@ -434,7 +445,9 @@ describe('runDoctor with the scope saved in responder.json', () => {
       const checks = await doctorWith()
       for (const dir of extra) {
         expect(check(checks, `Sin enlaces que salgan de la carpeta extra ${dir}`).ok).toBe(true)
-        expect(check(checks, `Sin configuración de proyecto en la carpeta extra ${dir}`).ok).toBe(true)
+        // V18/V19: project configuration does not load from an additional directory, so there is
+        // no line about it for an extra folder at all.
+        expect(checks.find((c) => c.name === `Sin configuración de proyecto en la carpeta extra ${dir}`)).toBeUndefined()
       }
     })
 
@@ -451,14 +464,94 @@ describe('runDoctor with the scope saved in responder.json', () => {
       expect(check(checks, `Sin enlaces que salgan de la carpeta extra ${clean}`).ok).toBe(true)
     })
 
-    it('flags project configuration in an extra folder, naming it', async () => {
-      const [, withAgents] = extra as [string, string]
-      await writeFile(join(withAgents, 'AGENTS.md'), '# instructions')
+    // Review round 1, I1. With Read, Glob and Grep denied, nothing from an additional directory
+    // reached the model on the real binary (verificaciones.md, V18/V19): a project folder added in
+    // mode 2 is not a hazard for carrying its own `.claude/`, `AGENTS.md` or `.mcp.json`. Blocking
+    // on them stopped setup from offering to start on the folder people add most.
+    async function withEveryProjectArtifact(dir: string): Promise<void> {
+      await mkdir(join(dir, '.claude', 'skills', 'x'), { recursive: true })
+      await mkdir(join(dir, '.claude', 'agents'), { recursive: true })
+      await mkdir(join(dir, '.claude', 'commands'), { recursive: true })
+      await writeFile(join(dir, '.claude', 'settings.json'), '{}')
+      await writeFile(join(dir, '.claude', 'settings.local.json'), '{}')
+      await writeFile(join(dir, '.claude', 'skills', 'x', 'SKILL.md'), '---\nname: x\n---\n')
+      await writeFile(join(dir, '.claude', 'agents', 'a.md'), '# agent')
+      await writeFile(join(dir, '.claude', 'commands', 'c.md'), '# command')
+      await writeFile(join(dir, '.mcp.json'), '{}')
+      await writeFile(join(dir, 'CLAUDE.local.md'), '# local')
+      await writeFile(join(dir, 'AGENTS.md'), '# instructions')
+    }
+
+    it('passes a project folder full of project configuration as an extra folder', async () => {
+      const [, project] = extra as [string, string]
+      await withEveryProjectArtifact(project)
       await profileFor({ kind: 'folders', extra })
-      const bad = check(await doctorWith(), `Sin configuración de proyecto en la carpeta extra ${withAgents}`)
-      expect(bad.ok).toBe(false)
-      expect(bad.detail).toContain(withAgents)
+      const checks = await doctorWith()
+      expect(checks.filter((c) => c.name.includes(project) && !c.ok)).toEqual([])
     })
+
+    it('still fails the same configuration in the working directory', async () => {
+      await withEveryProjectArtifact(shareDir)
+      await profileFor({ kind: 'folders', extra })
+      const checks = await runDoctor(doctorOptions({ profileHome, home, shareDir }))
+      const bad = check(checks, 'Sin configuración de proyecto en la carpeta compartida')
+      expect(bad.ok).toBe(false)
+      expect(bad.blocking).toBe(true)
+    })
+
+    // Review round 1, I3. macOS privacy settings keep the terminal out of Documents, Desktop or
+    // Downloads: `stat` passes, `readdir` gets EPERM. chmod 000 is the same shape (EACCES) without
+    // needing a real privacy denial.
+    it('says a folder it cannot open is kept out by macOS, with the fix, blocking but not security', async () => {
+      const [, locked] = extra as [string, string]
+      await profileFor({ kind: 'folders', extra })
+      await chmod(locked, 0o000)
+      cleanups.push(() => chmod(locked, 0o700))
+      const checks = await runDoctor(doctorOptions({ profileHome, home, platform: 'darwin' }))
+      const line = check(checks, `Carpeta extra ${locked}`)
+      expect(line.ok).toBe(false)
+      expect(line.blocking).toBe(true)
+      expect(line.security).toBe(false)
+      expect(line.detail).toContain(locked)
+      expect(line.detail).toContain('Privacidad y seguridad › Archivos y carpetas')
+      // Nothing claims to have looked inside a folder it could not open.
+      expect(checks.find((c) => c.name === `Sin enlaces que salgan de la carpeta extra ${locked}`)).toBeUndefined()
+      expect(checks.find((c) => c.name === `Sin configuración de proyecto en la carpeta extra ${locked}`)).toBeUndefined()
+    })
+
+    it('keeps the old wording for a subfolder it cannot open', async () => {
+      const [, withLocked] = extra as [string, string]
+      await mkdir(join(withLocked, 'cerrada'))
+      await chmod(join(withLocked, 'cerrada'), 0o000)
+      cleanups.push(() => chmod(join(withLocked, 'cerrada'), 0o700))
+      await profileFor({ kind: 'folders', extra })
+      const checks = await runDoctor(doctorOptions({ profileHome, home, platform: 'darwin' }))
+      const line = check(checks, `Sin enlaces que salgan de la carpeta extra ${withLocked}`)
+      expect(line.ok).toBe(false)
+      expect(line.detail).toContain('no se pudieron revisar (sin permiso de lectura)')
+      expect(checks.find((c) => c.name === `Carpeta extra ${withLocked}`)).toBeUndefined()
+    })
+
+    // Review round 1, M1: the extra folders are walked with setup's own bounds, and a partial walk
+    // is said, without failing the line.
+    it('says when an extra folder was too deep to review fully, without failing it', async () => {
+      const [, deep] = extra as [string, string]
+      await mkdir(join(deep, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'), { recursive: true })
+      await profileFor({ kind: 'folders', extra })
+      const line = check(await doctorWith(), `Sin enlaces que salgan de la carpeta extra ${deep}`)
+      expect(line.ok).toBe(true)
+      expect(line.detail).toMatch(/no revisé todo/)
+    })
+
+    it('stops walking a very large extra folder and says so, without failing it', async () => {
+      const [, big] = extra as [string, string]
+      const names = Array.from({ length: 20_001 }, (_, i) => join(big, `f${i}`))
+      for (let i = 0; i < names.length; i += 1000) await Promise.all(names.slice(i, i + 1000).map((n) => writeFile(n, '')))
+      await profileFor({ kind: 'folders', extra })
+      const line = check(await doctorWith(), `Sin enlaces que salgan de la carpeta extra ${big}`)
+      expect(line.ok).toBe(true)
+      expect(line.detail).toMatch(/no terminé de revisarla/)
+    }, 30_000)
 
     // The persona CLAUDE.md belongs in the working directory only; an extra folder without one is
     // what it should be, and a line saying "falta CLAUDE.md" about it would be a false alarm.
@@ -477,6 +570,8 @@ describe('runDoctor with the scope saved in responder.json', () => {
       const missing = check(checks, `Carpeta extra ${gone}`)
       expect(missing.ok).toBe(false)
       expect(missing.blocking).toBe(true)
+      // A folder that is gone exposes nothing: it stops `responder`, it is not about safety.
+      expect(missing.security).toBe(false)
       expect(missing.detail).toContain(gone)
       // Nothing claims to have looked inside a folder that is not there.
       expect(checks.find((c) => c.name === `Sin enlaces que salgan de la carpeta extra ${gone}`)).toBeUndefined()

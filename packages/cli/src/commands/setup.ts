@@ -22,7 +22,7 @@ import { isSameOrWithin, resolveComparablePath } from '../fs-paths'
 import { defaultInteractiveRunner, type InteractiveRunner } from '../interactive'
 import { describeFsError } from '../spanish-errors'
 import { connect } from './connect'
-import { projectConfigArtifacts, runDoctor, type Check } from './doctor'
+import { MAX_SCAN_DEPTH, MAX_SCAN_ENTRIES, projectConfigArtifacts, runDoctor, type Check } from './doctor'
 import { readResponderConfig, runResponder } from './responder'
 import { scopeProblem, scopeSummary, type ResponderScope } from './responder-config'
 import {
@@ -318,8 +318,7 @@ async function chooseShareDir(o: {
 // in alongside real files, at any depth) without pretending to be a full secret scanner.
 const CREDENTIAL_NAME_PATTERNS = [/^\.env(\..*)?$/, /\.pem$/i, /\.key$/i, /^id_rsa/i, /^credentials/i]
 
-const MAX_SCAN_DEPTH = 6
-const MAX_SCAN_ENTRIES = 20000
+// Shared with doctor's bounded walk of mode 2's extra folders, so both stop at the same place.
 
 type ShareDirScan = {
   gitDirs: string[]

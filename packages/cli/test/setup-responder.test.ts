@@ -1,5 +1,5 @@
 import { CLI_COMMAND } from '@agentbridge/core'
-import { access, chmod, mkdir, mkdtemp, readFile, stat, symlink, writeFile } from 'node:fs/promises'
+import { access, chmod, lstat, mkdir, mkdtemp, readFile, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -570,10 +570,57 @@ describe('the persona and the scope file', () => {
 
     for (const dir of extras()) await mkdir(dir, { recursive: true })
     await run({ kind: 'folders', extra: extras() })
-    for (const dir of extras()) expect(await scopeFile()).toContain(`- ${dir}`)
+    for (const dir of extras()) expect(await scopeFile()).toContain(`- \`${dir}\``)
 
     await run({ kind: 'home' })
-    expect(await scopeFile()).toContain(`your owner's personal folder, ${personal()}, except the protected places`)
+    expect(await scopeFile()).toContain(`your owner's personal folder, \`${personal()}\`, except the protected places`)
+  })
+
+  // Review round 1, I5 and a Minor: the sentence that keeps a wider reach from becoming a wider
+  // disclosure, in both wider modes. It could be deleted with every test green.
+  it('tells the model in modes 2 and 3 that being able to read a secret is no reason to pass it on', () => {
+    for (const scope of [{ kind: 'folders' as const, extra: ['/srv/notas'] }, { kind: 'home' as const }]) {
+      expect(scopeDescription(scope, '/casa')).toContain(
+        'never pass on a password, token or key you come across, even outside the protected places',
+      )
+    }
+  })
+
+  // Review round 1, Minor: a folder name is free text, and `@x` in running text is a CLAUDE.md
+  // import. Each path is a code span, where imports are not evaluated.
+  it('keeps a folder whose name contains " @" from reading as an import', () => {
+    const odd = '/srv/notas @x/y'
+    const withBacktick = '/srv/a`b @z'
+    const text = scopeDescription({ kind: 'folders', extra: [odd, withBacktick] }, '/casa')
+    expect(text).toContain(`- \`${odd}\``)
+    expect(text).toContain(`- \`\` ${withBacktick} \`\``)
+    // Outside the code spans, no `@` is left for an import to start from.
+    const outsideSpans = text.replace(/(`+)[^`]*?(?:`(?!\1)[^`]*?)*\1/g, '')
+    expect(outsideSpans).not.toContain('@')
+    expect(scopeDescription({ kind: 'home' }, '/Users/ana @x')).toContain('`/Users/ana @x`')
+  })
+
+  // Review round 1, I4. The shared folder is written into by sync clients and `git pull`; a symlink
+  // named like the scope file must be replaced, never written through.
+  it('replaces a symlink planted as the scope file instead of writing through it', async () => {
+    const outside = join(root, 'id_rsa')
+    await writeFile(outside, 'LLAVE PRIVADA')
+    await mkdir(shareDir, { recursive: true })
+    await symlink(outside, join(shareDir, SCOPE_FILE))
+    await run({ kind: 'folder' })
+    expect(await readFile(outside, 'utf8')).toBe('LLAVE PRIVADA')
+    expect((await lstat(join(shareDir, SCOPE_FILE))).isFile()).toBe(true)
+    expect(await scopeFile()).toBe(scopeDescription({ kind: 'folder' }, personal()))
+  })
+
+  // The same, for the persona: a dangling CLAUDE.md link is "something is there", not "absent" —
+  // writing the persona would otherwise create the file it points at.
+  it('never writes through a dangling CLAUDE.md symlink', async () => {
+    const target = join(root, 'en-otro-lado.md')
+    await mkdir(shareDir, { recursive: true })
+    await symlink(target, join(shareDir, 'CLAUDE.md'))
+    await run({ kind: 'folder' })
+    await expect(access(target)).rejects.toThrow()
   })
 
   // The failure the file exists to prevent: switching back to one folder must not leave the model
@@ -602,9 +649,39 @@ describe('the persona and the scope file', () => {
   it('says so when a CLAUDE.md the person wrote does not point at the scope file, in modes 2 and 3', async () => {
     await mkdir(shareDir, { recursive: true })
     await writeFile(join(shareDir, 'CLAUDE.md'), 'mis reglas')
+    for (const dir of extras()) await mkdir(dir, { recursive: true })
+    // Both modes the title names — review round 1 found this ran mode 3 only.
+    for (const scope of [{ kind: 'folders', extra: extras() }, { kind: 'home' }] as const) {
+      const said = (await run(scope)).lines.join('\n')
+      expect(said, scope.kind).toContain(`no menciona ${SCOPE_FILE}`)
+      expect(said, scope.kind).toContain(`@${SCOPE_FILE}`)
+    }
+  })
+
+  // Review round 1, I2: the most common real edit is the old text with the person's own rules
+  // added below it. That is theirs; a prefix match would have overwritten it.
+  it('leaves the old persona with the person\'s own lines appended untouched, and warns', async () => {
+    await mkdir(shareDir, { recursive: true })
+    const edited = `${LEGACY_PERSONA}- Also answer in English when asked in English.\n`
+    await writeFile(join(shareDir, 'CLAUDE.md'), edited)
     const said = (await run({ kind: 'home' })).lines.join('\n')
+    expect(await persona()).toBe(edited)
     expect(said).toContain(`no menciona ${SCOPE_FILE}`)
-    expect(said).toContain(`@${SCOPE_FILE}`)
+  })
+
+  it('says it could not read a CLAUDE.md it cannot open, instead of "no menciona"', async () => {
+    await mkdir(shareDir, { recursive: true })
+    await writeFile(join(shareDir, 'CLAUDE.md'), 'mis reglas')
+    await chmod(join(shareDir, 'CLAUDE.md'), 0o000)
+    let said: string
+    try {
+      said = (await run({ kind: 'home' })).lines.join('\n')
+    } finally {
+      await chmod(join(shareDir, 'CLAUDE.md'), 0o600)
+    }
+    expect(said).toMatch(/No pude leer .*CLAUDE\.md/)
+    expect(said).not.toContain('no menciona')
+    expect(await persona()).toBe('mis reglas')
   })
 
   it('does not warn in mode 1, where a CLAUDE.md without the scope file still describes the reach', async () => {
