@@ -71,7 +71,9 @@ describe('the docs say what the scopes do, and no more', () => {
     // back to the model and it refused; without a positive control a "not loaded" proves nothing.
     const runbook = await readFile(join(ROOT, 'docs/runbooks/aceptacion-0.4.md'), 'utf8')
     const section = runbook.slice(runbook.indexOf('## 8. '), runbook.indexOf('## 9. '))
-    expect(section).toContain('"disableAllHooks": true')
+    // The lesson, and the line the person actually copies into every probe's settings.
+    expect(section).toContain('**Cada sonda lleva `"disableAllHooks": true` en su archivo de ajustes.**')
+    expect(section).toMatch(/^  "disableAllHooks": true,$/m)
     expect(section).toContain('Cada "no" necesita su "sí".')
     expect(section).toContain('nombres neutros')
     for (const heading of ['### 8.2 Opción 1', '### 8.3 Opción 2', '### 8.4 Opción 3', '### 8.7 Limpieza']) {
