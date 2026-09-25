@@ -616,6 +616,26 @@ describe('runDoctor with --share alone (no --profile)', () => {
     expect(checks.some((c) => !c.ok)).toBe(true)
   })
 
+  // Review round 1, follow-up: a shared folder kept in ~/Documents with the terminal refused by
+  // macOS's privacy settings is exactly as unreadable as an extra folder. chmod 000 is the same shape
+  // (EACCES) without a real privacy denial.
+  it('says the shared folder is kept out by macOS, with the fix, blocking but not security', async () => {
+    await seedIdentity()
+    await chmod(shareDir, 0o000)
+    cleanups.push(() => chmod(shareDir, 0o700))
+    const checks = await runDoctor({ ...doctorOptions(), shareDir, platform: 'darwin' })
+    const line = check(checks, 'Carpeta compartida')
+    expect(line.ok).toBe(false)
+    expect(line.blocking).toBe(true)
+    expect(line.security).toBe(false)
+    expect(line.detail).toContain(shareDir)
+    expect(line.detail).toContain('Privacidad y seguridad › Archivos y carpetas')
+    // Nothing reports on the inside of a folder it could not open.
+    expect(checks.find((c) => c.name === 'Sin enlaces que salgan de la carpeta')).toBeUndefined()
+    expect(checks.find((c) => c.name === 'Sin configuración de proyecto en la carpeta compartida')).toBeUndefined()
+    expect(checks.filter((c) => c.name === 'Carpeta compartida')).toHaveLength(1)
+  })
+
   it('does not report the profile/share cross-check when --profile was never given', async () => {
     await seedIdentity()
     const checks = await runDoctor({ ...doctorOptions(), shareDir })

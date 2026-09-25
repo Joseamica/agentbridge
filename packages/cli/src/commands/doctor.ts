@@ -406,11 +406,47 @@ export async function probeBoard(o: {
 // they are the whole reason `--share` exists as its own flag, and folding them into
 // `addProfileChecks` (gated on `--profile`) is what let an `AGENTS.md` sitting in the shared
 // folder go unreported when nobody happened to also pass `--profile`.
+// Whether a folder itself refuses to be opened — not a subfolder, the folder. On macOS that is
+// almost always the privacy settings keeping the terminal out of Documents, Desktop or Downloads:
+// `stat` passes and `readdir` gets EPERM. Detected by the error, never by the folder's name.
+async function cannotOpen(dir: string): Promise<boolean> {
+  const code = await readdir(dir).then(
+    () => null,
+    (err: NodeJS.ErrnoException) => err.code ?? null,
+  )
+  return code === 'EPERM' || code === 'EACCES'
+}
+
+// Said the same way for the shared folder and for an extra folder: the cause and where to fix it.
+// Walking such a folder printed "1 ruta(s) no se pudieron revisar" as a security failure with no
+// cause and no way out.
+function cannotOpenDetail(dir: string, platform: NodeJS.Platform): string {
+  return platform === 'darwin'
+    ? `No puedo abrir ${dir}: macOS no deja que este programa entre en esa carpeta. Ve a Ajustes del Sistema › Privacidad y seguridad › Archivos y carpetas (o Acceso total al disco) y permite la app de terminal donde corres esto. Hasta entonces, tu agente tampoco puede leerla.`
+    : `No puedo abrir ${dir}: no tengo permiso para leer esa carpeta. Hasta que lo tenga, tu agente tampoco puede leerla.`
+}
+
 async function addShareChecks(
   add: (name: string, ok: boolean, detail: string, blocking: boolean, security?: boolean) => void,
-  o: { shareDir: string; profileHome?: string },
+  o: { shareDir: string; profileHome?: string; platform: NodeJS.Platform },
 ): Promise<void> {
   const shareDir = resolve(o.shareDir)
+  // A shared folder kept in ~/Documents is a likely choice, and declining macOS's prompt for the
+  // terminal leaves it exactly as unreadable as an extra folder: the agent can read nothing at
+  // all. Its own line, blocking — but not `security`: it is a permission the person must grant,
+  // not a hole. The persona, links and project-config lines are skipped: each would report on a
+  // folder nobody could open ("Falta CLAUDE.md", "Ninguna"). The cross-check below compares paths
+  // only, so it still runs.
+  const locked = await cannotOpen(shareDir)
+  if (locked) add('Carpeta compartida', false, cannotOpenDetail(shareDir, o.platform), true, false)
+  else await addShareContentChecks(add, shareDir)
+  await addProfileCrossCheck(add, o)
+}
+
+async function addShareContentChecks(
+  add: (name: string, ok: boolean, detail: string, blocking: boolean, security?: boolean) => void,
+  shareDir: string,
+): Promise<void> {
   const persona = await access(join(shareDir, 'CLAUDE.md'))
     .then(() => true)
     .catch(() => false)
@@ -431,7 +467,12 @@ async function addShareChecks(
     linksName: 'Sin enlaces que salgan de la carpeta',
     configName: 'Sin configuración de proyecto en la carpeta compartida',
   })
+}
 
+async function addProfileCrossCheck(
+  add: (name: string, ok: boolean, detail: string, blocking: boolean, security?: boolean) => void,
+  o: { shareDir: string; profileHome?: string },
+): Promise<void> {
   // This one needs both flags at once — it says nothing about the shared folder alone — so it
   // only runs when `--profile` was also given, same as before the split.
   if (o.profileHome) {
@@ -581,20 +622,8 @@ async function addScopeChecks(
     // revisar" as a security failure with no cause and no way out. Blocking, because the agent
     // started from the same terminal cannot read it either; not `security`, because a folder
     // nobody can open exposes nothing. Detected by the error, never by the folder's name.
-    const opened = await readdir(dir).then(
-      () => null,
-      (err: NodeJS.ErrnoException) => err.code ?? 'ERR',
-    )
-    if (opened === 'EPERM' || opened === 'EACCES') {
-      add(
-        `Carpeta extra ${dir}`,
-        false,
-        platform === 'darwin'
-          ? `No puedo abrir ${dir}: macOS no deja que este programa entre en esa carpeta. Ve a Ajustes del Sistema › Privacidad y seguridad › Archivos y carpetas (o Acceso total al disco) y permite la app de terminal donde corres esto. Hasta entonces, tu agente tampoco puede leerla.`
-          : `No puedo abrir ${dir}: no tengo permiso para leer esa carpeta. Hasta que lo tenga, tu agente tampoco puede leerla.`,
-        true,
-        false,
-      )
+    if (await cannotOpen(dir)) {
+      add(`Carpeta extra ${dir}`, false, cannotOpenDetail(dir, platform), true, false)
       continue
     }
     // Links only. The project-configuration check is the working directory's alone: with Read,
@@ -842,7 +871,7 @@ export async function runDoctor(o: {
   // is the whole point of I1's fix), and `--profile` alone must still examine the profile. The
   // one check that needs both (the cross-containment check) lives inside addShareChecks and
   // only fires when profileHome is also present — see the comment there.
-  if (o.shareDir) await addShareChecks(add, { shareDir: o.shareDir, profileHome: o.profileHome })
+  if (o.shareDir) await addShareChecks(add, { shareDir: o.shareDir, profileHome: o.profileHome, platform })
   if (o.profileHome) {
     await addProfileChecks(add, { profileHome: o.profileHome, identityHome: o.identityHome, repoDir: o.repoDir, run, home: o.home ?? homedir(), platform })
   }
