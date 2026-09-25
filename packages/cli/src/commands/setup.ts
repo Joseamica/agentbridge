@@ -62,6 +62,10 @@ export type SetupContext = CliContext & {
   // Windows refusals (mode 2 entirely, mode 3 with a folder outside the personal folder) can be
   // walked through on any machine; defaults to this one.
   platform?: NodeJS.Platform
+  // The personal folder the scope question reasons about and setupResponder anchors to. Injected
+  // so a test decides which caja fuerte folders exist, instead of whatever this machine has: the
+  // case-blind caja test proved nothing on a Mac with a real `~/.kube` (task 2 review, M8).
+  personalHome?: string
 }
 
 // The truth today: the key and the name are only ever created by answering these two questions,
@@ -105,7 +109,10 @@ const SHARE_FOLDER_EXPLANATION_ES = [
   'depende de que el modelo se porte bien: está impuesto por configuración, y esa configuración',
   'solo protege lo que está DENTRO de la carpeta que elijas. Por eso:',
   '  - Usa una carpeta nueva y vacía, dedicada solo a esto.',
-  '  - No la apuntes a tu repositorio de trabajo ni a tu carpeta de usuario.',
+  // "carpeta personal", the name option 3 of the scope question uses for the same folder, a few
+  // lines later (task 2 review, M1): two names for one thing read as two things.
+  '  - No la apuntes a tu repositorio de trabajo ni a tu carpeta personal.',
+  '    (Si quieres que tu agente vea toda tu carpeta personal, eso te lo pregunto después.)',
   '  - Copia ahí solo lo que de verdad quieras compartir.',
 ].join('\n')
 
@@ -217,8 +224,17 @@ async function askWithRetries<T>(
 // without ever creating anything on disk — an earlier test instead ran a full guided setup
 // against a path under the real `~/AgentBridge`, and a failing assertion partway through left a
 // stray folder in the owner's actual home when the cleanup at the end of the test never ran.
-export function expandUserPath(raw: string): string {
-  const trimmed = raw.trim()
+//
+// A folder dragged into the macOS Terminal arrives shell-escaped (`Mis\ Documentos`), and some
+// terminals wrap it in quotes instead. Both are undone here, the way a shell would have, before
+// any other check: left in, the backslash reached the glob-character refusal and a person who
+// did exactly what a non-programmer does was told to rename a folder whose name was fine (task 2
+// review, M5). Not on Windows, where the backslash is the path separator.
+export function expandUserPath(raw: string, platform: NodeJS.Platform = process.platform): string {
+  let trimmed = raw.trim()
+  const quoted = /^(['"])(.*)\1$/s.exec(trimmed)
+  if (quoted) trimmed = quoted[2] ?? ''
+  if (platform !== 'win32') trimmed = trimmed.replace(/\\(.)/gs, '$1')
   if (trimmed === '~' || trimmed === '$HOME') return homedir()
   if (trimmed.startsWith('~/')) return join(homedir(), trimmed.slice(2))
   if (trimmed.startsWith('$HOME/')) return join(homedir(), trimmed.slice('$HOME/'.length))
@@ -235,7 +251,7 @@ const MAX_FOLDER_ATTEMPTS = 3
 function hardRefusal(assessment: ShareDirAssessment): string | null {
   if (assessment.problem) return `No puedo usar esa carpeta: ${assessment.problem}.`
   if (assessment.isHome) {
-    return 'Esa es tu carpeta de usuario, y compartirla dejaría visible todo lo que tienes en la computadora.'
+    return 'Esa es tu carpeta personal, y compartirla así dejaría visible todo lo que tienes en la computadora.'
   }
   if (assessment.credentialConflict) {
     // What is actually at stake differs by branch (Q1: the dedicated profile holds no key or
@@ -263,10 +279,11 @@ async function chooseShareDir(o: {
   out: Output
   defaultShare: string
   assess: (shareDir: string) => Promise<ShareDirAssessment>
+  platform: NodeJS.Platform
 }): Promise<{ shareDir: string; assessment: ShareDirAssessment }> {
   for (let attempt = 1; attempt <= MAX_FOLDER_ATTEMPTS; attempt++) {
     const rawShare = (await o.prompt(`Carpeta a compartir (Enter para usar ${o.defaultShare}): `)).trim()
-    const shareDir = resolve(expandUserPath(rawShare) || o.defaultShare)
+    const shareDir = resolve(expandUserPath(rawShare, o.platform) || o.defaultShare)
     // Logged explicitly (not just folded into the question text below) so it is always visible
     // — to a person at a real terminal AND to anything inspecting this command's output — even
     // though a real readline `.question()` would also echo its own question string to the
@@ -545,16 +562,25 @@ export function scopeSummary(scope: ResponderScope): string {
   return `Tu agente puede ver: la carpeta compartida y ${more}.`
 }
 
+// Says exactly what is shut and, in the same breath, what is not (task 2 review, I2). An earlier
+// wording said "tus archivos de llaves siguen cerrados", while only six file kinds are denied: an
+// `id_rsa` or a `credentials.json` in a chosen folder stays readable once CONFIRMAR is typed. A
+// reassurance that is not true is worse than none, because the person relies on it.
 const EXTRA_FOLDERS_EXPLANATION_ES = [
   'Dime las otras carpetas que tu agente puede leer, una por una.',
   'Cuando termines, deja la respuesta vacía y presiona Enter.',
-  'Dentro de esas carpetas, tus archivos .env y tus archivos de llaves siguen cerrados.',
+  'Dentro de esas carpetas siguen cerrados los archivos .env y los archivos de llaves que terminan en .pem, .key, .p12 o .pfx.',
+  'Cualquier otro archivo sí se puede leer, aunque guarde una clave: por ejemplo un id_rsa, un credentials.json o una contraseña escrita en un documento.',
 ].join('\n')
 
 // Mode 3 says, before the confirmation, the one thing a person must understand to answer it: that
 // it is not "what I mean to share" but every file in the personal folder, for anyone they let ask.
 // The caja fuerte is named in everyday words — nobody who does not program knows what `~/.ssh` is,
-// and they do not need to: they need to know their passwords and their everyday Claude stay shut.
+// and they do not need to. It is also named as what it is, the best-known places, followed by
+// what it does not reach: the first wording promised "tus contraseñas y llaves" were shut, and a
+// `contraseñas.docx`, saved mail and chats, or a cloud tool's token file are all readable (task 2
+// review, I2). This is the consent screen for the widest mode; its reassurance has to be as exact
+// as its warning.
 function homeExplanation(home: string): string {
   return [
     `Con esta opción, tu agente puede leer cualquier archivo de tu carpeta personal (${home}):`,
@@ -562,10 +588,13 @@ function homeExplanation(home: string): string {
     '',
     'Lo que sigue cerrado siempre — la "caja fuerte", que nadie puede abrir, ni tú desde aquí:',
     '  - tu llave de AgentBridge',
-    '  - tus contraseñas y llaves: las del navegador, las de tu llavero y las que dan acceso a servidores y a la nube',
-    '  - tus archivos .env, donde los programas guardan sus contraseñas',
     '  - tu Claude de todos los días: tu sesión y todas tus conversaciones',
+    '  - los lugares más conocidos donde se guardan contraseñas y llaves: las del navegador, las de tu llavero y las que dan acceso a servidores y a la nube',
+    '  - tus archivos .env, donde los programas guardan sus contraseñas',
     'Los archivos del sistema, fuera de tu carpeta personal, también siguen cerrados.',
+    '',
+    'La caja fuerte no lo cubre todo. Si tienes una contraseña escrita en un documento, correos o chats',
+    'guardados en tu computadora, o un archivo de llaves con un nombre poco común, tu agente sí puede leerlos.',
     '',
     'Importante: cualquier persona a la que le des permiso de preguntarte puede preguntar por',
     'cualquier otro archivo de tu carpeta personal, y tu agente se lo va a leer. No solo lo que tú',
@@ -593,6 +622,8 @@ type ScopeInterview = {
   shareDir: string
   identityHome: string
   profileHome: string
+  // The personal folder: what mode 3 opens and what the `~/…` rules are anchored to.
+  home: string
   platform: NodeJS.Platform
   saved: ResponderScope | null
 }
@@ -617,16 +648,18 @@ async function chooseScope(o: ScopeInterview): Promise<ResponderScope> {
     shareDir: resolve(o.shareDir),
     identityHome: resolve(o.identityHome),
     profileHome: resolve(o.profileHome),
-    home: homedir(),
+    home: o.home,
     platform: o.platform,
   }
   const onEnter = o.saved ? scopeNumber(o.saved) : 1
   const enterHint = onEnter === 1 ? 'Enter para la 1' : `Enter para dejar la ${onEnter}, la que tienes ahora`
   const question = [...SCOPE_QUESTION_LINES, `Escribe 1, 2 o 3 (${enterHint}): `].join('\n')
+  let lastWasBlocked = false
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const raw = await o.prompt(question)
     const choice = parseScopeChoice(raw, onEnter)
     if (choice === null) {
+      lastWasBlocked = false
       o.out.log(`No entendí "${raw.trim()}". Escribe 1, 2 o 3.`)
       continue
     }
@@ -635,6 +668,7 @@ async function chooseScope(o: ScopeInterview): Promise<ResponderScope> {
     // write would refuse, and a refusal here must lead back to the question, not out of setup.
     const blocked = unenforceable(choice === 2 ? { kind: 'folders', extra: [] } : { kind: 'home' }, paths)
     if (blocked) {
+      lastWasBlocked = true
       o.out.log(blocked)
       o.out.log('Elige otra opción.')
       continue
@@ -646,9 +680,14 @@ async function chooseScope(o: ScopeInterview): Promise<ResponderScope> {
     o.out.log('No añadiste ninguna carpeta, así que tu agente solo va a ver esta carpeta (opción 1).')
     return { kind: 'folder' }
   }
-  // Falls back instead of ending the interview: one folder is the narrowest choice, so landing on
-  // it can only ever show less than intended, never more.
-  o.out.log(`No entendí qué opción querías, así que dejo solo esta carpeta (opción 1). Para cambiarlo, vuelve a correr: ${CLI_COMMAND} setup`)
+  // Falls back instead of ending the interview, and always to one folder — never to the saved
+  // scope: "keep what they had" would restore a saved mode 3 without the typed confirmation.
+  // A choice that was understood but is unavailable here is not "no entendí" (review, M2).
+  o.out.log(
+    lastWasBlocked
+      ? `Esa opción no se puede usar en esta computadora, así que dejo solo esta carpeta (opción 1). Para cambiarlo, vuelve a correr: ${CLI_COMMAND} setup`
+      : `No entendí qué opción querías, así que dejo solo esta carpeta (opción 1). Para cambiarlo, vuelve a correr: ${CLI_COMMAND} setup`,
+  )
   return { kind: 'folder' }
 }
 
@@ -656,15 +695,23 @@ async function chooseScope(o: ScopeInterview): Promise<ResponderScope> {
 // is the safe answer — unlike the shared-folder gate, where a miss ends the interview.
 async function confirmHome(o: ScopeInterview): Promise<ResponderScope> {
   o.out.log('')
-  o.out.log(homeExplanation(homedir()))
+  o.out.log(homeExplanation(o.home))
   const raw = await o.prompt(`Escribe ${CONFIRM_WORD} para continuar: `)
-  if (parseConfirmation(raw)) return { kind: 'home' }
+  if (parseConfirmation(raw)) {
+    // A way back, said at the moment of choosing, so CONFIRMAR does not read as final (review, M10).
+    o.out.log(`Si cambias de opinión, vuelve a correr "${CLI_COMMAND} setup" y elige la opción 1.`)
+    return { kind: 'home' }
+  }
   o.out.log(`No escribiste ${CONFIRM_WORD}, así que dejo solo esta carpeta (opción 1).`)
   return { kind: 'folder' }
 }
 
 async function chooseExtraFolders(o: ScopeInterview, paths: ScopePaths, previous: readonly string[]): Promise<string[]> {
-  const chosen: string[] = []
+  let chosen: string[] = []
+  const accept = (dir: string, replaces: readonly string[]): void => {
+    chosen = [...chosen.filter((c) => !replaces.includes(c)), dir]
+    for (const c of replaces) o.out.log(`Quité de la lista ${c}: está dentro de esta, así que tu agente la sigue viendo.`)
+  }
   o.out.log('')
   o.out.log(EXTRA_FOLDERS_EXPLANATION_ES)
   if (previous.length > 0) {
@@ -683,17 +730,30 @@ async function chooseExtraFolders(o: ScopeInterview, paths: ScopePaths, previous
       throw err
     })
     // Kept folders go through every check again: since the last run one may have gained a `.git`
-    // or a key file, or moved inside something the caja fuerte closes.
-    if (keep) for (const dir of previous) if (await considerExtraFolder(o, paths, dir, chosen)) chosen.push(dir)
+    // or a key file, or moved inside something the caja fuerte closes. Each is named before its
+    // checks run: a re-run once printed "no existe" and "Escribe CONFIRMAR para añadirla" under a
+    // list of three folders, and the person could not tell which one either sentence was about
+    // (task 2 review, I1).
+    if (keep) {
+      for (const dir of previous) {
+        o.out.log(`Carpeta: ${dir}`)
+        const verdict = await considerExtraFolder(o, paths, dir, chosen)
+        if (verdict.ok) {
+          accept(dir, verdict.replaces)
+          o.out.log('Sigue en la lista.')
+        }
+      }
+    }
   }
   let refusedInARow = 0
   for (;;) {
     const raw = (await o.prompt('Otra carpeta que tu agente pueda leer (Enter para terminar): ')).trim()
     if (!raw) break
-    const dir = resolve(expandUserPath(raw))
+    const dir = resolve(expandUserPath(raw, o.platform))
     o.out.log(`Carpeta: ${dir}`)
-    if (await considerExtraFolder(o, paths, dir, chosen)) {
-      chosen.push(dir)
+    const verdict = await considerExtraFolder(o, paths, dir, chosen)
+    if (verdict.ok) {
+      accept(dir, verdict.replaces)
       refusedInARow = 0
       o.out.log('Añadida.')
       continue
@@ -710,13 +770,18 @@ async function chooseExtraFolders(o: ScopeInterview, paths: ScopePaths, previous
   return chosen
 }
 
+// `replaces`: folders already on the list that sit inside this one. Adding the parent takes them
+// off, since it covers them — the alternative, refusing the parent with a sentence that named the
+// child, left the person with no way to widen the list but a re-run (task 2 review, M4).
+type ExtraVerdict = { ok: true; replaces: string[] } | { ok: false }
+
 // Every check one extra folder has to pass, each refusal with its own reason and none of them
 // ending the interview. The order matters only for which reason is said: the cheap string checks
 // run before anything touches the disk.
-async function considerExtraFolder(o: ScopeInterview, paths: ScopePaths, dir: string, chosen: readonly string[]): Promise<boolean> {
-  const refuse = (reason: string): false => {
+async function considerExtraFolder(o: ScopeInterview, paths: ScopePaths, dir: string, chosen: readonly string[]): Promise<ExtraVerdict> {
+  const refuse = (reason: string): ExtraVerdict => {
     o.out.log(reason)
-    return false
+    return { ok: false }
   }
   const [dirReal, homeReal, shareReal, identityReal, profileReal] = await Promise.all([
     resolveComparablePath(dir),
@@ -734,7 +799,7 @@ async function considerExtraFolder(o: ScopeInterview, paths: ScopePaths, dir: st
   const closed = [...cajaFuerteDirs(homeReal), identityReal, profileReal]
   if (closed.some((c) => isSameOrWithin(lower, c.toLowerCase()))) {
     return refuse(
-      'No puedo añadir esa carpeta: está dentro de la caja fuerte (tu llave de AgentBridge, tus contraseñas y llaves, tu Claude de todos los días). Tu agente no podría leer nada de ahí, así que no tiene caso añadirla.',
+      'No puedo añadir esa carpeta: está dentro de la caja fuerte (tu llave de AgentBridge, tu Claude de todos los días o uno de los lugares más conocidos donde se guardan contraseñas y llaves). Tu agente no podría leer nada de ahí, así que no tiene caso añadirla.',
     )
   }
   if (isSameOrWithin(homeReal, dirReal)) {
@@ -742,20 +807,32 @@ async function considerExtraFolder(o: ScopeInterview, paths: ScopePaths, dir: st
       'No puedo añadir esa carpeta: es tu carpeta personal, o la contiene. Si quieres que tu agente vea toda tu carpeta personal, elige la opción 3, que deja cerrados tus secretos.',
     )
   }
-  // A glob character in the name: task 1's writer refuses it, in its own sentence.
-  const blocked = unenforceable({ kind: 'folders', extra: [...chosen, dir] }, paths)
-  if (blocked) return refuse(blocked)
+  // How this folder relates to the ones already on the list, said about the folder just typed.
   const chosenReal = await Promise.all(chosen.map((d) => resolveComparablePath(d)))
+  const replaces: string[] = []
+  for (const [i, c] of chosen.entries()) {
+    const cReal = chosenReal[i] ?? c
+    if (cReal === dirReal) return refuse('No puedo añadir esa carpeta: ya está en la lista.')
+    if (isSameOrWithin(dirReal, cReal)) {
+      return refuse(`No puedo añadir esa carpeta: está dentro de ${c}, que ya añadiste, así que tu agente ya puede leerla.`)
+    }
+    if (isSameOrWithin(cReal, dirReal)) replaces.push(c)
+  }
+  const kept = chosen.filter((c) => !replaces.includes(c))
+  const keptReal = chosenReal.filter((_, i) => !replaces.includes(chosen[i] ?? ''))
+  // A glob character in the name: task 1's writer refuses it, in its own sentence.
+  const blocked = unenforceable({ kind: 'folders', extra: [...kept, dir] }, paths)
+  if (blocked) return refuse(blocked)
   const problem = scopeProblem(
-    { kind: 'folders', extra: [...chosenReal, dirReal] },
+    { kind: 'folders', extra: [...keptReal, dirReal] },
     { shareDir: shareReal, identityHome: identityReal, profileHome: profileReal },
   )
   if (problem) {
     // Judged on real paths (a `/tmp` that is really `/private/tmp` must not slip past), but said
     // with the paths the person typed: a sentence naming a folder they never mentioned reads as
     // a different folder.
-    const typed = [...chosen, dir]
-    const real = [...chosenReal, dirReal]
+    const typed = [...kept, dir]
+    const real = [...keptReal, dirReal]
     const order = real.map((_, i) => i).sort((x, y) => (real[y] ?? '').length - (real[x] ?? '').length)
     let said = problem
     for (const i of order) said = said.replaceAll(real[i] ?? '', typed[i] ?? '')
@@ -770,13 +847,13 @@ async function considerExtraFolder(o: ScopeInterview, paths: ScopePaths, dir: st
   if (!assessment.exists) {
     return refuse('No puedo añadir esa carpeta: no existe. Las carpetas extra tienen que existir ya: son carpetas tuyas que quieres que tu agente pueda leer.')
   }
-  if (assessment.reasons.length === 0) return true
+  if (assessment.reasons.length === 0) return { ok: true, replaces }
   o.out.log('Ojo: esa carpeta se ve peligrosa para compartir —')
   for (const reason of assessment.reasons) o.out.log(`  - ${reason}`)
   o.out.log(`Si de verdad quieres añadirla, escribe exactamente ${CONFIRM_WORD}. Cualquier otra respuesta la deja fuera.`)
-  if (parseConfirmation(await o.prompt(`Escribe ${CONFIRM_WORD} para añadirla: `))) return true
+  if (parseConfirmation(await o.prompt(`Escribe ${CONFIRM_WORD} para añadirla: `))) return { ok: true, replaces }
   o.out.log('No la añadí.')
-  return false
+  return { ok: false }
 }
 
 // doctor's own name for the one check this command can fix on the spot instead of merely
@@ -1019,9 +1096,12 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     const saved = await readResponderConfig(profileHome).catch(() => null)
     const defaultShare = saved?.shareDir ?? join(homedir(), 'AgentBridge', 'compartido')
 
+    const platform = ctx.platform ?? process.platform
+    const personalHome = ctx.personalHome ?? homedir()
     const { shareDir, assessment } = await chooseShareDir({
       prompt,
       out,
+      platform,
       defaultShare,
       assess: (dir) => assessShareDir(dir, { identityHome: ctx.home, profileHome }),
     })
@@ -1049,13 +1129,13 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     out.log(assessment.exists ? 'Voy a usar la carpeta que ya existe.' : 'Esa carpeta no existe todavía; la voy a crear vacía.')
     out.log('')
 
-    const platform = ctx.platform ?? process.platform
     const scope = await chooseScope({
       prompt,
       out,
       shareDir,
       identityHome: ctx.home,
       profileHome,
+      home: personalHome,
       platform,
       // Only a saved scope for this same profile; an unreadable file proposes one folder.
       saved: saved?.scope ?? null,
@@ -1075,6 +1155,7 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
         printNextSteps: false,
         scope,
         platform,
+        home: personalHome,
       })
     } catch (err) {
       if (err instanceof CliError) throw err

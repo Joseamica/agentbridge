@@ -15,7 +15,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { plainSocketFactory, startFakeBoard, type FakeBoard } from '../../core/test/support/fake-board'
 import { RESPONDER_CONFIG_FILE } from '../src/commands/responder'
-import { applyRelays, blockers, loginStep, mustMention, runSetup, setupCommand, type SetupContext } from '../src/commands/setup'
+import { applyRelays, blockers, expandUserPath, loginStep, mustMention, runSetup, setupCommand, type SetupContext } from '../src/commands/setup'
 import { memoryOutput, PromptEOF } from '../src/context'
 
 const allowAnyRelay = (inputs: readonly unknown[]): string[] => inputs.filter((x): x is string => typeof x === 'string').slice(0, 5)
@@ -924,7 +924,7 @@ describe('the shared-folder protection', () => {
   it('refuses the home directory outright — no CONFIRMAR can override it', async () => {
     await seedIdentityAndProfile()
     const { prompt, expectDrained } = scripted(['1', homedir(), '', homedir(), '', homedir(), ''])
-    await expect(runSetup(context({ prompt }))).rejects.toThrow(/carpeta de usuario/i)
+    await expect(runSetup(context({ prompt }))).rejects.toThrow(/Esa es tu carpeta personal/)
     expectDrained()
   })
 
@@ -1108,6 +1108,11 @@ describe('what the answering agent can see', () => {
     expect((await savedConfig()).scope).toEqual({ kind: 'folder' })
     expect((await savedSettings()).permissions.additionalDirectories).toBeUndefined()
     expect(summaryOf(ctx)).toContain('Tu agente puede ver: solo la carpeta compartida.')
+    // One name for one folder: the warning before the question and option 3 both say "carpeta
+    // personal" (review, M1).
+    const text = ctx.out.lines.join('\n')
+    expect(text).toContain('No la apuntes a tu repositorio de trabajo ni a tu carpeta personal.')
+    expect(text).not.toContain('carpeta de usuario')
   })
 
   it('mode 3: explains what stays shut and who can ask about the rest, then needs CONFIRMAR', async () => {
@@ -1121,13 +1126,19 @@ describe('what the answering agent can see', () => {
     await runSetup(ctx)
     ctx.expectDrained()
     const text = ctx.out.lines.join('\n')
+    // Fails loudly if the prompt text drifts: from a -1 sentinel, slice(0, -1) would cover the
+    // whole transcript and "said before" would silently become "said somewhere" (review, M9).
+    expect(linesWhenConfirmAsked).toBeGreaterThan(0)
     const explained = ctx.out.lines.slice(0, linesWhenConfirmAsked).join('\n')
     // Everything below had been said by the time the word was asked for — not after.
     expect(explained).toContain(`cualquier archivo de tu carpeta personal (${homedir()})`)
     expect(explained).toMatch(/cualquier persona a la que le des permiso de preguntarte puede preguntar por\ncualquier otro archivo de tu carpeta personal/)
     expect(explained).toContain('caja fuerte')
     expect(explained).toContain('tu llave de AgentBridge')
-    expect(explained).toMatch(/tus contraseñas y llaves/)
+    // Named as what it is — the best-known places — and followed by what it does not reach (I2).
+    expect(explained).toContain('los lugares más conocidos donde se guardan contraseñas y llaves')
+    expect(explained).toContain('La caja fuerte no lo cubre todo.')
+    expect(explained).toMatch(/una contraseña escrita en un documento, correos o chats\nguardados en tu computadora, o un archivo de llaves con un nombre poco común, tu agente sí puede leerlos/)
     expect(explained).toMatch(/tus archivos \.env/)
     expect(explained).toContain('tu Claude de todos los días')
     expect(explained).toMatch(/archivos del sistema.*siguen cerrados/)
@@ -1137,6 +1148,7 @@ describe('what the answering agent can see', () => {
     expect(ctx.out.lines.filter((line) => line.startsWith('Falta algo:'))).toEqual([])
     expect(text).toMatch(/Listo para contestar/)
     expect(summaryOf(ctx)).toContain('Tu agente puede ver: toda tu carpeta personal, menos tus secretos.')
+    expect(text).toContain(`Si cambias de opinión, vuelve a correr "${CLI_COMMAND} setup" y elige la opción 1.`)
   })
 
   it('mode 3: anything but CONFIRMAR falls back to one folder, and says so', async () => {
@@ -1158,6 +1170,11 @@ describe('what the answering agent can see', () => {
     expect((await savedSettings()).permissions.additionalDirectories).toEqual([a, b])
     expect(ctx.out.lines.filter((line) => line.startsWith('Falta algo:'))).toEqual([])
     expect(summaryOf(ctx)).toContain('Tu agente puede ver: la carpeta compartida y 2 carpetas más.')
+    // Only six file kinds are shut in an extra folder, and the text says which, and what is not (I2).
+    const text = ctx.out.lines.join('\n')
+    expect(text).toContain('siguen cerrados los archivos .env y los archivos de llaves que terminan en .pem, .key, .p12 o .pfx.')
+    expect(text).toContain('Cualquier otro archivo sí se puede leer, aunque guarde una clave')
+    expect(text).not.toContain('tus archivos de llaves siguen cerrados')
   })
 
   it('mode 2 with no folder added is one folder, said plainly', async () => {
@@ -1188,8 +1205,9 @@ describe('what the answering agent can see', () => {
     const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', a, a, inA, '', 'n'] })
     await runSetup(ctx)
     ctx.expectDrained()
-    const refusals = ctx.out.lines.filter((line) => line.includes('está repetida o dentro de otra carpeta extra'))
-    expect(refusals).toHaveLength(2)
+    const text = ctx.out.lines.join('\n')
+    expect(text).toContain('No puedo añadir esa carpeta: ya está en la lista.')
+    expect(text).toContain(`No puedo añadir esa carpeta: está dentro de ${a}, que ya añadiste, así que tu agente ya puede leerla.`)
     expect((await savedConfig()).scope).toEqual({ kind: 'folders', extra: [a] })
   })
 
@@ -1215,15 +1233,20 @@ describe('what the answering agent can see', () => {
   })
 
   it('mode 2: refuses a folder inside the caja fuerte, whatever its capitals, since nothing in it could be read', async () => {
-    // Real-home paths as strings only: every one is refused before anything touches the disk.
-    const ssh = join(homedir(), '.ssh')
+    // A personal folder this test controls, so whether a caja folder exists is decided here and
+    // not by the machine: on a Mac with a real `~/.kube`, realpath restored its capitals and the
+    // case-blind compare went untested (review, M8).
+    const casa = await folder('casa')
+    await mkdir(join(casa, '.ssh'))
+    const ssh = join(casa, '.ssh')
     // Capitals on a folder that most machines do not have: `realpath` restores the true case of a
     // folder that exists (so `~/.SSH` on a Mac with `~/.ssh` proved nothing — verified by making
     // the comparison case-sensitive), but a missing one keeps what was typed, and only the
     // case-blind comparison still recognises it.
-    const shouting = join(homedir(), '.KUBE', 'viejo')
+    const shouting = join(casa, '.KUBE', 'viejo')
     const insideIdentity = join(identityHome, 'algo')
     const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', ssh, shouting, insideIdentity, 'n'] })
+    ctx.personalHome = casa
     await runSetup(ctx)
     ctx.expectDrained()
     const refusals = ctx.out.lines.filter((line) => line.startsWith('No puedo añadir esa carpeta: está dentro de la caja fuerte'))
@@ -1333,7 +1356,15 @@ describe('what the answering agent can see', () => {
     expect(second.asked.find((q) => q.includes(SCOPE_QUESTION))).toContain('Enter para dejar la 2, la que tienes ahora')
     const text = second.out.lines.join('\n')
     expect(text).toContain('La vez pasada elegiste además estas carpetas:')
-    expect(text).toContain('No la añadí.')
+    // Each kept folder is named before its own verdict (review, I1).
+    const lines = second.out.lines
+    const aAt = lines.indexOf(`Carpeta: ${a}`)
+    const bAt = lines.indexOf(`Carpeta: ${b}`)
+    expect(aAt).toBeGreaterThan(lines.indexOf('La vez pasada elegiste además estas carpetas:'))
+    expect(lines[aAt + 1]).toBe('Sigue en la lista.')
+    expect(bAt).toBeGreaterThan(aAt)
+    expect(lines.indexOf('No la añadí.')).toBeGreaterThan(bAt)
+    expect(lines.slice(aAt + 2, bAt)).toEqual([])
     expect((await savedConfig()).scope).toEqual({ kind: 'folders', extra: [a] })
   })
 
@@ -1348,5 +1379,82 @@ describe('what the answering agent can see', () => {
     second.expectDrained()
     expect((await savedSettings()).permissions.additionalDirectories).toBeUndefined()
     expect((await savedConfig()).scope).toEqual({ kind: 'folder' })
+  })
+  // Review I3: a "keep what they had" fallback (`return o.saved ?? folder`) restored a saved mode 3
+  // with no CONFIRMAR on a re-run, and every test stayed green — they all ran with nothing saved.
+  async function afterSavedHome(): Promise<void> {
+    const first = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '3', 'CONFIRMAR', 'n'] })
+    await runSetup(first)
+    first.expectDrained()
+    expect((await savedConfig()).scope).toEqual({ kind: 'home' })
+  }
+
+  it('after a saved mode 3, answers it never understands still land on one folder, not on mode 3', async () => {
+    await afterSavedHome()
+    const second = await responderSetupContext({ answers: ['1', '', '', 'x', 'y', 'z', 'n'] })
+    await runSetup(second)
+    second.expectDrained()
+    expect(second.out.lines.join('\n')).toContain('No entendí qué opción querías, así que dejo solo esta carpeta (opción 1).')
+    expect((await savedConfig()).scope).toEqual({ kind: 'folder' })
+    expect((await savedSettings()).permissions.additionalDirectories).toBeUndefined()
+  })
+
+  it('after a saved mode 3, Enter without CONFIRMAR lands on one folder, not on mode 3', async () => {
+    await afterSavedHome()
+    const second = await responderSetupContext({ answers: ['1', '', '', '', 'no', 'n'] })
+    await runSetup(second)
+    second.expectDrained()
+    expect(second.out.lines.join('\n')).toContain('No escribiste CONFIRMAR, así que dejo solo esta carpeta (opción 1).')
+    expect((await savedConfig()).scope).toEqual({ kind: 'folder' })
+    expect((await savedSettings()).permissions.additionalDirectories).toBeUndefined()
+  })
+
+  it('on Windows, choices that were understood but are unavailable are not called "no entendí"', async () => {
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', '3', '2', 'n'] })
+    ctx.platform = 'win32'
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const text = ctx.out.lines.join('\n')
+    expect(text).toContain('Esa opción no se puede usar en esta computadora, así que dejo solo esta carpeta (opción 1).')
+    expect(text).not.toMatch(/No entendí/)
+    expect((await savedConfig()).scope).toEqual({ kind: 'folder' })
+  })
+
+  it('mode 2: a parent added after its subfolder replaces it, and says so', async () => {
+    const parent = await folder('proyectos')
+    const child = join(parent, 'uno')
+    await mkdir(child)
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', child, parent, '', 'n'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const text = ctx.out.lines.join('\n')
+    expect(text).toContain(`Quité de la lista ${child}: está dentro de esta, así que tu agente la sigue viendo.`)
+    expect(text).not.toMatch(/No puedo añadir esa carpeta/)
+    expect((await savedConfig()).scope).toEqual({ kind: 'folders', extra: [parent] })
+  })
+
+  it('takes a folder dragged into the terminal, escaped space and all, at both folder questions', async () => {
+    // What macOS Terminal inserts when a folder is dragged onto it (review, M5).
+    const spacedShare = join(root, 'mi compartido')
+    const docs = await folder('Mis Documentos')
+    const escape = (p: string) => p.replaceAll(' ', '\\ ')
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', escape(spacedShare), '', '2', escape(docs), '', 'n'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const text = ctx.out.lines.join('\n')
+    expect(text).toContain(`Voy a usar esta carpeta: ${spacedShare}`)
+    expect(text).not.toMatch(/comodín/)
+    const config = JSON.parse(await readFile(join(profileHome, RESPONDER_CONFIG_FILE), 'utf8'))
+    expect(config.shareDir).toBe(spacedShare)
+    expect(config.scope).toEqual({ kind: 'folders', extra: [docs] })
+  })
+})
+
+describe('expandUserPath', () => {
+  it('undoes the escaping and the quotes a terminal adds, except on Windows where \\ separates folders', () => {
+    expect(expandUserPath('/a/Mis\\ Documentos', 'darwin')).toBe('/a/Mis Documentos')
+    expect(expandUserPath("'/a/Mis Documentos'", 'linux')).toBe('/a/Mis Documentos')
+    expect(expandUserPath('"/a/Mis Documentos"', 'darwin')).toBe('/a/Mis Documentos')
+    expect(expandUserPath('C:\\Users\\ana\\docs', 'win32')).toBe('C:\\Users\\ana\\docs')
   })
 })
