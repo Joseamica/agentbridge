@@ -454,24 +454,37 @@ describe('runDoctor with the scope saved in responder.json', () => {
       await profileFor({ kind: 'folders', extra })
       const checks = await doctorWith()
       for (const dir of extra) {
-        expect(check(checks, `Sin enlaces que salgan de la carpeta extra ${dir}`).ok).toBe(true)
+        expect(check(checks, `Enlaces que salen de la carpeta extra ${dir}`).ok).toBe(true)
         // V18/V19: project configuration does not load from an additional directory, so there is
         // no line about it for an extra folder at all.
         expect(checks.find((c) => c.name === `Sin configuración de proyecto en la carpeta extra ${dir}`)).toBeUndefined()
       }
     })
 
-    it('flags an escaping link in one extra folder, naming that folder and only that one', async () => {
-      const [clean, leaky] = extra as [string, string]
-      await symlink(join(root, 'identidad'), join(leaky, 'atajo'))
+    // Final review, M7. A Python project's `.venv/bin/python -> /usr/bin/python3` made this a
+    // blocking security failure, and setup would not offer to start, while Claude Code resolves a
+    // link and applies the fence and the caja fuerte to its real target (verificaciones.md, V8).
+    // Said, with why it is not a risk — not failed.
+    it('says an escaping link in an extra folder, and why it is not a risk, without failing', async () => {
+      const [clean, withLink] = extra as [string, string]
+      await symlink(join(root, 'identidad'), join(withLink, 'atajo'))
       await profileFor({ kind: 'folders', extra })
       const checks = await doctorWith()
-      const bad = check(checks, `Sin enlaces que salgan de la carpeta extra ${leaky}`)
-      expect(bad.ok).toBe(false)
-      expect(bad.blocking).toBe(true)
-      expect(bad.security).toBe(true)
-      expect(bad.detail).toContain(leaky)
-      expect(check(checks, `Sin enlaces que salgan de la carpeta extra ${clean}`).ok).toBe(true)
+      const line = check(checks, `Enlaces que salen de la carpeta extra ${withLink}`)
+      expect(line.ok).toBe(true)
+      expect(line.detail).toContain('1 enlace(s) apuntan fuera de la carpeta, y no es un riesgo')
+      expect(line.detail).toContain('la misma valla y la misma caja fuerte')
+      expect(check(checks, `Enlaces que salen de la carpeta extra ${clean}`).detail).toBe('Ninguno')
+    })
+
+    // The shared folder keeps 0.3's stance: the same link there still fails, blocking.
+    it('still fails an escaping link in the shared folder', async () => {
+      await symlink(join(root, 'identidad'), join(shareDir, 'atajo'))
+      await profileFor({ kind: 'folders', extra })
+      const line = check(await runDoctor(doctorOptions({ profileHome, home, shareDir })), 'Sin enlaces que salgan de la carpeta')
+      expect(line.ok).toBe(false)
+      expect(line.blocking).toBe(true)
+      expect(line.security).toBe(true)
     })
 
     // Review round 1, I1. With Read, Glob and Grep denied, nothing from an additional directory
@@ -525,7 +538,7 @@ describe('runDoctor with the scope saved in responder.json', () => {
       expect(line.detail).toContain(locked)
       expect(line.detail).toContain('Privacidad y seguridad › Archivos y carpetas')
       // Nothing claims to have looked inside a folder it could not open.
-      expect(checks.find((c) => c.name === `Sin enlaces que salgan de la carpeta extra ${locked}`)).toBeUndefined()
+      expect(checks.find((c) => c.name === `Enlaces que salen de la carpeta extra ${locked}`)).toBeUndefined()
       expect(checks.find((c) => c.name === `Sin configuración de proyecto en la carpeta extra ${locked}`)).toBeUndefined()
     })
 
@@ -536,7 +549,7 @@ describe('runDoctor with the scope saved in responder.json', () => {
       cleanups.push(() => chmod(join(withLocked, 'cerrada'), 0o700))
       await profileFor({ kind: 'folders', extra })
       const checks = await runDoctor(doctorOptions({ profileHome, home, platform: 'darwin' }))
-      const line = check(checks, `Sin enlaces que salgan de la carpeta extra ${withLocked}`)
+      const line = check(checks, `Enlaces que salen de la carpeta extra ${withLocked}`)
       expect(line.ok).toBe(false)
       expect(line.detail).toContain('no se pudieron revisar (sin permiso de lectura)')
       expect(checks.find((c) => c.name === `Carpeta extra ${withLocked}`)).toBeUndefined()
@@ -548,7 +561,7 @@ describe('runDoctor with the scope saved in responder.json', () => {
       const [, deep] = extra as [string, string]
       await mkdir(join(deep, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'), { recursive: true })
       await profileFor({ kind: 'folders', extra })
-      const line = check(await doctorWith(), `Sin enlaces que salgan de la carpeta extra ${deep}`)
+      const line = check(await doctorWith(), `Enlaces que salen de la carpeta extra ${deep}`)
       expect(line.ok).toBe(true)
       expect(line.detail).toMatch(/no revisé todo/)
     })
@@ -558,7 +571,7 @@ describe('runDoctor with the scope saved in responder.json', () => {
       const names = Array.from({ length: 20_001 }, (_, i) => join(big, `f${i}`))
       for (let i = 0; i < names.length; i += 1000) await Promise.all(names.slice(i, i + 1000).map((n) => writeFile(n, '')))
       await profileFor({ kind: 'folders', extra })
-      const line = check(await doctorWith(), `Sin enlaces que salgan de la carpeta extra ${big}`)
+      const line = check(await doctorWith(), `Enlaces que salen de la carpeta extra ${big}`)
       expect(line.ok).toBe(true)
       expect(line.detail).toMatch(/no terminé de revisarla/)
     }, 30_000)
@@ -584,7 +597,7 @@ describe('runDoctor with the scope saved in responder.json', () => {
       expect(missing.security).toBe(false)
       expect(missing.detail).toContain(gone)
       // Nothing claims to have looked inside a folder that is not there.
-      expect(checks.find((c) => c.name === `Sin enlaces que salgan de la carpeta extra ${gone}`)).toBeUndefined()
+      expect(checks.find((c) => c.name === `Enlaces que salen de la carpeta extra ${gone}`)).toBeUndefined()
     })
   })
 })
@@ -603,14 +616,17 @@ describe('runDoctor with --share alone (no --profile)', () => {
   })
 
   it('catches an AGENTS.md sitting in the shared folder even with no --profile', async () => {
-    // The exact probe from the final review: an AGENTS.md injects itself into the responder's
-    // instructions at every session start, and used to sail through a --share-only run.
+    // The exact probe from the 0.3 final review: an AGENTS.md used to sail through a --share-only
+    // run. It stays flagged in the shared folder — a later Claude Code could start loading it.
     await seedIdentity()
     await writeFile(join(shareDir, 'AGENTS.md'), '# instructions')
     const checks = await runDoctor({ ...doctorOptions(), shareDir })
     const projectConfig = check(checks, 'Sin configuración de proyecto en la carpeta compartida')
     expect(projectConfig.ok).toBe(false)
-    expect(projectConfig.detail).toContain('se inyectan como instrucciones')
+    // Said as what it is: V19 found Claude Code 2.1.282 does not read AGENTS.md at all, so the
+    // line must not say it loads (final review, M4) — only that a later version might.
+    expect(projectConfig.detail).toContain('no lo carga, pero es un archivo de instrucciones para agentes')
+    expect(projectConfig.detail).not.toContain('se inyectan como instrucciones')
     // The exit code doctorCommand derives from `checks.some(c => !c.ok)` must therefore be 1 —
     // proven here at the level runDoctor actually controls: at least one check failed.
     expect(checks.some((c) => !c.ok)).toBe(true)

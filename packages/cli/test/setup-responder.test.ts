@@ -332,6 +332,25 @@ describe('setupResponder', () => {
     expect(calls).toEqual([])
   })
 
+  it('refuses the whole personal folder on Windows, before writing anything (ruling 5)', async () => {
+    const err = await setupResponder({
+      shareDir,
+      repoDir,
+      profileHome: home,
+      identityHome,
+      scope: { kind: 'home' },
+      // Everything under this home, so the only refusal that can fire is mode 3's own.
+      home: root,
+      platform: 'win32',
+      run: runner,
+      out: memoryOutput(),
+    }).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(CliError)
+    expect((err as CliError).message).toMatch(/toda tu carpeta personal: no está comprobado ahí que la caja fuerte quede cerrada/)
+    await expect(access(join(home, 'settings.json'))).rejects.toThrow()
+    expect(calls).toEqual([])
+  })
+
   it('does not re-permission a pre-existing home directory (a misaimed --profile is not silently narrowed)', async () => {
     await mkdir(home, { recursive: true, mode: 0o755 })
     await chmod(home, 0o755)

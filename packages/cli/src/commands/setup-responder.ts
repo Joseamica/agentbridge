@@ -127,37 +127,33 @@ const SHARE_KEY_TAILS = ['**/*.pem', '**/*.key', '**/*.p12', '**/*.pfx'] as cons
 // `proj[1]` would turn `//…/proj[1]/**` into a character class that never matches the real
 // folder — the rule would be written, pass every check, and protect nothing, the same failure as
 // V6. Refused rather than escaped: whether Claude Code honours an escape here is unverified. A
-// backslash is one too, except on Windows, where it is the path separator.
-const GLOB_CHARACTERS = /[*?[\]{}]/
-const GLOB_CHARACTERS_POSIX = /[*?[\]{}\\]/
+// backslash is one too: on macOS and Linux it is an escape, never a path separator.
+const GLOB_CHARACTERS = /[*?[\]{}\\]/
 
-// Turns an absolute path into the anchored form of a rule. On macOS and Linux that is `//<path>`
-// (V1: `Read(//<abs>/extra/secret/**)` refused on the real binary). On Windows it is unverified
-// how a drive-letter path is anchored, and a guessed form that silently matches nothing is worse
-// than no feature — so a path under the home is written with `~/`, the form mode 3 already rests
-// on, and anything else is refused.
-function anchor(path: string, o: ScopePaths): string {
-  const windows = (o.platform ?? process.platform) === 'win32'
-  if ((windows ? GLOB_CHARACTERS : GLOB_CHARACTERS_POSIX).test(path)) {
+// Turns an absolute path into the anchored form of a rule: `//<path>` (V1:
+// `Read(//<abs>/extra/secret/**)` refused on the real binary). Only ever reached on macOS and
+// Linux: cajaFuerteFor refuses modes 2 and 3 on Windows before anything is anchored.
+function anchor(path: string): string {
+  if (GLOB_CHARACTERS.test(path)) {
     throw new CliError(
-      `La ruta ${path} tiene un carácter que Claude Code tomaría como comodín (* ? [ ] { }${windows ? '' : ' o \\'}), así que no puedo protegerla bien. Cambia el nombre de esa carpeta o elige otra.`,
+      `La ruta ${path} tiene un carácter que Claude Code tomaría como comodín (* ? [ ] { } o \\), así que no puedo protegerla bien. Cambia el nombre de esa carpeta o elige otra.`,
     )
   }
-  if (!windows) return `/${path}`
-  const home = o.home.replace(/[\\/]+$/, '')
-  const lowerPath = path.toLowerCase()
-  const lowerHome = home.toLowerCase()
-  if (lowerPath.startsWith(`${lowerHome}\\`) || lowerPath.startsWith(`${lowerHome}/`)) {
-    return `~/${path.slice(home.length + 1).replaceAll('\\', '/')}`
-  }
-  throw new CliError(
-    `En Windows todavía no sé proteger una carpeta fuera de tu carpeta personal (${path}). Deja la carpeta compartida, tu identidad y el perfil dedicado dentro de tu carpeta personal, o elige solo la carpeta compartida (opción 1).`,
-  )
+  return `/${path}`
 }
 
-// Mode 2's refusal on Windows, said once so setupResponder and the inspector say the same thing.
+// The Windows refusals, said once so setupResponder, the inspector (and through it `responder`
+// and `doctor`) and setup's question all say the same thing. Mode 2 needs each extra folder's
+// absolute path inside a rule, and how Claude Code anchors a drive-letter path is unverified.
+// Mode 3 rests on the `~/…` rules, and those have never been checked on Windows either: its
+// consent screen tells the person the caja fuerte stays closed, and a promise nobody has checked,
+// at the moment they type CONFIRMAR, is exactly what this product must not make (ruling 5).
+// Running section 8 of docs/runbooks/aceptacion-0.4.md on a Windows machine is what would lift
+// both.
 const FOLDERS_ON_WINDOWS =
-  'En Windows todavía no se puede elegir varias carpetas: no está comprobado cómo proteger los secretos dentro de cada carpeta extra. Elige solo esta carpeta (opción 1) o toda tu carpeta personal menos la caja fuerte (opción 3).'
+  'En Windows todavía no se puede elegir varias carpetas: no está comprobado ahí cómo proteger los secretos dentro de cada carpeta extra. Por ahora, en Windows solo está la opción 1: solo esta carpeta.'
+const HOME_ON_WINDOWS =
+  'En Windows todavía no se puede elegir toda tu carpeta personal: no está comprobado ahí que la caja fuerte quede cerrada. Por ahora, en Windows solo está la opción 1: solo esta carpeta.'
 
 // Every deny rule a scope adds on top of the mode-1 base. Mode 1 adds none: its only readable
 // directory is the working directory, where the unanchored base rules do hold. Modes 2 and 3 deny
@@ -166,14 +162,14 @@ const FOLDERS_ON_WINDOWS =
 // list), and the key files in the shared folder; mode 2 adds the secret files of each extra folder.
 export function cajaFuerteFor(scope: ResponderScope, o: ScopePaths): string[] {
   if (scope.kind === 'folder') return []
-  if (scope.kind === 'folders' && (o.platform ?? process.platform) === 'win32') throw new CliError(FOLDERS_ON_WINDOWS)
-  const own = [`Read(${anchor(o.identityHome, o)}/**)`, `Read(${anchor(o.profileHome, o)}/**)`]
-  const share = anchor(o.shareDir, o)
+  if ((o.platform ?? process.platform) === 'win32') throw new CliError(scope.kind === 'folders' ? FOLDERS_ON_WINDOWS : HOME_ON_WINDOWS)
+  const own = [`Read(${anchor(o.identityHome)}/**)`, `Read(${anchor(o.profileHome)}/**)`]
+  const share = anchor(o.shareDir)
   const shareKeys = SHARE_KEY_TAILS.map((tail) => `Read(${share}/${tail})`)
   const common = [...CAJA_FUERTE_HOME, ...own, ...shareKeys]
   if (scope.kind === 'home') return common
   const perFolder = scope.extra.flatMap((dir) => {
-    const anchored = anchor(dir, o)
+    const anchored = anchor(dir)
     return SECRET_FILE_TAILS.map((tail) => `Read(${anchored}/${tail})`)
   })
   return [...common, ...perFolder]
@@ -284,7 +280,7 @@ export async function inspectResponderSettings(
       (err as NodeJS.ErrnoException).code === 'ENOENT' ? `no existe ${settingsPath}` : `no se pudo leer ${settingsPath}`
   }
   // What the scope requires, computed by the writer itself. A scope this machine cannot enforce
-  // (mode 2 on Windows, a folder name with a glob character) is a problem to report, not a crash:
+  // (modes 2 and 3 on Windows, a folder name with a glob character) is a problem to report, not a crash:
   // doctor has to print a verdict and responder has to refuse in Spanish.
   let expected: SettingsFile | null = null
   let scopeError: string | null = null

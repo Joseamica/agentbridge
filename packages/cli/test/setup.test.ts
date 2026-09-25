@@ -897,6 +897,19 @@ describe('the shared-folder protection', () => {
     await expect(access(join(shareDir, 'CLAUDE.md'))).rejects.toThrow()
   })
 
+  // The shared folder is the working directory, where project configuration does load (V19):
+  // the reason dropped for extra folders stays here.
+  it('flags project configuration in the shared folder as a reason to confirm', async () => {
+    await seedIdentityAndProfile()
+    await mkdir(shareDir, { recursive: true })
+    await writeFile(join(shareDir, '.mcp.json'), '{}')
+    const out = memoryOutput()
+    const { prompt, expectDrained } = scripted(['1', shareDir, '', 'CONFIRMAR', '', '', 'n'])
+    await runSetup(context({ prompt, out }))
+    expectDrained()
+    expect(out.lines.join('\n')).toContain('ya tiene configuración de proyecto que doctor vigila: .mcp.json')
+  })
+
   it('flags a symlink inside the folder as a reason to confirm, without following it', async () => {
     await seedIdentityAndProfile()
     await mkdir(shareDir, { recursive: true })
@@ -1139,6 +1152,11 @@ describe('what the answering agent can see', () => {
     expect(explained).toMatch(/cualquier persona a la que le des permiso de preguntarte puede preguntar por\ncualquier otro archivo de tu carpeta personal/)
     expect(explained).toContain('caja fuerte')
     expect(explained).toContain('tu llave de AgentBridge')
+    // Ruling 6: what is true is that nobody can open it through setup — not that it is shut
+    // "siempre" or "nunca se abre". A later Claude Code could stop honouring a rule, and an
+    // everyday Claude kept in a custom CLAUDE_CONFIG_DIR is not in the list.
+    expect(explained).toContain('Nadie la puede abrir desde setup, ni tú')
+    expect(explained).not.toMatch(/siempre|nunca|nadie puede abrir|todas tus conversaciones/)
     // Named as what it is — the best-known places — and followed by what it does not reach (I2).
     expect(explained).toContain('los lugares más conocidos donde se guardan contraseñas y llaves')
     expect(explained).toContain('La caja fuerte no lo cubre todo.')
@@ -1310,7 +1328,7 @@ describe('what the answering agent can see', () => {
     expect((await savedConfig()).scope).toEqual({ kind: 'folders', extra: [other] })
   })
 
-  it('on Windows, explains that option 2 and an outside folder for option 3 are not available, and asks again', async () => {
+  it('on Windows, explains that options 2 and 3 are not available, and asks again', async () => {
     const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', '3', '1', 'n'] })
     ctx.platform = 'win32'
     await runSetup(ctx)
@@ -1322,8 +1340,12 @@ describe('what the answering agent can see', () => {
     expect(windowsAt).toBeGreaterThanOrEqual(0)
     expect(ctx.out.lines[windowsAt + 1]).toBe('Elige otra opción.')
     expect(ctx.asked.some((q) => q.includes('Otra carpeta que tu agente pueda leer'))).toBe(false)
-    // The temp folders lie outside the personal folder: task 1 cannot anchor them on Windows.
-    expect(text).toContain('En Windows todavía no sé proteger una carpeta fuera de tu carpeta personal')
+    // Ruling 5: option 3 is refused in its own sentence, whatever the folders — never with the
+    // consent screen that says the caja fuerte stays closed, which nobody has checked on Windows.
+    const homeAt = ctx.out.lines.findIndex((line) => line.startsWith('En Windows todavía no se puede elegir toda tu carpeta personal'))
+    expect(homeAt).toBeGreaterThan(windowsAt)
+    expect(ctx.out.lines[homeAt + 1]).toBe('Elige otra opción.')
+    expect(text).not.toContain('caja fuerte". Nadie la puede abrir')
     expect(ctx.asked.filter((q) => q.includes(SCOPE_QUESTION))).toHaveLength(3)
     // Refused before the explanation or the word: nothing was asked in between.
     expect(ctx.asked.some((q) => q.includes('CONFIRMAR'))).toBe(false)
@@ -1427,6 +1449,43 @@ describe('what the answering agent can see', () => {
     expect(text).toContain('Esa opción no se puede usar en esta computadora, así que dejo solo esta carpeta (opción 1).')
     expect(text).not.toMatch(/No entendí/)
     expect((await savedConfig()).scope).toEqual({ kind: 'folder' })
+  })
+
+  // Final review, I3. V18 (with V19's control): nothing from an extra folder's `.claude/` or
+  // `.mcp.json` reaches the model, and doctor dropped that check for extra folders. setup still
+  // asked CONFIRMAR, saying the folder had configuration "que doctor vigila".
+  it('mode 2: adds a project with its own configuration without calling it dangerous', async () => {
+    const project = await folder('proyecto')
+    await mkdir(join(project, '.claude', 'skills', 'x'), { recursive: true })
+    await writeFile(join(project, '.claude', 'skills', 'x', 'SKILL.md'), '---\nname: x\n---\n')
+    await writeFile(join(project, '.mcp.json'), '{}')
+    await writeFile(join(project, 'AGENTS.md'), '# instrucciones')
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', project, '', 'n'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const text = ctx.out.lines.join('\n')
+    expect(text).not.toContain('doctor vigila')
+    expect(text).not.toContain('se ve peligrosa')
+    expect(ctx.asked.some((q) => q.includes('CONFIRMAR para añadirla'))).toBe(false)
+    expect((await savedConfig()).scope).toEqual({ kind: 'folders', extra: [project] })
+  })
+
+  // Final review, M7. A link out of an extra folder reaches nothing the chosen folders do not:
+  // Claude Code resolves it and applies the fence and the caja fuerte to the target (V8). A
+  // Python project's `.venv` is enough to have one.
+  it('mode 2: adds a folder with a link pointing out of it without asking CONFIRMAR, and offers to start', async () => {
+    const project = await folder('con-venv')
+    await mkdir(join(project, '.venv', 'bin'), { recursive: true })
+    await symlink(root, join(project, '.venv', 'bin', 'python'))
+    const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', project, '', 'n'] })
+    await runSetup(ctx)
+    ctx.expectDrained()
+    const text = ctx.out.lines.join('\n')
+    expect(text).not.toContain('enlaces simbólicos que no revisé')
+    expect(ctx.asked.some((q) => q.includes('CONFIRMAR para añadirla'))).toBe(false)
+    expect(ctx.out.lines.filter((line) => line.startsWith('Falta algo:'))).toEqual([])
+    expect(text).toMatch(/Listo para contestar/)
+    expect((await savedConfig()).scope).toEqual({ kind: 'folders', extra: [project] })
   })
 
   it('mode 2: a parent added after its subfolder replaces it, and says so', async () => {

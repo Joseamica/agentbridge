@@ -87,7 +87,7 @@ describe('responderSettings, mode 2 (several folders)', () => {
   // Windows-shaped paths all under the home, so no other refusal (a path outside the home) can
   // fire first and make this pass for the wrong reason — which is exactly what an earlier version
   // of this test did when the mode-2 refusal was removed on purpose.
-  it('is refused on Windows, offering the other two modes', () => {
+  it('is refused on Windows, offering option 1 only', () => {
     const win = {
       shareDir: 'C:\\Users\\ana\\compartido',
       identityHome: 'C:\\Users\\ana\\.agentbridge',
@@ -97,7 +97,10 @@ describe('responderSettings, mode 2 (several folders)', () => {
     }
     const scope: ResponderScope = { kind: 'folders', extra: ['C:\\Users\\ana\\Proyectos'] }
     expect(() => responderSettings(scope, win)).toThrow(/varias carpetas/)
-    expect(() => responderSettings(scope, win)).toThrow(/opción 1.*opción 3/)
+    // Option 3 is refused on Windows too (ruling 5): offering it here would send the person to a
+    // second refusal.
+    expect(() => responderSettings(scope, win)).toThrow(/solo está la opción 1/)
+    expect(() => responderSettings(scope, win)).not.toThrow(/opción 3/)
   })
 
   // A glob character in a folder name turns the anchored path into a pattern: `//a/proj[1]/**`
@@ -186,43 +189,21 @@ describe('responderSettings, mode 3 (the whole personal folder)', () => {
     ])
   })
 
-  // On Windows the `//<absolute>` form is unverified, but `~/…` is the form the whole mode already
-  // rests on — so the identity home and profile, which live under the home by default, are
-  // anchored with `~` there rather than with a guessed drive-letter syntax.
-  it('anchors the identity home and profile with ~ on Windows', () => {
-    const win = responderSettings(HOME, {
+  // Ruling 5. The consent screen tells the person the caja fuerte stays closed, and the `~/…` rules
+  // it rests on have never been checked on Windows. So mode 3 is refused there like mode 2, even
+  // with every folder inside the personal folder — the case an earlier version accepted, and the
+  // only one where no other refusal (a path outside the home) could fire first and make this pass
+  // for the wrong reason.
+  it('is refused on Windows, even with everything inside the personal folder, offering option 1 only', () => {
+    const win = {
       shareDir: 'C:\\Users\\ana\\compartido',
       identityHome: 'C:\\Users\\ana\\.agentbridge',
       profileHome: 'C:\\Users\\ana\\.agentbridge-responder',
       home: 'C:\\Users\\ana',
-      platform: 'win32',
-    })
-    expect(win.permissions.deny).toContain('Read(~/.agentbridge/**)')
-    expect(win.permissions.deny).toContain('Read(~/.agentbridge-responder/**)')
-  })
-
-  it('refuses on Windows when the identity home lives outside the personal folder, instead of guessing a path form', () => {
-    expect(() =>
-      responderSettings(HOME, {
-        shareDir: 'C:\\Users\\ana\\compartido',
-        identityHome: 'D:\\ab\\identidad',
-        profileHome: 'C:\\Users\\ana\\.agentbridge-responder',
-        home: 'C:\\Users\\ana',
-        platform: 'win32',
-      }),
-    ).toThrow(/Windows/)
-  })
-
-  it('refuses on Windows when the shared folder lives outside the personal folder', () => {
-    expect(() =>
-      responderSettings(HOME, {
-        shareDir: 'D:\\compartido',
-        identityHome: 'C:\\Users\\ana\\.agentbridge',
-        profileHome: 'C:\\Users\\ana\\.agentbridge-responder',
-        home: 'C:\\Users\\ana',
-        platform: 'win32',
-      }),
-    ).toThrow(/D:\\compartido/)
+      platform: 'win32' as const,
+    }
+    expect(() => responderSettings(HOME, win)).toThrow(/toda tu carpeta personal: no está comprobado ahí que la caja fuerte quede cerrada/)
+    expect(() => responderSettings(HOME, win)).toThrow(/solo está la opción 1/)
   })
 })
 
@@ -377,6 +358,19 @@ describe('inspectResponderSettings', () => {
       platform: 'win32',
     })
     expect(report.problems.join(' ')).toMatch(/varias carpetas/)
+  })
+
+  // What `responder` refuses on and `doctor` fails on: a mode-3 responder.json on Windows (one
+  // written before ruling 5, or by hand) is reported in the same sentence setup says.
+  it('reports a mode-3 profile on Windows as a problem instead of throwing', async () => {
+    await write(settingsFor(FOLDER))
+    const report = await inspectResponderSettings(dir, HOME, {
+      shareDir: 'C:\\Users\\ana\\compartido',
+      identityHome: 'C:\\Users\\ana\\.agentbridge',
+      home: 'C:\\Users\\ana',
+      platform: 'win32',
+    })
+    expect(report.problems.join(' ')).toMatch(/no está comprobado ahí que la caja fuerte quede cerrada/)
   })
 
   // A hand edit can put any JSON value where a list belongs; that used to crash the check with an

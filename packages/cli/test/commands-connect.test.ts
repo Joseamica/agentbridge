@@ -76,14 +76,16 @@ describe('connect', () => {
     expect(getContact(store, them.publicKey, 'outbound')).toMatchObject({ state: 'pending' })
     store.close()
     expect(ctx.out.lines.join('\n')).toMatch(/solicitud/i)
-  })
+    // The bound the comment above describes. It once sat on the next test instead, which is
+    // refused before anything is mined, and this one stayed on the 20-second default.
+  }, 120_000)
 
   it('refuses a note longer than the protocol allows, without storing anything', async () => {
     await expect(connect([encodeLink(them.publicKey, [board.url]), '--note', 'x'.repeat(501)], ctx)).rejects.toThrow()
     const store = await openStore(home, { relayPolicy: allowAnyRelay })
     expect(getContact(store, them.publicKey, 'outbound')).toBeNull()
     store.close()
-  }, 120_000)
+  })
 
   it('explains what is missing when the link is not one of ours', async () => {
     await expect(connect(['no-es-un-enlace'], ctx)).rejects.toThrow()
@@ -100,7 +102,8 @@ describe('connect', () => {
     // "this takes a few seconds" notice must not appear here — it would be advertising work this
     // call never does.
     expect(printed).not.toMatch(NOTICE_RE)
-  })
+    // The first connect mines the request for real: bounded like the test above.
+  }, 120_000)
 
   // Fix round 1, I2: the P5c notice was previously unasserted. This pins it to the one moment it
   // actually matters — strictly before the sync call that can mine the request this same command
@@ -130,7 +133,9 @@ describe('connect', () => {
     expect(noticeAt).toBeGreaterThanOrEqual(0)
     expect(secondSyncAt).toBeGreaterThanOrEqual(0)
     expect(noticeAt).toBeLessThan(secondSyncAt)
-  })
+    // Mines 22 bits for real, like the first test in this block: it outran the 20-second default
+    // in the 0.4 final review's full run while passing alone (final review, M10).
+  }, 120_000)
 })
 
 describe('connect: already approved', () => {
@@ -140,7 +145,8 @@ describe('connect: already approved', () => {
     const printed = ctx.out.lines.join('\n')
     expect(printed).toMatch(/ya te dio permiso/i)
     expect(printed).not.toMatch(NOTICE_RE)
-  })
+    // The first connect mines the request for real: bounded like the test above.
+  }, 120_000)
 
   // Fix round 1, I2. A hostile declared name — an ESC + CSI color sequence and a lone CR (a
   // cursor-to-column-0 move with no following LF) — must never survive into printed output; both are

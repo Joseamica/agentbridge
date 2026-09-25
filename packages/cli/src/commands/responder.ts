@@ -130,7 +130,11 @@ export async function runResponder(o: {
 
   // The one file that actually fences this session, checked before spawning — not merely
   // reported by `doctor`, which nothing makes anyone run. `responder.json` is re-validated on
-  // every read above, and it is the harmless one: it names a folder and a model. `settings.json`
+  // every read above. It is not harmless on its own: since 0.4 it carries the scope, and a
+  // widened scope there is the whole personal folder. What makes it safe is this very check —
+  // settings.json is held to the scope responder.json records, exactly, and readResponderConfig
+  // rebuilds that scope field by field and re-runs scopeProblem, so a responder.json edited to
+  // read more than settings.json enforces, or the reverse, stops the start. `settings.json`
   // is what carries `permissions.blockReadsOutsideWorkingDirectories` and RESPONDER_DENY, and it
   // is handed to `claude --settings` unread. Claude Code refuses a MISSING settings file but
   // accepts one that exists and is not valid JSON in silence (verified against the real 2.1.278

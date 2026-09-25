@@ -59,8 +59,7 @@ export type SetupContext = CliContext & {
   // the machine running it happens to have one.
   copyLink?: (text: string) => Promise<boolean>
   // Which platform the scope question judges and setupResponder writes for. Injected so the
-  // Windows refusals (mode 2 entirely, mode 3 with a folder outside the personal folder) can be
-  // walked through on any machine; defaults to this one.
+  // Windows refusals (modes 2 and 3) can be walked through on any machine; defaults to this one.
   platform?: NodeJS.Platform
   // The personal folder the scope question reasons about and setupResponder anchors to. Injected
   // so a test decides which caja fuerte folders exist, instead of whatever this machine has: the
@@ -318,8 +317,6 @@ async function chooseShareDir(o: {
 // in alongside real files, at any depth) without pretending to be a full secret scanner.
 const CREDENTIAL_NAME_PATTERNS = [/^\.env(\..*)?$/, /\.pem$/i, /\.key$/i, /^id_rsa/i, /^credentials/i]
 
-// Shared with doctor's bounded walk of mode 2's extra folders, so both stop at the same place.
-
 type ShareDirScan = {
   gitDirs: string[]
   suspiciousFiles: string[]
@@ -457,9 +454,23 @@ export type ShareDirAssessment = {
 
 // Reuses doctor's own project-config detection (projectConfigArtifacts) rather than keeping a
 // second list of the same artifact names — see the comment on that export in doctor.ts.
+//
+// `role: 'extra'` is mode 2's extra folder, which drops two of the reasons, and only there:
+// - project configuration: nothing from an additional directory reaches the model — not a skill,
+//   a command, a subagent, `.mcp.json` or `CLAUDE.local.md` (verificaciones.md, V18, with V19 as
+//   its control). Saying an extra folder holds configuration "que doctor vigila" was untrue: doctor
+//   dropped that check for extra folders, and every project with a `.claude/` got a CONFIRMAR
+//   screen for it (final review, I3).
+// - symlinks: a link inside an extra folder never widens what the agent can read. Claude Code
+//   resolves it and applies the fence and the caja fuerte to the real target (V8), so the target
+//   is readable only if it already lies in a chosen folder. A Python project's `.venv` is enough
+//   to trip this reason (final review, M7).
+// The shared folder keeps both: it is the working directory, where project configuration does
+// load (V19), and its behaviour is unchanged from 0.3.
 export async function assessShareDir(
   shareDirRaw: string,
   guard: { identityHome: string; profileHome: string },
+  role: 'shared' | 'extra' = 'shared',
 ): Promise<ShareDirAssessment> {
   const shareDir = resolve(shareDirRaw)
   const [shareReal, homeReal, identityReal, profileReal] = await Promise.all([
@@ -499,7 +510,7 @@ export async function assessShareDir(
       const shown = scan.suspiciousFiles.slice(0, 5).join(', ') + (scan.suspiciousFiles.length > 5 ? ', …' : '')
       reasons.push(`tiene archivos que parecen credenciales: ${shown}`)
     }
-    if (scan.symlinks.length > 0) {
+    if (scan.symlinks.length > 0 && role === 'shared') {
       const shown = scan.symlinks.slice(0, 5).join(', ') + (scan.symlinks.length > 5 ? ', …' : '')
       reasons.push(
         `tiene enlaces simbólicos que no revisé por dentro: ${shown} — podrían apuntar a cualquier cosa, incluido otro repositorio de trabajo`,
@@ -509,7 +520,7 @@ export async function assessShareDir(
       const shown = scan.skippedNodeModules.slice(0, 5).join(', ') + (scan.skippedNodeModules.length > 5 ? ', …' : '')
       reasons.push(`no revisé dentro de node_modules (${shown}) — si ahí adentro hay un archivo de llaves o de credenciales, tu agente lo puede leer y yo no lo vi`)
     }
-    const projectConfig = await projectConfigArtifacts(shareDir)
+    const projectConfig = role === 'shared' ? await projectConfigArtifacts(shareDir) : []
     if (projectConfig.length > 0) reasons.push(`ya tiene configuración de proyecto que doctor vigila: ${projectConfig.join(', ')}`)
     // Both of these lead with the actual danger (a repo or credentials might be hiding in what
     // wasn't fully checked), not with a performance-sounding note about size — a real reviewer
@@ -555,10 +566,6 @@ function parseScopeChoice(raw: string, onEnter: ScopeChoice): ScopeChoice | null
   return null
 }
 
-// The summary line lives in responder-config.ts, so `responder` and `doctor` name the mode in the
-// very words `setup` used — re-exported here for the callers that already import it from setup.
-export { scopeSummary }
-
 // Says exactly what is shut and, in the same breath, what is not (task 2 review, I2). An earlier
 // wording said "tus archivos de llaves siguen cerrados", while only six file kinds are denied: an
 // `id_rsa` or a `credentials.json` in a chosen folder stays readable once CONFIRMAR is typed. A
@@ -577,15 +584,18 @@ const EXTRA_FOLDERS_EXPLANATION_ES = [
 // what it does not reach: the first wording promised "tus contraseñas y llaves" were shut, and a
 // `contraseñas.docx`, saved mail and chats, or a cloud tool's token file are all readable (task 2
 // review, I2). This is the consent screen for the widest mode; its reassurance has to be as exact
-// as its warning.
+// as its warning. So it promises no more than is true: not "siempre" and not "que nadie puede
+// abrir" — a future Claude Code could stop honouring a rule, and an everyday Claude kept in a
+// custom CLAUDE_CONFIG_DIR is not in the list — only that nobody can open it through `setup`
+// (ruling 6). It is never shown on Windows, where mode 3 is refused (ruling 5).
 function homeExplanation(home: string): string {
   return [
     `Con esta opción, tu agente puede leer cualquier archivo de tu carpeta personal (${home}):`,
     'tus documentos, tus fotos, tus proyectos, todo lo que tengas ahí.',
     '',
-    'Lo que sigue cerrado siempre — la "caja fuerte", que nadie puede abrir, ni tú desde aquí:',
+    'Lo que sigue cerrado es la "caja fuerte". Nadie la puede abrir desde setup, ni tú:',
     '  - tu llave de AgentBridge',
-    '  - tu Claude de todos los días: tu sesión y todas tus conversaciones',
+    '  - tu Claude de todos los días: tu sesión y tus conversaciones',
     '  - los lugares más conocidos donde se guardan contraseñas y llaves: las del navegador, las de tu llavero y las que dan acceso a servidores y a la nube',
     '  - tus archivos .env, donde los programas guardan sus contraseñas',
     'Los archivos del sistema, fuera de tu carpeta personal, también siguen cerrados.',
@@ -628,8 +638,7 @@ type ScopeInterview = {
 // Whether this machine can enforce a scope, in task 1's own words. The writer itself decides —
 // the same function setupResponder calls — so the question can never accept a scope the write
 // would then refuse, which would end the interview with the folder already chosen and nothing
-// saved. It refuses mode 2 on Windows, mode 3 on Windows when a protected folder lies outside
-// the personal folder, and any path with a glob character.
+// saved. It refuses modes 2 and 3 on Windows, and any path with a glob character.
 function unenforceable(scope: ResponderScope, paths: ScopePaths): string | null {
   try {
     responderSettings(scope, paths)
@@ -835,8 +844,9 @@ async function considerExtraFolder(o: ScopeInterview, paths: ScopePaths, dir: st
     for (const i of order) said = said.replaceAll(real[i] ?? '', typed[i] ?? '')
     return refuse(`No puedo añadir esa carpeta: ${said}.`)
   }
-  // The same gate the shared folder went through: hard refusals refuse, danger reasons ask.
-  const assessment = await assessShareDir(dir, { identityHome: paths.identityHome, profileHome: paths.profileHome })
+  // The same gate the shared folder went through, less the two reasons that are not true of an
+  // extra folder (see assessShareDir): hard refusals refuse, danger reasons ask.
+  const assessment = await assessShareDir(dir, { identityHome: paths.identityHome, profileHome: paths.profileHome }, 'extra')
   const hard = hardRefusal(assessment)
   if (hard) return refuse(hard)
   // Unlike the shared folder, nothing creates an extra folder: it is one of the person's own,

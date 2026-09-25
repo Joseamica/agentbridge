@@ -145,22 +145,29 @@ const PROJECT_CONFIG_DIRS = ['.claude/agents', '.claude/skills', '.claude/comman
 // The unattended session's cwd IS the shared folder, so Claude Code picks up any project
 // configuration it finds there — .claude/settings*.json hooks run shell commands entirely
 // outside the tool permission system, .mcp.json can point at another MCP server,
-// .claude/agents/* can define subagents, CLAUDE.local.md and AGENTS.md are auto-loaded
-// instructions same as CLAUDE.md, and .claude/skills/*/SKILL.md and .claude/commands/*.md have
+// .claude/agents/* can define subagents, CLAUDE.local.md is auto-loaded instructions same as
+// CLAUDE.md, and .claude/skills/*/SKILL.md and .claude/commands/*.md have
 // their frontmatter injected straight into the session's instructions on startup. That last
 // pair is the most dangerous of the lot: nobody has to be talked into reading anything, and no
 // deny rule can stop text — "trust the concrete check, not the prose" only holds if the check
 // actually looks. None of this has to come from the responder: a sync client or a `git pull`
 // landing files in the shared folder is enough. Treat any of it as a real failure, not a note.
 //
-// Two genuinely different things happen depending on which of these turns up, and the failing
+// AGENTS.md is the exception to all of the above, and the detail says so: on Claude Code 2.1.282
+// it is not read at all (verificaciones.md, V19 — CLAUDE.local.md in the working directory loaded,
+// AGENTS.md beside it did not). It stays on the list because it is an instructions file for agents
+// and a later Claude Code could start loading it; a shared folder is curated, so one turning up
+// there is still worth stopping for. What the line must not do is say it loads today.
+//
+// Two genuinely different things happen depending on which of the others turns up, and the failing
 // check's detail below must say which: settings.json/settings.local.json (hooks) and .mcp.json
 // (another MCP server) and .claude/agents (subagents) all run code, or hand control to
-// something else, outside the tool permission system. The other four — CLAUDE.local.md,
-// AGENTS.md, .claude/skills, .claude/commands — never execute anything at all; their TEXT is
+// something else, outside the tool permission system. The other three — CLAUDE.local.md,
+// .claude/skills, .claude/commands — never execute anything at all; their TEXT is
 // injected straight into the session's instructions on startup, and no deny rule can stop
 // text. Describing that second group as "can run code" would be simply wrong, and would
 // understate exactly the risk that made checking for them worth doing in the first place.
+const NOT_LOADED_TODAY = 'AGENTS.md'
 const PROJECT_CONFIG_EXEC_RISK = new Set(['.claude/settings.json', '.claude/settings.local.json', '.mcp.json', '.claude/agents'])
 
 // Exported so `setup` can reuse this exact detection when deciding whether a chosen shared
@@ -510,7 +517,8 @@ async function addFolderContentChecks(
   add: (name: string, ok: boolean, detail: string, blocking: boolean, security?: boolean) => void,
   // `configName` absent: the project-configuration check is skipped (extra folders, see
   // addScopeChecks). `limits` absent: the walk is unbounded (the working directory, as before).
-  o: { dir: string; linksName: string; configName?: string; prefix?: string; limits?: WalkLimits },
+  // `linksFenced`: an escaping link is said, not failed (extra folders, see addScopeChecks).
+  o: { dir: string; linksName: string; configName?: string; prefix?: string; limits?: WalkLimits; linksFenced?: boolean },
 ): Promise<void> {
   const prefix = o.prefix ?? ''
   // walkShareDir turns a missing or unreadable folder into an `unreadable` entry rather than
@@ -518,12 +526,18 @@ async function addFolderContentChecks(
   const rootReal = await realpath(o.dir).catch(() => o.dir)
   const walk: WalkResult = { escaping: [], unreadable: [], skipped: [] }
   await walkShareDir(o.dir, rootReal, walk, o.limits)
-  const linksOk = walk.escaping.length === 0 && walk.unreadable.length === 0
+  const linksOk = (o.linksFenced || walk.escaping.length === 0) && walk.unreadable.length === 0
   // The folder's own paths never appear in this detail: they name its internal layout, which no
   // doctor line may print. Say how many and of what kind, not which. The folder itself may be
   // named (in `prefix`): the person chose it and is looking at this screen.
   const linkBits: string[] = []
-  if (walk.escaping.length) linkBits.push(`${walk.escaping.length} enlace(s) apuntan fuera de la carpeta`)
+  if (walk.escaping.length) {
+    linkBits.push(
+      o.linksFenced
+        ? `${walk.escaping.length} enlace(s) apuntan fuera de la carpeta, y no es un riesgo: Claude Code sigue cada enlace hasta su destino real y ahí aplica la misma valla y la misma caja fuerte (comprobado con Claude Code 2.1.282), así que tu agente solo puede leer ese destino si ya está en una carpeta que elegiste`
+        : `${walk.escaping.length} enlace(s) apuntan fuera de la carpeta`,
+    )
+  }
   if (walk.unreadable.length) linkBits.push(`${walk.unreadable.length} ruta(s) no se pudieron revisar (sin permiso de lectura)`)
   if (walk.skipped.length) linkBits.push(`${walk.skipped.length} carpeta(s) no se revisaron por dentro (.git o node_modules)`)
   // Partial is said, never passed off as a full sweep — but it does not fail the line: nothing
@@ -540,11 +554,14 @@ async function addFolderContentChecks(
   if (o.configName === undefined) return
   const projectConfig = await projectConfigArtifacts(o.dir)
   const execRisk = projectConfig.filter((rel) => PROJECT_CONFIG_EXEC_RISK.has(rel))
-  const textInjection = projectConfig.filter((rel) => !PROJECT_CONFIG_EXEC_RISK.has(rel))
+  const textInjection = projectConfig.filter((rel) => !PROJECT_CONFIG_EXEC_RISK.has(rel) && rel !== NOT_LOADED_TODAY)
   const projectConfigBits: string[] = []
   if (execRisk.length) projectConfigBits.push(`${execRisk.length} archivo(s)/carpeta(s) que pueden ejecutar código o delegar a otro servidor fuera del control de permisos`)
   if (textInjection.length) {
     projectConfigBits.push(`${textInjection.length} archivo(s)/carpeta(s) que se inyectan como instrucciones del agente al arrancar, sin que nadie tenga que leerlos ni pedirlos`)
+  }
+  if (projectConfig.includes(NOT_LOADED_TODAY)) {
+    projectConfigBits.push(`un ${NOT_LOADED_TODAY}: el Claude Code comprobado (2.1.282) no lo carga, pero es un archivo de instrucciones para agentes y una versión nueva podría cargarlo al arrancar`)
   }
   add(
     o.configName,
@@ -626,7 +643,13 @@ async function addScopeChecks(
       add(`Carpeta extra ${dir}`, false, cannotOpenDetail(dir, platform), true, false)
       continue
     }
-    // Links only. The project-configuration check is the working directory's alone: with Read,
+    // Links only, and an escaping one does not fail the line (final review, M7): Claude Code resolves
+    // a link and applies the fence and the caja fuerte to its real target (verificaciones.md, V8),
+    // so a link out of an extra folder reaches nothing the chosen folders do not — while a Python
+    // project's `.venv` alone made this a blocking failure, and setup would not offer to start.
+    // The shared folder keeps its stricter line, unchanged since 0.3. The line's name says what it
+    // counts rather than "Sin enlaces…", which would be false beside a link it lets through.
+    // The project-configuration check is the working directory's alone: with Read,
     // Glob and Grep denied, nothing from an additional directory reached the model on the real
     // binary — not a skill, a command, a subagent, `.mcp.json`, `CLAUDE.local.md` or `AGENTS.md` —
     // while the same skill and `CLAUDE.local.md` in the working directory did load
@@ -634,9 +657,10 @@ async function addScopeChecks(
     // alarm on the folder people add most: a project.
     await addFolderContentChecks(add, {
       dir,
-      linksName: `Sin enlaces que salgan de la carpeta extra ${dir}`,
+      linksName: `Enlaces que salen de la carpeta extra ${dir}`,
       prefix: `En la carpeta extra ${dir}: `,
       limits: WALK_LIMITS,
+      linksFenced: true,
     })
   }
 }
