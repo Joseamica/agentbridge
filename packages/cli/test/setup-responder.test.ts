@@ -305,12 +305,14 @@ describe('setupResponder', () => {
       profileHome: home,
       identityHome,
       scope: { kind: 'folders', extra: [join(root, 'proyectos')] },
+      // Everything under this home, so the only refusal that can fire is mode 2's own.
+      home: root,
       platform: 'win32',
       run: runner,
       out: memoryOutput(),
     }).catch((e: unknown) => e)
     expect(err).toBeInstanceOf(CliError)
-    expect((err as CliError).message).toMatch(/Windows/)
+    expect((err as CliError).message).toMatch(/varias carpetas/)
     await expect(access(join(home, 'settings.json'))).rejects.toThrow()
     expect(calls).toEqual([])
   })

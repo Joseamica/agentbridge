@@ -68,9 +68,19 @@ describe('responderSettings, mode 2 (several folders)', () => {
   // Not verified on the real binary: how Claude Code anchors `C:\…` in a rule. Guessing a form
   // that silently matches nothing would be the V6 failure again — a rule that looks like
   // protection and covers nothing — so mode 2 is refused there instead.
+  // Windows-shaped paths all under the home, so no other refusal (a path outside the home) can
+  // fire first and make this pass for the wrong reason — which is exactly what an earlier version
+  // of this test did when the mode-2 refusal was removed on purpose.
   it('is refused on Windows, offering the other two modes', () => {
-    expect(() => responderSettings(FOLDERS, { ...paths, platform: 'win32' })).toThrow(/Windows/)
-    expect(() => responderSettings(FOLDERS, { ...paths, platform: 'win32' })).toThrow(/1.*3|carpeta personal/)
+    const win = {
+      identityHome: 'C:\\Users\\ana\\.agentbridge',
+      profileHome: 'C:\\Users\\ana\\.agentbridge-responder',
+      home: 'C:\\Users\\ana',
+      platform: 'win32' as const,
+    }
+    const scope: ResponderScope = { kind: 'folders', extra: ['C:\\Users\\ana\\Proyectos'] }
+    expect(() => responderSettings(scope, win)).toThrow(/varias carpetas/)
+    expect(() => responderSettings(scope, win)).toThrow(/opción 1.*opción 3/)
   })
 
   // A glob character in a folder name turns the anchored path into a pattern: `//a/proj[1]/**`
@@ -173,8 +183,12 @@ describe('anchoring (the V6 finding)', () => {
     ['mode 2', FOLDERS],
     ['mode 3', HOME],
   ] as const) {
+    // By position, not by filtering out anything equal to a base rule: `Read(**/.env)` IS a base
+    // rule, so a filter would silently drop exactly the unanchored form V6 is about.
     it(`${name}: every rule beyond the mode-1 base is anchored to ~ or to an absolute path`, () => {
-      const added = responderSettings(scope, paths).permissions.deny.filter((r) => !(RESPONDER_DENY as readonly string[]).includes(r))
+      const deny = responderSettings(scope, paths).permissions.deny
+      expect(deny.slice(0, RESPONDER_DENY.length)).toEqual([...RESPONDER_DENY])
+      const added = deny.slice(RESPONDER_DENY.length)
       expect(added.length).toBeGreaterThan(0)
       for (const rule of added) {
         const p = readPath(rule)
@@ -300,5 +314,11 @@ describe('inspectResponderSettings', () => {
     await write(settingsFor(FOLDERS))
     const report = await inspectResponderSettings(dir, FOLDERS, { ...paths, platform: 'win32' })
     expect(report.problems.join(' ')).toMatch(/Windows/)
+  })
+
+  it('reports a folder name with a glob character as a problem instead of throwing', async () => {
+    const scope: ResponderScope = { kind: 'folders', extra: ['/Users/ana/proj[1]'] }
+    await write(settingsFor(FOLDER))
+    expect((await inspectResponderSettings(dir, scope, paths)).problems.join(' ')).toMatch(/comodín/)
   })
 })
