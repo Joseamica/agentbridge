@@ -1217,7 +1217,11 @@ describe('what the answering agent can see', () => {
   it('mode 2: refuses a folder inside the caja fuerte, whatever its capitals, since nothing in it could be read', async () => {
     // Real-home paths as strings only: every one is refused before anything touches the disk.
     const ssh = join(homedir(), '.ssh')
-    const shouting = join(homedir(), '.SSH', 'viejas')
+    // Capitals on a folder that most machines do not have: `realpath` restores the true case of a
+    // folder that exists (so `~/.SSH` on a Mac with `~/.ssh` proved nothing — verified by making
+    // the comparison case-sensitive), but a missing one keeps what was typed, and only the
+    // case-blind comparison still recognises it.
+    const shouting = join(homedir(), '.KUBE', 'viejo')
     const insideIdentity = join(identityHome, 'algo')
     const ctx = await responderSetupContext({ answers: ['Dani', '1', shareDir, '', '2', ssh, shouting, insideIdentity, 'n'] })
     await runSetup(ctx)
@@ -1280,7 +1284,12 @@ describe('what the answering agent can see', () => {
     await runSetup(ctx)
     ctx.expectDrained()
     const text = ctx.out.lines.join('\n')
-    expect(text).toContain('En Windows todavía no se puede elegir varias carpetas')
+    // Refused at the question, not folder by folder: the per-folder check says the same sentence,
+    // so the sentence alone passed with the up-front check removed (verified by removing it).
+    const windowsAt = ctx.out.lines.findIndex((line) => line.startsWith('En Windows todavía no se puede elegir varias carpetas'))
+    expect(windowsAt).toBeGreaterThanOrEqual(0)
+    expect(ctx.out.lines[windowsAt + 1]).toBe('Elige otra opción.')
+    expect(ctx.asked.some((q) => q.includes('Otra carpeta que tu agente pueda leer'))).toBe(false)
     // The temp folders lie outside the personal folder: task 1 cannot anchor them on Windows.
     expect(text).toContain('En Windows todavía no sé proteger una carpeta fuera de tu carpeta personal')
     expect(ctx.asked.filter((q) => q.includes(SCOPE_QUESTION))).toHaveLength(3)
