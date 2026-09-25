@@ -1,5 +1,5 @@
 import { CLI_COMMAND, loadOrCreateIdentity, openStore, recordIncomingRequest, setProfile } from '@agentbridge/core'
-import { chmod, mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -284,6 +284,154 @@ describe('runDoctor with a dedicated profile', () => {
     expect(auth.ok).toBe(false)
     expect(auth.detail).toContain('15 segundos')
     expect(sawSignal).toBeInstanceOf(AbortSignal)
+  })
+})
+
+// Task 3 of 0.4: doctor holds settings.json to the scope responder.json records, says which mode is
+// in force, and in mode 2 examines every extra folder the way it examines the shared one.
+describe('runDoctor with the scope saved in responder.json', () => {
+  // A stand-in for the personal folder: nothing here reads or names the real one.
+  let home: string
+  beforeEach(async () => {
+    home = join(root, 'casa')
+    await mkdir(home, { recursive: true })
+  })
+
+  type Scope = { kind: 'folder' } | { kind: 'home' } | { kind: 'folders'; extra: string[] }
+  async function profileFor(scope: Scope, settingsScope: Scope = scope): Promise<void> {
+    const { responderSettings } = await import('../src/commands/setup-responder')
+    await mkdir(profileHome, { recursive: true })
+    const config = { version: 2, shareDir, identityHome, model: 'sonnet', effort: 'low', scope }
+    await writeFile(join(profileHome, RESPONDER_CONFIG_FILE), JSON.stringify(config), { mode: 0o600 })
+    const settings = responderSettings(settingsScope, { shareDir, identityHome, profileHome, home })
+    await writeFile(join(profileHome, 'settings.json'), `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 })
+  }
+  const doctorWith = () => runDoctor(doctorOptions({ profileHome, home }))
+
+  // Review finding M3 of task 1, doctor's half: the saved scope, not a default. A mode-1 file
+  // under a mode-3 responder.json has every mode-1 rule and the fence — only a check against the
+  // saved scope sees that the caja fuerte and the personal folder are not what the file says.
+  it('fails the fence check when responder.json says mode 3 and settings.json is the mode-1 file', async () => {
+    await profileFor({ kind: 'home' }, { kind: 'folder' })
+    const fence = check(await doctorWith(), 'Permisos del respondedor')
+    expect(fence.ok).toBe(false)
+    expect(fence.blocking).toBe(true)
+    expect(fence.security).toBe(true)
+    expect(fence.detail).toMatch(/caja fuerte/)
+  })
+
+  it('passes the fence check for mode 3 with the file setupResponder writes for it', async () => {
+    await profileFor({ kind: 'home' })
+    expect(check(await doctorWith(), 'Permisos del respondedor').ok).toBe(true)
+  })
+
+  it('names the mode as information, in the words setup used', async () => {
+    for (const [scope, words] of [
+      [{ kind: 'folder' }, 'solo la carpeta compartida'],
+      [{ kind: 'home' }, 'toda tu carpeta personal, menos la caja fuerte'],
+    ] as const) {
+      await profileFor(scope)
+      const mode = check(await doctorWith(), 'Alcance del respondedor')
+      expect(mode.ok).toBe(true)
+      expect(mode.blocking).toBe(false)
+      expect(mode.detail).toContain(words)
+    }
+  })
+
+  // The consent screen was corrected to say what the caja fuerte is — the best-known places — and
+  // what it is not (task 2 review, I2). Doctor's line is the one read months later; it must not
+  // promise more than the list protects.
+  it('says in mode 3 what the caja fuerte covers, and what it does not', async () => {
+    await profileFor({ kind: 'home' })
+    const checks = await doctorWith()
+    const caja = check(checks, 'Caja fuerte')
+    expect(caja.ok).toBe(true)
+    expect(caja.blocking).toBe(false)
+    expect(caja.detail).toContain('los lugares más conocidos donde se guardan contraseñas y llaves')
+    expect(caja.detail).toContain('tu llave de AgentBridge')
+    expect(caja.detail).toMatch(/no lo cubre todo/i)
+    expect(caja.detail).not.toMatch(/tus secretos/)
+  })
+
+  it('does not print the caja fuerte line in mode 1, where there is no caja fuerte', async () => {
+    await profileFor({ kind: 'folder' })
+    expect((await doctorWith()).find((c) => c.name === 'Caja fuerte')).toBeUndefined()
+  })
+
+  describe('mode 2', () => {
+    let extra: string[]
+    beforeEach(async () => {
+      // Inside the stand-in personal folder, where people keep the folders they would add.
+      extra = [join(home, 'notas'), join(home, 'clientes')]
+      for (const dir of extra) await mkdir(dir, { recursive: true })
+    })
+
+    it('names the mode and every extra folder', async () => {
+      await profileFor({ kind: 'folders', extra })
+      const mode = check(await doctorWith(), 'Alcance del respondedor')
+      expect(mode.detail).toContain('la carpeta compartida y 2 carpetas más')
+      for (const dir of extra) expect(mode.detail).toContain(dir)
+    })
+
+    it('fails the fence check when settings.json is the mode-1 file', async () => {
+      await profileFor({ kind: 'folders', extra }, { kind: 'folder' })
+      expect(check(await doctorWith(), 'Permisos del respondedor').ok).toBe(false)
+    })
+
+    // Each extra folder gets its own lines, named, so a failure says which folder it is about — and
+    // setup, which prints only the detail, can say it too.
+    it('examines each extra folder on its own lines, and a clean one passes', async () => {
+      await profileFor({ kind: 'folders', extra })
+      const checks = await doctorWith()
+      for (const dir of extra) {
+        expect(check(checks, `Sin enlaces que salgan de la carpeta extra ${dir}`).ok).toBe(true)
+        expect(check(checks, `Sin configuración de proyecto en la carpeta extra ${dir}`).ok).toBe(true)
+      }
+    })
+
+    it('flags an escaping link in one extra folder, naming that folder and only that one', async () => {
+      const [clean, leaky] = extra as [string, string]
+      await symlink(join(root, 'identidad'), join(leaky, 'atajo'))
+      await profileFor({ kind: 'folders', extra })
+      const checks = await doctorWith()
+      const bad = check(checks, `Sin enlaces que salgan de la carpeta extra ${leaky}`)
+      expect(bad.ok).toBe(false)
+      expect(bad.blocking).toBe(true)
+      expect(bad.security).toBe(true)
+      expect(bad.detail).toContain(leaky)
+      expect(check(checks, `Sin enlaces que salgan de la carpeta extra ${clean}`).ok).toBe(true)
+    })
+
+    it('flags project configuration in an extra folder, naming it', async () => {
+      const [, withAgents] = extra as [string, string]
+      await writeFile(join(withAgents, 'AGENTS.md'), '# instructions')
+      await profileFor({ kind: 'folders', extra })
+      const bad = check(await doctorWith(), `Sin configuración de proyecto en la carpeta extra ${withAgents}`)
+      expect(bad.ok).toBe(false)
+      expect(bad.detail).toContain(withAgents)
+    })
+
+    // The persona CLAUDE.md belongs in the working directory only; an extra folder without one is
+    // what it should be, and a line saying "falta CLAUDE.md" about it would be a false alarm.
+    it('does not ask an extra folder for a CLAUDE.md', async () => {
+      await profileFor({ kind: 'folders', extra })
+      const checks = await doctorWith()
+      expect(checks.filter((c) => c.name === 'Carpeta compartida')).toHaveLength(0)
+      for (const c of checks) expect(c.detail).not.toMatch(/Falta CLAUDE\.md/)
+    })
+
+    it('reports an extra folder that is gone, by name, as blocking — instead of walking nothing', async () => {
+      const [, gone] = extra as [string, string]
+      await profileFor({ kind: 'folders', extra })
+      await rm(gone, { recursive: true })
+      const checks = await doctorWith()
+      const missing = check(checks, `Carpeta extra ${gone}`)
+      expect(missing.ok).toBe(false)
+      expect(missing.blocking).toBe(true)
+      expect(missing.detail).toContain(gone)
+      // Nothing claims to have looked inside a folder that is not there.
+      expect(checks.find((c) => c.name === `Sin enlaces que salgan de la carpeta extra ${gone}`)).toBeUndefined()
+    })
   })
 })
 

@@ -61,6 +61,18 @@ export function scopeProblem(
   return null
 }
 
+// The one-line name of a mode, said the same way by `setup` (its summary), `responder` (before it
+// hands over the terminal) and `doctor` (its information line). Kept here, in the module with no
+// dependencies, so none of the three has to import another command to say it. "menos la caja
+// fuerte", never "menos tus secretos": the caja fuerte closes the best-known places, not every
+// secret a person has (task 2 review, I2).
+export function scopeSummary(scope: ResponderScope): string {
+  if (scope.kind === 'folder') return 'Tu agente puede ver: solo la carpeta compartida.'
+  if (scope.kind === 'home') return 'Tu agente puede ver: toda tu carpeta personal, menos la caja fuerte.'
+  const more = scope.extra.length === 1 ? 'una carpeta más' : `${scope.extra.length} carpetas más`
+  return `Tu agente puede ver: la carpeta compartida y ${more}.`
+}
+
 // These values used to land inside a hand-rolled bash script (`start.sh`), where an unvalidated
 // --model/--effort (typed by hand, or passed through automation) could break out of the line it
 // was interpolated into. They now live in responder.json instead and reach `claude` as one

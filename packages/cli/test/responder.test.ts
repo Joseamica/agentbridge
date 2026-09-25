@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { CLI_COMMAND } from '@agentbridge/core'
@@ -354,6 +354,117 @@ describe('runResponder', () => {
       })
       expect(spawned).toBe(true)
       expect(code).toBe(0)
+    })
+  })
+
+  // Review finding M3 of task 1: responder.ts already handed the saved scope to the inspector, but
+  // nothing pinned it — replacing `config.scope` with `{ kind: 'folder' }` kept every test green,
+  // and that replacement is exactly the dangerous one: a profile whose responder.json says "the
+  // whole personal folder" and whose settings.json is the mode-1 file would start, and the next
+  // `setup` run would not be what made the two agree. The scope comes from responder.json, and
+  // settings.json is held to it.
+  describe('the scope saved in responder.json', () => {
+    // A stand-in for the personal folder, so nothing here reads or names the real one.
+    let home: string
+    beforeEach(async () => {
+      home = await mkdtemp(join(tmpdir(), 'ab-responder-home-'))
+    })
+
+    const settingsFor = (scope: Parameters<typeof responderSettings>[0], profileHome: string) =>
+      JSON.stringify(responderSettings(scope, { shareDir, identityHome: '/tmp/identidad', profileHome, home }))
+
+    async function start(config: unknown, settings: (profileHome: string) => string) {
+      const profileHome = await mkdtemp(join(tmpdir(), 'ab-responder-'))
+      await writeFile(join(profileHome, RESPONDER_CONFIG_FILE), JSON.stringify(config), { mode: 0o600 })
+      await writeFile(join(profileHome, 'settings.json'), settings(profileHome), { mode: 0o600 })
+      const out = memoryOutput()
+      let spawned = false
+      let saidBeforeClaudeStarted = ''
+      const error: unknown = await runResponder({
+        profileHome,
+        env: {},
+        out,
+        home,
+        runInteractive: async () => {
+          spawned = true
+          saidBeforeClaudeStarted = out.lines.join('\n')
+          return { code: 0, spawnFailed: false }
+        },
+      }).then(
+        () => null,
+        (e: unknown) => e,
+      )
+      return { error, spawned, saidBeforeClaudeStarted }
+    }
+
+    it('refuses a mode-3 profile whose settings.json is the mode-1 file, and never spawns', async () => {
+      const { error, spawned } = await start({ ...workingConfig, version: 2, scope: { kind: 'home' } }, () => JSON.stringify(modeOne()))
+      expect(spawned).toBe(false)
+      // The mode-1 file has every mode-1 rule and the fence; what it lacks is the caja fuerte and
+      // the personal folder — the only two things a check against the wrong scope would not see.
+      expect((error as Error).message).toMatch(/caja fuerte/)
+      expect((error as Error).message).toContain(`${CLI_COMMAND} setup`)
+    })
+
+    it('starts mode 3 with the settings setupResponder writes for it, and names the mode first', async () => {
+      const { error, spawned, saidBeforeClaudeStarted } = await start({ ...workingConfig, version: 2, scope: { kind: 'home' } }, (p) =>
+        settingsFor({ kind: 'home' }, p),
+      )
+      expect(error).toBeNull()
+      expect(spawned).toBe(true)
+      expect(saidBeforeClaudeStarted).toContain('Tu agente puede ver: toda tu carpeta personal, menos la caja fuerte.')
+    })
+
+    it('names mode 1 before handing over', async () => {
+      const { spawned, saidBeforeClaudeStarted } = await start(workingConfig, () => JSON.stringify(modeOne()))
+      expect(spawned).toBe(true)
+      expect(saidBeforeClaudeStarted).toContain('Tu agente puede ver: solo la carpeta compartida.')
+    })
+
+    describe('mode 2', () => {
+      let extra: string[]
+      beforeEach(async () => {
+        const parent = await mkdtemp(join(tmpdir(), 'ab-responder-extra-'))
+        extra = [join(parent, 'notas'), join(parent, 'clientes')]
+        for (const dir of extra) await mkdir(dir)
+      })
+      const modeTwo = () => ({ ...workingConfig, version: 2, scope: { kind: 'folders', extra } })
+
+      it('starts when every extra folder is there, in the shared folder, naming the mode', async () => {
+        const { error, spawned, saidBeforeClaudeStarted } = await start(modeTwo(), (p) => settingsFor({ kind: 'folders', extra }, p))
+        expect(error).toBeNull()
+        expect(spawned).toBe(true)
+        expect(saidBeforeClaudeStarted).toContain('Tu agente puede ver: la carpeta compartida y 2 carpetas más.')
+      })
+
+      // The same ambiguity the shared-folder check exists for: a folder handed to Claude that is
+      // gone would surface, at best, as something unrelated. Named, so the person knows which.
+      it('names an extra folder that is gone, and never spawns', async () => {
+        const gone = extra[1] as string
+        await import('node:fs/promises').then((fs) => fs.rm(gone, { recursive: true }))
+        const { error, spawned } = await start(modeTwo(), (p) => settingsFor({ kind: 'folders', extra }, p))
+        expect(spawned).toBe(false)
+        expect((error as Error).message).toMatch(/carpetas extra/)
+        expect((error as Error).message).toContain(gone)
+        expect((error as Error).message).toContain(`${CLI_COMMAND} setup`)
+      })
+
+      it('names an extra folder that is a file, not a folder, and never spawns', async () => {
+        const notAFolder = extra[0] as string
+        await import('node:fs/promises').then(async (fs) => {
+          await fs.rm(notAFolder, { recursive: true })
+          await fs.writeFile(notAFolder, 'no soy una carpeta')
+        })
+        const { error, spawned } = await start(modeTwo(), (p) => settingsFor({ kind: 'folders', extra }, p))
+        expect(spawned).toBe(false)
+        expect((error as Error).message).toContain(notAFolder)
+      })
+
+      it('refuses a mode-2 profile whose settings.json is the mode-1 file, and never spawns', async () => {
+        const { error, spawned } = await start(modeTwo(), () => JSON.stringify(modeOne()))
+        expect(spawned).toBe(false)
+        expect((error as Error).message).toMatch(/faltan carpetas que elegiste/)
+      })
     })
   })
 

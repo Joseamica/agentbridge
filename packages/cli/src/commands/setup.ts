@@ -24,7 +24,7 @@ import { describeFsError } from '../spanish-errors'
 import { connect } from './connect'
 import { projectConfigArtifacts, runDoctor, type Check } from './doctor'
 import { readResponderConfig, runResponder } from './responder'
-import { scopeProblem, type ResponderScope } from './responder-config'
+import { scopeProblem, scopeSummary, type ResponderScope } from './responder-config'
 import {
   CAJA_FUERTE_HOME,
   defaultRunner,
@@ -554,13 +554,9 @@ function parseScopeChoice(raw: string, onEnter: ScopeChoice): ScopeChoice | null
   return null
 }
 
-// The summary line. One line, because it is the part people scroll back to.
-export function scopeSummary(scope: ResponderScope): string {
-  if (scope.kind === 'folder') return 'Tu agente puede ver: solo la carpeta compartida.'
-  if (scope.kind === 'home') return 'Tu agente puede ver: toda tu carpeta personal, menos la caja fuerte.'
-  const more = scope.extra.length === 1 ? 'una carpeta más' : `${scope.extra.length} carpetas más`
-  return `Tu agente puede ver: la carpeta compartida y ${more}.`
-}
+// The summary line lives in responder-config.ts, so `responder` and `doctor` name the mode in the
+// very words `setup` used — re-exported here for the callers that already import it from setup.
+export { scopeSummary }
 
 // Says exactly what is shut and, in the same breath, what is not (task 2 review, I2). An earlier
 // wording said "tus archivos de llaves siguen cerrados", while only six file kinds are denied: an

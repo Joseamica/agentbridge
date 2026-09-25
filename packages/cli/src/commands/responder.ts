@@ -11,6 +11,7 @@ import {
   RESPONDER_CONFIG_FILE,
   SAFE_MODEL_PATTERN,
   scopeProblem,
+  scopeSummary,
   type ResponderConfig,
   type ResponderScope,
 } from './responder-config'
@@ -120,6 +121,9 @@ export async function runResponder(o: {
   env: NodeJS.ProcessEnv
   out: Output
   runInteractive: InteractiveRunner
+  // The personal folder mode 3 opens and the `~/…` rules are anchored to. Injected so tests
+  // describe a machine without reading or naming the real one; defaults to this one.
+  home?: string
 }): Promise<number> {
   const profileHome = resolve(o.profileHome)
   const config = await readResponderConfig(profileHome)
@@ -136,10 +140,13 @@ export async function runResponder(o: {
   // and nothing said. `responder --profile <any directory>` makes that reachable on purpose, so
   // the check belongs here and not only in `doctor`. The reader itself lives beside the writer
   // (setup-responder.ts) so this and doctor's own check can never disagree.
+  // Held to the scope responder.json records, never to a default: checked against one folder, a
+  // mode-1 file sitting under a mode-3 responder.json looks perfect — every mode-1 rule and the
+  // fence are there — while what it lacks is exactly the caja fuerte (task 1 review, M3).
   const fence = await inspectResponderSettings(profileHome, config.scope, {
     shareDir: config.shareDir,
     identityHome: config.identityHome,
-    home: homedir(),
+    home: o.home ?? homedir(),
   })
   if (fence.problems.length > 0) {
     throw new CliError(
@@ -163,6 +170,21 @@ export async function runResponder(o: {
     )
   }
 
+  // Each extra folder of mode 2 is handed to Claude as a readable directory, and one that was
+  // moved or unplugged fails in no clearer way than the shared folder does — so the same check,
+  // with the folder named, since a person with three folders needs to know which one is gone.
+  // Safe to show for the same reason as above: it is a folder this person chose.
+  if (config.scope.kind === 'folders') {
+    for (const dir of config.scope.extra) {
+      const info = await stat(dir).catch(() => null)
+      if (!info?.isDirectory()) {
+        throw new CliError(
+          `No encuentro una de las carpetas extra que tu agente puede leer (${dir}). Puede que se haya movido, se haya renombrado, o esté en una unidad que no está conectada. Vuelve a correr: ${CLI_COMMAND} setup y quítala o elige una que exista.`,
+        )
+      }
+    }
+  }
+
   const env = {
     ...o.env,
     // The person's own identity and database, shared with every command they type — not a second
@@ -181,6 +203,9 @@ export async function runResponder(o: {
   // that the install is broken. The marker Claude keeps for this lives in its own private
   // `<perfil>/claude/.claude.json` and changes between versions, so this says what is about to
   // happen rather than writing into a file we do not own.
+  // The mode first, in the words `setup` used: the person about to leave their machine answering
+  // questions should see how far it reaches at the moment they start it, not only when they chose.
+  o.out.log(scopeSummary(config.scope))
   o.out.log('Abro Claude para ponerte a contestar. Déjalo abierto. Para parar: Ctrl+C.')
   o.out.log('La primera vez, Claude hace primero un par de preguntas suyas (el tema de colores y, si hace falta, el inicio de sesión).')
   const result = await o.runInteractive(
