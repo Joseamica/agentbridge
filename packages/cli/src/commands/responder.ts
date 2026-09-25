@@ -6,7 +6,15 @@ import { CLI_COMMAND } from '@agentbridge/core'
 import { CliError, type CliContext, type Output } from '../context'
 import { isSameOrWithin } from '../fs-paths'
 import { defaultInteractiveRunner, type InteractiveRunner } from '../interactive'
-import { ALLOWED_EFFORTS, RESPONDER_CONFIG_FILE, SAFE_MODEL_PATTERN, type ResponderConfig } from './responder-config'
+import {
+  ALLOWED_EFFORTS,
+  RESPONDER_CONFIG_FILE,
+  SAFE_MODEL_PATTERN,
+  scopeProblem,
+  scopeSummary,
+  type ResponderConfig,
+  type ResponderScope,
+} from './responder-config'
 import { inspectResponderSettings } from './setup-responder'
 
 export { RESPONDER_CONFIG_FILE, type ResponderConfig } from './responder-config'
@@ -27,8 +35,8 @@ export async function readResponderConfig(profileHome: string): Promise<Responde
   } catch {
     throw new CliError(`El archivo de configuración del respondedor está dañado. Vuelve a correr: ${CLI_COMMAND} setup`)
   }
-  const c = parsed as Partial<ResponderConfig>
-  if (c.version !== 1) {
+  const c = parsed as Partial<Omit<ResponderConfig, 'version'>> & { version?: unknown }
+  if (c.version !== 1 && c.version !== 2) {
     // A newer AgentBridge wrote a shape this build does not know. Guessing at it would run the
     // answering session with the wrong folder or the wrong settings — the two things that must
     // never be wrong.
@@ -61,7 +69,36 @@ export async function readResponderConfig(profileHome: string): Promise<Responde
   if (typeof c.effort !== 'string' || !(ALLOWED_EFFORTS as readonly string[]).includes(c.effort)) {
     throw new CliError(`El esfuerzo guardado no es válido: "${String(c.effort)}". Vuelve a correr: ${CLI_COMMAND} setup`)
   }
-  return { version: 1, shareDir: c.shareDir, identityHome: c.identityHome, model: c.model, effort: c.effort }
+  // A version-1 file predates scopes and meant one folder; it is read as exactly that, so every
+  // 0.3 install keeps working without re-running setup (D4).
+  const scope = c.version === 1 ? ({ kind: 'folder' } as const) : readScope(c.scope)
+  const problem = scopeProblem(scope, { shareDir: c.shareDir, identityHome: c.identityHome, profileHome: resolve(profileHome) })
+  if (problem) {
+    throw new CliError(`El alcance guardado del respondedor no es válido: ${problem}. Vuelve a correr: ${CLI_COMMAND} setup`)
+  }
+  return { version: 2, shareDir: c.shareDir, identityHome: c.identityHome, model: c.model, effort: c.effort, scope }
+}
+
+// The scope decides which directories the answering session can read, so its shape is checked
+// field by field and rebuilt, never passed through: an unknown `kind` guessed as the nearest
+// known one, or an `extra` that is not an array of strings, would hand `claude` directories
+// nobody chose. A fresh object also drops any stray field a hand-edit added.
+function readScope(raw: unknown): ResponderScope {
+  const invalid = () =>
+    new CliError(`El alcance guardado del respondedor no es válido. Vuelve a correr: ${CLI_COMMAND} setup`)
+  if (typeof raw !== 'object' || raw === null) throw invalid()
+  const r = raw as { kind?: unknown; extra?: unknown }
+  if (r.kind === 'folder' || r.kind === 'home') return { kind: r.kind }
+  if (r.kind !== 'folders') throw invalid()
+  if (!Array.isArray(r.extra) || r.extra.length === 0 || !r.extra.every((d) => typeof d === 'string' && d.length > 0)) throw invalid()
+  // Stored exactly as setupResponder writes them: `resolve()`d. A `/a/b/../c` or a trailing slash
+  // would slip past the duplicate and containment checks as a different string from `/a/c`, and
+  // would reach the anchored rules unnormalised while Claude resolves the directory itself.
+  // Relative entries are left for scopeProblem, which says so in its own words.
+  if ((r.extra as string[]).some((d) => isAbsolute(d) && resolve(d) !== d)) {
+    throw new CliError(`El alcance guardado del respondedor tiene una carpeta escrita de forma no normalizada. Vuelve a correr: ${CLI_COMMAND} setup`)
+  }
+  return { kind: 'folders', extra: [...(r.extra as string[])] }
 }
 
 export function responderArgs(o: { settingsPath: string; model: string; effort: string }): string[] {
@@ -84,13 +121,20 @@ export async function runResponder(o: {
   env: NodeJS.ProcessEnv
   out: Output
   runInteractive: InteractiveRunner
+  // The personal folder mode 3 opens and the `~/…` rules are anchored to. Injected so tests
+  // describe a machine without reading or naming the real one; defaults to this one.
+  home?: string
 }): Promise<number> {
   const profileHome = resolve(o.profileHome)
   const config = await readResponderConfig(profileHome)
 
   // The one file that actually fences this session, checked before spawning — not merely
   // reported by `doctor`, which nothing makes anyone run. `responder.json` is re-validated on
-  // every read above, and it is the harmless one: it names a folder and a model. `settings.json`
+  // every read above. It is not harmless on its own: since 0.4 it carries the scope, and a
+  // widened scope there is the whole personal folder. What makes it safe is this very check —
+  // settings.json is held to the scope responder.json records, exactly, and readResponderConfig
+  // rebuilds that scope field by field and re-runs scopeProblem, so a responder.json edited to
+  // read more than settings.json enforces, or the reverse, stops the start. `settings.json`
   // is what carries `permissions.blockReadsOutsideWorkingDirectories` and RESPONDER_DENY, and it
   // is handed to `claude --settings` unread. Claude Code refuses a MISSING settings file but
   // accepts one that exists and is not valid JSON in silence (verified against the real 2.1.278
@@ -100,7 +144,14 @@ export async function runResponder(o: {
   // and nothing said. `responder --profile <any directory>` makes that reachable on purpose, so
   // the check belongs here and not only in `doctor`. The reader itself lives beside the writer
   // (setup-responder.ts) so this and doctor's own check can never disagree.
-  const fence = await inspectResponderSettings(profileHome)
+  // Held to the scope responder.json records, never to a default: checked against one folder, a
+  // mode-1 file sitting under a mode-3 responder.json looks perfect — every mode-1 rule and the
+  // fence are there — while what it lacks is exactly the caja fuerte (task 1 review, M3).
+  const fence = await inspectResponderSettings(profileHome, config.scope, {
+    shareDir: config.shareDir,
+    identityHome: config.identityHome,
+    home: o.home ?? homedir(),
+  })
   if (fence.problems.length > 0) {
     throw new CliError(
       `No puedo ponerte a contestar: los permisos del perfil dedicado no están como deben (${fence.problems.join(' · ')}). Sin ellos, la sesión que contesta podría leer archivos fuera de la carpeta compartida. Vuelve a correr: ${CLI_COMMAND} setup`,
@@ -123,6 +174,21 @@ export async function runResponder(o: {
     )
   }
 
+  // Each extra folder of mode 2 is handed to Claude as a readable directory, and one that was
+  // moved or unplugged fails in no clearer way than the shared folder does — so the same check,
+  // with the folder named, since a person with three folders needs to know which one is gone.
+  // Safe to show for the same reason as above: it is a folder this person chose.
+  if (config.scope.kind === 'folders') {
+    for (const dir of config.scope.extra) {
+      const info = await stat(dir).catch(() => null)
+      if (!info?.isDirectory()) {
+        throw new CliError(
+          `No encuentro una de las carpetas extra que tu agente puede leer (${dir}). Puede que se haya movido, se haya renombrado, o esté en una unidad que no está conectada. Vuelve a correr: ${CLI_COMMAND} setup y quítala o elige una que exista.`,
+        )
+      }
+    }
+  }
+
   const env = {
     ...o.env,
     // The person's own identity and database, shared with every command they type — not a second
@@ -141,6 +207,9 @@ export async function runResponder(o: {
   // that the install is broken. The marker Claude keeps for this lives in its own private
   // `<perfil>/claude/.claude.json` and changes between versions, so this says what is about to
   // happen rather than writing into a file we do not own.
+  // The mode first, in the words `setup` used: the person about to leave their machine answering
+  // questions should see how far it reaches at the moment they start it, not only when they chose.
+  o.out.log(scopeSummary(config.scope))
   o.out.log('Abro Claude para ponerte a contestar. Déjalo abierto. Para parar: Ctrl+C.')
   o.out.log('La primera vez, Claude hace primero un par de preguntas suyas (el tema de colores y, si hace falta, el inicio de sesión).')
   const result = await o.runInteractive(

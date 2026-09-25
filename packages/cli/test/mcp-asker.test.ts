@@ -105,10 +105,14 @@ describe('the asker MCP server', () => {
   })
 
   it('asks for permission through connect', async () => {
+    // `connect` mines 22 bits of proof of work for real, so how long this takes depends on how busy
+    // the machine is, not on this code — the same reason asker-service.test.ts and
+    // commands-connect.test.ts bound their connect tests explicitly. Under full-suite load it
+    // outran vitest's 20-second default about once in three runs while passing every time alone.
     const { isError } = await call('connect', { link: encodeLink(ana.publicKey, [board.url]), note: 'soy Beto' })
     expect(isError).toBe(false)
     expect(getContact(store, ana.publicKey, 'outbound')?.state).toBe('pending')
-  })
+  }, 120_000)
 
   // A hostile declared name is exactly what forTerminal exists to strip (see commands-connect.test.ts's
   // "sanitizes a hostile declared name before showing it") — connect's own already_approved branch, and

@@ -6,7 +6,7 @@ const ROOT = new URL('../../', import.meta.url).pathname
 // Plans and specs are a record of what was decided when they were written; rewriting history to
 // satisfy a lint would destroy the reason they exist. Everything a person is meant to FOLLOW is
 // covered.
-const DOCS = ['README.md', 'CLAUDE.md', 'docs/inicio-rapido.md', 'docs/known-gaps.md', 'docs/runbooks/aceptacion-0.3.md']
+const DOCS = ['README.md', 'CLAUDE.md', 'docs/inicio-rapido.md', 'docs/known-gaps.md', 'docs/runbooks/aceptacion-0.4.md']
 
 describe('the docs do not ask a person to paste shell', () => {
   it('never mentions start.sh', async () => {
@@ -30,8 +30,81 @@ describe('the docs do not ask a person to paste shell', () => {
     expect(await readFile(join(ROOT, 'docs/inicio-rapido.md'), 'utf8')).toMatch(/@latest responder/)
   })
 
-  it('left no copy of the 0.2 acceptance runbook behind', async () => {
+  it('left no copy of an older acceptance runbook behind', async () => {
     const runbooks = await readdir(join(ROOT, 'docs/runbooks'))
     expect(runbooks).not.toContain('aceptacion-0.2.md')
+    expect(runbooks).not.toContain('aceptacion-0.3.md')
+  })
+
+  it('keeps the runbook to the shell blocks it says it has', async () => {
+    // The runbook promises that the only shell is in blocks marked ```bash, and says how many.
+    // A fifth one slipped into a Windows-side step would still pass every other check here.
+    const runbook = await readFile(join(ROOT, 'docs/runbooks/aceptacion-0.4.md'), 'utf8')
+    expect(runbook).toContain('Hay cuatro, todos en la sección 1, en S6 y en la sección 9.')
+    expect(runbook.match(/^```bash$/gm) ?? []).toHaveLength(4)
+  })
+
+  it('names the one shell word the other machine types, and types no other', async () => {
+    // Section 8 enters the shared folder with `cd`, outside the bash blocks (final review, M3).
+    // The runbook says so; a second such line would make that sentence untrue again.
+    const runbook = await readFile(join(ROOT, 'docs/runbooks/aceptacion-0.4.md'), 'utf8')
+    expect(runbook).toContain('más un `cd "<carpeta>"` en la sección 8')
+    const outsideBash = runbook.replace(/^```bash\n[\s\S]*?^```$/gm, '')
+    expect(outsideBash.match(/^cd .*$/gm) ?? []).toEqual(['cd "<compartida>"'])
+  })
+})
+
+describe('the docs say what the scopes do, and no more', () => {
+  it('call the home directory "carpeta personal", the word setup uses', async () => {
+    // Two names for one folder read as two folders (task 2 review, M1).
+    for (const doc of DOCS) {
+      expect(await readFile(join(ROOT, doc), 'utf8'), doc).not.toMatch(/carpeta de usuario/)
+    }
+  })
+
+  it('never promise the caja fuerte closes every secret', async () => {
+    // It closes the best-known places. "menos tus secretos" was the wording ruling 3 removed from
+    // setup; a doc repeating it would put the overpromise back where people read it slowly.
+    for (const doc of DOCS) {
+      expect(await readFile(join(ROOT, doc), 'utf8'), doc).not.toMatch(/(menos|todos|cerrados) tus secretos/)
+    }
+    // Ruling 6: what is true is that nobody opens it through `setup` — not that it "nunca se abre".
+    // Every "nadie … puede abrir" has to say through what, in the same sentence.
+    for (const doc of DOCS) {
+      const text = (await readFile(join(ROOT, doc), 'utf8')).replace(/\s+/g, ' ')
+      expect(text, doc).not.toMatch(/nunca se abre|sigue cerrad[oa] siempre/)
+      for (const sentence of text.match(/nadie (?:la )?puede abrir[^.;(]*/g) ?? []) expect(sentence, doc).toContain('setup')
+    }
+    const guide = await readFile(join(ROOT, 'docs/inicio-rapido.md'), 'utf8')
+    // Ruling 5, said where a person reads it slowly.
+    expect(guide).toContain('En Windows la opción 3 todavía no está disponible.')
+    expect(guide).toContain('los lugares más conocidos donde se guardan contraseñas y llaves')
+    expect(guide).toContain('La caja fuerte no lo cubre todo.')
+    // Mode 3's one sentence a person must understand before choosing it.
+    expect(guide).toMatch(/cualquier persona a la que le des permiso\s+de preguntarte puede preguntar por cualquier archivo de tu carpeta personal/)
+  })
+
+  it('re-checks the verified Claude Code behaviours the way that actually works', async () => {
+    // Both lessons cost real attempts: without disableAllHooks a memory plugin fed earlier probes
+    // back to the model and it refused; without a positive control a "not loaded" proves nothing.
+    const runbook = await readFile(join(ROOT, 'docs/runbooks/aceptacion-0.4.md'), 'utf8')
+    const section = runbook.slice(runbook.indexOf('## 8. '), runbook.indexOf('## 9. '))
+    // The lesson, and the line the person actually copies into every probe's settings.
+    expect(section).toContain('**Cada sonda lleva `"disableAllHooks": true` en su archivo de ajustes.**')
+    expect(section).toMatch(/^  "disableAllHooks": true,$/m)
+    expect(section).toContain('Cada "no" necesita su "sí".')
+    expect(section).toContain('nombres neutros')
+    for (const heading of ['### 8.2 Opción 1', '### 8.3 Opción 2', '### 8.4 Opción 3', '### 8.7 Limpieza']) {
+      expect(section).toContain(heading)
+    }
+  })
+
+  it('never asks for a search across the whole personal folder', async () => {
+    // Claude Code cuts every search at 20 seconds, and a real personal folder takes longer: the
+    // first real run of section 8 could not finish row 3g as written (final review, I2).
+    const runbook = await readFile(join(ROOT, 'docs/runbooks/aceptacion-0.4.md'), 'utf8')
+    const section = runbook.slice(runbook.indexOf('## 8. '), runbook.indexOf('## 9. '))
+    expect(section).toContain('| 3g | Grep de `VALOR` en `<casa>/ab-sonda` |')
+    expect(section).not.toMatch(/Grep de `VALOR` en `<casa>`/)
   })
 })

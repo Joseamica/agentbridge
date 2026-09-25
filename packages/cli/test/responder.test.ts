@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { CLI_COMMAND } from '@agentbridge/core'
@@ -7,12 +7,16 @@ import { memoryOutput } from '../src/context'
 import { readResponderConfig, responderArgs, runResponder, RESPONDER_CONFIG_FILE } from '../src/commands/responder'
 import { responderSettings } from '../src/commands/setup-responder'
 
+// Mode 1 ignores the paths entirely; they are here only because the signature takes them.
+const modeOne = () =>
+  responderSettings({ kind: 'folder' }, { shareDir: '/tmp/compartido', identityHome: '/tmp/identidad', profileHome: '/tmp/perfil', home: '/tmp/casa' })
+
 // `settingsText` is what lands in the profile's settings.json — the file `--settings` points
 // `claude` at, and the only thing that actually fences the answering session. It defaults to
 // exactly what setupResponder writes, because every test that reaches the spawn needs a profile
 // that is genuinely safe to start; the fence tests below pass their own broken shapes, and
 // `null` leaves the file out altogether.
-async function profileWith(config: unknown, settingsText: string | null = JSON.stringify(responderSettings())): Promise<string> {
+async function profileWith(config: unknown, settingsText: string | null = JSON.stringify(modeOne())): Promise<string> {
   const profileHome = await mkdtemp(join(tmpdir(), 'ab-responder-'))
   await writeFile(join(profileHome, RESPONDER_CONFIG_FILE), JSON.stringify(config), { mode: 0o600 })
   if (settingsText !== null) await writeFile(join(profileHome, 'settings.json'), settingsText, { mode: 0o600 })
@@ -22,9 +26,18 @@ async function profileWith(config: unknown, settingsText: string | null = JSON.s
 const goodConfig = { version: 1, shareDir: '/tmp/compartido', identityHome: '/tmp/identidad', model: 'sonnet', effort: 'low' }
 
 describe('responder configuration', () => {
-  it('reads the config setup wrote', async () => {
+  // Every 0.3 install has a version-1 file and no `scope`. It must keep working without re-running
+  // setup, and it means exactly what it meant then: one folder.
+  it('reads a version-1 config as mode 1', async () => {
     const profileHome = await profileWith(goodConfig)
-    await expect(readResponderConfig(profileHome)).resolves.toEqual(goodConfig)
+    await expect(readResponderConfig(profileHome)).resolves.toEqual({ ...goodConfig, version: 2, scope: { kind: 'folder' } })
+  })
+
+  it('reads a version-2 config with each of the three scopes', async () => {
+    for (const scope of [{ kind: 'folder' }, { kind: 'home' }, { kind: 'folders', extra: ['/tmp/otra', '/srv/notas'] }]) {
+      const profileHome = await profileWith({ ...goodConfig, version: 2, scope })
+      await expect(readResponderConfig(profileHome)).resolves.toEqual({ ...goodConfig, version: 2, scope })
+    }
   })
 
   it('says to run setup when the profile was never prepared', async () => {
@@ -46,8 +59,56 @@ describe('responder configuration', () => {
   })
 
   it('refuses a config from a future version instead of guessing its shape', async () => {
-    const profileHome = await profileWith({ ...goodConfig, version: 2 })
+    const profileHome = await profileWith({ ...goodConfig, version: 3, scope: { kind: 'folder' } })
     await expect(readResponderConfig(profileHome)).rejects.toThrow(/versión/i)
+  })
+
+  // The scope decides which folders the answering session can read, so a hand-edited or
+  // half-written value is refused, never guessed at — the same discipline as the two paths above.
+  describe('a version-2 scope', () => {
+    const v2 = (scope: unknown) => ({ ...goodConfig, version: 2, scope })
+    const refuses = async (scope: unknown, pattern: RegExp) => {
+      const profileHome = await profileWith(v2(scope))
+      await expect(readResponderConfig(profileHome)).rejects.toThrow(pattern)
+    }
+
+    it('is required', () => refuses(undefined, /alcance/i))
+    it('must have a known kind', () => refuses({ kind: 'todo' }, /alcance/i))
+    it('needs at least one extra folder in mode 2', () => refuses({ kind: 'folders', extra: [] }, /alcance/i))
+    it('needs every extra folder to be an absolute path', () => refuses({ kind: 'folders', extra: ['otra'] }, /absoluta/i))
+    it('refuses an extra folder that is not a string', () => refuses({ kind: 'folders', extra: [7] }, /alcance/i))
+    it('refuses the same folder twice', () => refuses({ kind: 'folders', extra: ['/tmp/otra', '/tmp/otra'] }, /repetid|dentro de otra/i))
+    it('refuses an extra folder inside another extra folder', () =>
+      refuses({ kind: 'folders', extra: ['/tmp/otra', '/tmp/otra/sub'] }, /repetid|dentro de otra/i))
+    it('refuses an extra folder equal to the shared folder', () => refuses({ kind: 'folders', extra: ['/tmp/compartido'] }, /compartida/i))
+    it('refuses an extra folder inside the shared folder', () =>
+      refuses({ kind: 'folders', extra: ['/tmp/compartido/sub'] }, /compartida/i))
+    // The fence is what keeps the key and the database away from a question. An extra folder
+    // that contains them puts them back inside the readable set.
+    //
+    // Each of these two builds its own folders under a fresh mkdtemp, so the extra folder holds
+    // exactly one of the two and the assertion is about that one's clause. An earlier version used
+    // `tmpdir()` as the extra: on Linux that is `/tmp`, which also holds `/tmp/identidad`, so the
+    // identity clause fired and the profile test failed there while passing on macOS.
+    it('refuses an extra folder that contains the identity home', async () => {
+      const idRoot = await mkdtemp(join(tmpdir(), 'ab-id-'))
+      const profileHome = await profileWith({
+        ...v2({ kind: 'folders', extra: [idRoot] }),
+        identityHome: join(idRoot, 'identidad'),
+      })
+      await expect(readResponderConfig(profileHome)).rejects.toThrow(/carpeta de identidad/)
+    })
+    it('refuses an extra folder that contains the dedicated profile', async () => {
+      const elsewhere = await mkdtemp(join(tmpdir(), 'ab-elsewhere-'))
+      const profileHome = await mkdtemp(join(tmpdir(), 'ab-responder-'))
+      const config = { ...goodConfig, version: 2, shareDir: join(elsewhere, 'compartido'), identityHome: join(elsewhere, 'identidad'), scope: { kind: 'folders', extra: [profileHome] } }
+      await writeFile(join(profileHome, RESPONDER_CONFIG_FILE), JSON.stringify(config), { mode: 0o600 })
+      await expect(readResponderConfig(profileHome)).rejects.toThrow(/perfil dedicado/)
+    })
+    // Stored the way setupResponder writes them, resolved: `/tmp/otra/../x` would otherwise sit
+    // beside `/tmp/x` as a different string and slip past the duplicate check.
+    it('refuses an extra folder that is not normalised', () => refuses({ kind: 'folders', extra: ['/tmp/otra/../x'] }, /normalizada/))
+    it('refuses an extra folder with a trailing slash', () => refuses({ kind: 'folders', extra: ['/tmp/otra/'] }, /normalizada/))
   })
 
   // Review round 1, Important 2: `model`/`effort` were re-validated on read but the two path
@@ -251,7 +312,7 @@ describe('runResponder', () => {
     })
 
     it('refuses to start when a deny rule is gone, naming it, and never spawns', async () => {
-      const weakened = responderSettings()
+      const weakened = modeOne()
       weakened.permissions.deny = weakened.permissions.deny.filter((rule) => rule !== 'Bash')
       const { error, spawned } = await startWith(JSON.stringify(weakened))
       expect((error as Error).message).toContain('Bash')
@@ -259,7 +320,7 @@ describe('runResponder', () => {
     })
 
     it('refuses to start when the read fence is not true, and never spawns', async () => {
-      const unfenced = responderSettings()
+      const unfenced = modeOne() as { permissions: { blockReadsOutsideWorkingDirectories: boolean } }
       unfenced.permissions.blockReadsOutsideWorkingDirectories = false
       const { error, spawned } = await startWith(JSON.stringify(unfenced))
       expect((error as Error).message).toContain('blockReadsOutsideWorkingDirectories')
@@ -271,7 +332,7 @@ describe('runResponder', () => {
     // so a checker that reads it from the top level would wave through a genuinely unfenced
     // profile. This is the shape that proves the check reads the nested place.
     it('refuses a fence written beside `permissions` instead of inside it', async () => {
-      const misplaced = responderSettings() as Record<string, unknown> & { permissions: Record<string, unknown> }
+      const misplaced = modeOne() as Record<string, unknown> & { permissions: Record<string, unknown> }
       delete misplaced.permissions.blockReadsOutsideWorkingDirectories
       misplaced.blockReadsOutsideWorkingDirectories = true
       const { error, spawned } = await startWith(JSON.stringify(misplaced))
@@ -293,6 +354,117 @@ describe('runResponder', () => {
       })
       expect(spawned).toBe(true)
       expect(code).toBe(0)
+    })
+  })
+
+  // Review finding M3 of task 1: responder.ts already handed the saved scope to the inspector, but
+  // nothing pinned it — replacing `config.scope` with `{ kind: 'folder' }` kept every test green,
+  // and that replacement is exactly the dangerous one: a profile whose responder.json says "the
+  // whole personal folder" and whose settings.json is the mode-1 file would start, and the next
+  // `setup` run would not be what made the two agree. The scope comes from responder.json, and
+  // settings.json is held to it.
+  describe('the scope saved in responder.json', () => {
+    // A stand-in for the personal folder, so nothing here reads or names the real one.
+    let home: string
+    beforeEach(async () => {
+      home = await mkdtemp(join(tmpdir(), 'ab-responder-home-'))
+    })
+
+    const settingsFor = (scope: Parameters<typeof responderSettings>[0], profileHome: string) =>
+      JSON.stringify(responderSettings(scope, { shareDir, identityHome: '/tmp/identidad', profileHome, home }))
+
+    async function start(config: unknown, settings: (profileHome: string) => string) {
+      const profileHome = await mkdtemp(join(tmpdir(), 'ab-responder-'))
+      await writeFile(join(profileHome, RESPONDER_CONFIG_FILE), JSON.stringify(config), { mode: 0o600 })
+      await writeFile(join(profileHome, 'settings.json'), settings(profileHome), { mode: 0o600 })
+      const out = memoryOutput()
+      let spawned = false
+      let saidBeforeClaudeStarted = ''
+      const error: unknown = await runResponder({
+        profileHome,
+        env: {},
+        out,
+        home,
+        runInteractive: async () => {
+          spawned = true
+          saidBeforeClaudeStarted = out.lines.join('\n')
+          return { code: 0, spawnFailed: false }
+        },
+      }).then(
+        () => null,
+        (e: unknown) => e,
+      )
+      return { error, spawned, saidBeforeClaudeStarted }
+    }
+
+    it('refuses a mode-3 profile whose settings.json is the mode-1 file, and never spawns', async () => {
+      const { error, spawned } = await start({ ...workingConfig, version: 2, scope: { kind: 'home' } }, () => JSON.stringify(modeOne()))
+      expect(spawned).toBe(false)
+      // The mode-1 file has every mode-1 rule and the fence; what it lacks is the caja fuerte and
+      // the personal folder — the only two things a check against the wrong scope would not see.
+      expect((error as Error).message).toMatch(/caja fuerte/)
+      expect((error as Error).message).toContain(`${CLI_COMMAND} setup`)
+    })
+
+    it('starts mode 3 with the settings setupResponder writes for it, and names the mode first', async () => {
+      const { error, spawned, saidBeforeClaudeStarted } = await start({ ...workingConfig, version: 2, scope: { kind: 'home' } }, (p) =>
+        settingsFor({ kind: 'home' }, p),
+      )
+      expect(error).toBeNull()
+      expect(spawned).toBe(true)
+      expect(saidBeforeClaudeStarted).toContain('Tu agente puede ver: toda tu carpeta personal, menos la caja fuerte.')
+    })
+
+    it('names mode 1 before handing over', async () => {
+      const { spawned, saidBeforeClaudeStarted } = await start(workingConfig, () => JSON.stringify(modeOne()))
+      expect(spawned).toBe(true)
+      expect(saidBeforeClaudeStarted).toContain('Tu agente puede ver: solo la carpeta compartida.')
+    })
+
+    describe('mode 2', () => {
+      let extra: string[]
+      beforeEach(async () => {
+        const parent = await mkdtemp(join(tmpdir(), 'ab-responder-extra-'))
+        extra = [join(parent, 'notas'), join(parent, 'clientes')]
+        for (const dir of extra) await mkdir(dir)
+      })
+      const modeTwo = () => ({ ...workingConfig, version: 2, scope: { kind: 'folders', extra } })
+
+      it('starts when every extra folder is there, in the shared folder, naming the mode', async () => {
+        const { error, spawned, saidBeforeClaudeStarted } = await start(modeTwo(), (p) => settingsFor({ kind: 'folders', extra }, p))
+        expect(error).toBeNull()
+        expect(spawned).toBe(true)
+        expect(saidBeforeClaudeStarted).toContain('Tu agente puede ver: la carpeta compartida y 2 carpetas más.')
+      })
+
+      // The same ambiguity the shared-folder check exists for: a folder handed to Claude that is
+      // gone would surface, at best, as something unrelated. Named, so the person knows which.
+      it('names an extra folder that is gone, and never spawns', async () => {
+        const gone = extra[1] as string
+        await import('node:fs/promises').then((fs) => fs.rm(gone, { recursive: true }))
+        const { error, spawned } = await start(modeTwo(), (p) => settingsFor({ kind: 'folders', extra }, p))
+        expect(spawned).toBe(false)
+        expect((error as Error).message).toMatch(/carpetas extra/)
+        expect((error as Error).message).toContain(gone)
+        expect((error as Error).message).toContain(`${CLI_COMMAND} setup`)
+      })
+
+      it('names an extra folder that is a file, not a folder, and never spawns', async () => {
+        const notAFolder = extra[0] as string
+        await import('node:fs/promises').then(async (fs) => {
+          await fs.rm(notAFolder, { recursive: true })
+          await fs.writeFile(notAFolder, 'no soy una carpeta')
+        })
+        const { error, spawned } = await start(modeTwo(), (p) => settingsFor({ kind: 'folders', extra }, p))
+        expect(spawned).toBe(false)
+        expect((error as Error).message).toContain(notAFolder)
+      })
+
+      it('refuses a mode-2 profile whose settings.json is the mode-1 file, and never spawns', async () => {
+        const { error, spawned } = await start(modeTwo(), () => JSON.stringify(modeOne()))
+        expect(spawned).toBe(false)
+        expect((error as Error).message).toMatch(/faltan carpetas que elegiste/)
+      })
     })
   })
 

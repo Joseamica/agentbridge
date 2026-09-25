@@ -18,12 +18,14 @@ import {
 } from '@agentbridge/core'
 import { randomUUID } from 'node:crypto'
 import { access, lstat, readdir, readFile, readlink, realpath, stat } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { dirname, join, resolve, sep } from 'node:path'
 import { parseArgs } from 'node:util'
 import { CliError, type CliContext } from '../context'
 import { isSameOrWithin, resolveComparablePath, resolveNonExisting } from '../fs-paths'
 import { readResponderConfig, RESPONDER_CONFIG_FILE } from './responder'
-import { defaultRunner, inspectResponderSettings, type CommandRunner } from './setup-responder'
+import { scopeSummary, type ResponderConfig } from './responder-config'
+import { defaultRunner, inspectResponderSettings, SCOPE_FILE, scopeDescription, type CommandRunner } from './setup-responder'
 
 export type Check = {
   name: string
@@ -45,7 +47,27 @@ export type Check = {
   security: boolean
 }
 
-type WalkResult = { escaping: string[]; unreadable: string[]; skipped: string[] }
+type WalkResult = {
+  escaping: string[]
+  unreadable: string[]
+  skipped: string[]
+  // Set only by a bounded walk (see WALK_LIMITS): whether a branch was too deep to finish, and
+  // whether the entry cap stopped the whole walk. Either way the result covers part of the folder,
+  // and the line built from it has to say so.
+  depthLimited?: boolean
+  truncated?: boolean
+  visited?: number
+}
+
+// The same bounds setup's own scan of a chosen folder uses (setup.ts imports them from here), so
+// the two stop at the same place and a large folder never takes longer here than there. The
+// working directory is walked without them, as it always was; the extra folders of mode 2 are the
+// ones people pick from their own home — a whole `~/Documents` — and an unbounded walk of one
+// could keep doctor, and setup's "Reviso que todo esté listo…", going for tens of seconds.
+export const MAX_SCAN_DEPTH = 6
+export const MAX_SCAN_ENTRIES = 20000
+type WalkLimits = { maxDepth: number; maxEntries: number }
+const WALK_LIMITS: WalkLimits = { maxDepth: MAX_SCAN_DEPTH, maxEntries: MAX_SCAN_ENTRIES }
 
 // Walks the shared folder looking for symlinks whose real target lands outside it.
 // - `.git` and `node_modules` are skipped for size, but named in `skipped` — callers must
@@ -55,7 +77,8 @@ type WalkResult = { escaping: string[]; unreadable: string[]; skipped: string[] 
 // - A dangling symlink (target does not exist) is resolved against its own literal target
 //   text via readlink + the link's own directory, not realpath (which requires the target to
 //   exist) — so a broken-but-internal link is not misreported as an escape.
-async function walkShareDir(dir: string, rootReal: string, result: WalkResult): Promise<void> {
+async function walkShareDir(dir: string, rootReal: string, result: WalkResult, limits?: WalkLimits, depth = 0): Promise<void> {
+  if (result.truncated) return
   let entries: string[]
   try {
     entries = await readdir(dir)
@@ -64,6 +87,14 @@ async function walkShareDir(dir: string, rootReal: string, result: WalkResult): 
     return
   }
   for (const entry of entries) {
+    if (limits) {
+      if (result.truncated) return
+      result.visited = (result.visited ?? 0) + 1
+      if (result.visited > limits.maxEntries) {
+        result.truncated = true
+        return
+      }
+    }
     const path = join(dir, entry)
     let info: Awaited<ReturnType<typeof lstat>>
     try {
@@ -88,8 +119,11 @@ async function walkShareDir(dir: string, rootReal: string, result: WalkResult): 
     } else if (info.isDirectory()) {
       if (entry === '.git' || entry === 'node_modules') {
         result.skipped.push(path)
+      } else if (limits && depth >= limits.maxDepth) {
+        // Only this branch stops, as in setup's scan; siblings are still walked.
+        result.depthLimited = true
       } else {
-        await walkShareDir(path, rootReal, result)
+        await walkShareDir(path, rootReal, result, limits, depth + 1)
       }
     }
   }
@@ -111,22 +145,29 @@ const PROJECT_CONFIG_DIRS = ['.claude/agents', '.claude/skills', '.claude/comman
 // The unattended session's cwd IS the shared folder, so Claude Code picks up any project
 // configuration it finds there — .claude/settings*.json hooks run shell commands entirely
 // outside the tool permission system, .mcp.json can point at another MCP server,
-// .claude/agents/* can define subagents, CLAUDE.local.md and AGENTS.md are auto-loaded
-// instructions same as CLAUDE.md, and .claude/skills/*/SKILL.md and .claude/commands/*.md have
+// .claude/agents/* can define subagents, CLAUDE.local.md is auto-loaded instructions same as
+// CLAUDE.md, and .claude/skills/*/SKILL.md and .claude/commands/*.md have
 // their frontmatter injected straight into the session's instructions on startup. That last
 // pair is the most dangerous of the lot: nobody has to be talked into reading anything, and no
 // deny rule can stop text — "trust the concrete check, not the prose" only holds if the check
 // actually looks. None of this has to come from the responder: a sync client or a `git pull`
 // landing files in the shared folder is enough. Treat any of it as a real failure, not a note.
 //
-// Two genuinely different things happen depending on which of these turns up, and the failing
+// AGENTS.md is the exception to all of the above, and the detail says so: on Claude Code 2.1.282
+// it is not read at all (verificaciones.md, V19 — CLAUDE.local.md in the working directory loaded,
+// AGENTS.md beside it did not). It stays on the list because it is an instructions file for agents
+// and a later Claude Code could start loading it; a shared folder is curated, so one turning up
+// there is still worth stopping for. What the line must not do is say it loads today.
+//
+// Two genuinely different things happen depending on which of the others turns up, and the failing
 // check's detail below must say which: settings.json/settings.local.json (hooks) and .mcp.json
 // (another MCP server) and .claude/agents (subagents) all run code, or hand control to
-// something else, outside the tool permission system. The other four — CLAUDE.local.md,
-// AGENTS.md, .claude/skills, .claude/commands — never execute anything at all; their TEXT is
+// something else, outside the tool permission system. The other three — CLAUDE.local.md,
+// .claude/skills, .claude/commands — never execute anything at all; their TEXT is
 // injected straight into the session's instructions on startup, and no deny rule can stop
 // text. Describing that second group as "can run code" would be simply wrong, and would
 // understate exactly the risk that made checking for them worth doing in the first place.
+const NOT_LOADED_TODAY = 'AGENTS.md'
 const PROJECT_CONFIG_EXEC_RISK = new Set(['.claude/settings.json', '.claude/settings.local.json', '.mcp.json', '.claude/agents'])
 
 // Exported so `setup` can reuse this exact detection when deciding whether a chosen shared
@@ -372,11 +413,47 @@ export async function probeBoard(o: {
 // they are the whole reason `--share` exists as its own flag, and folding them into
 // `addProfileChecks` (gated on `--profile`) is what let an `AGENTS.md` sitting in the shared
 // folder go unreported when nobody happened to also pass `--profile`.
+// Whether a folder itself refuses to be opened — not a subfolder, the folder. On macOS that is
+// almost always the privacy settings keeping the terminal out of Documents, Desktop or Downloads:
+// `stat` passes and `readdir` gets EPERM. Detected by the error, never by the folder's name.
+async function cannotOpen(dir: string): Promise<boolean> {
+  const code = await readdir(dir).then(
+    () => null,
+    (err: NodeJS.ErrnoException) => err.code ?? null,
+  )
+  return code === 'EPERM' || code === 'EACCES'
+}
+
+// Said the same way for the shared folder and for an extra folder: the cause and where to fix it.
+// Walking such a folder printed "1 ruta(s) no se pudieron revisar" as a security failure with no
+// cause and no way out.
+function cannotOpenDetail(dir: string, platform: NodeJS.Platform): string {
+  return platform === 'darwin'
+    ? `No puedo abrir ${dir}: macOS no deja que este programa entre en esa carpeta. Ve a Ajustes del Sistema › Privacidad y seguridad › Archivos y carpetas (o Acceso total al disco) y permite la app de terminal donde corres esto. Hasta entonces, tu agente tampoco puede leerla.`
+    : `No puedo abrir ${dir}: no tengo permiso para leer esa carpeta. Hasta que lo tenga, tu agente tampoco puede leerla.`
+}
+
 async function addShareChecks(
   add: (name: string, ok: boolean, detail: string, blocking: boolean, security?: boolean) => void,
-  o: { shareDir: string; profileHome?: string },
+  o: { shareDir: string; profileHome?: string; platform: NodeJS.Platform },
 ): Promise<void> {
   const shareDir = resolve(o.shareDir)
+  // A shared folder kept in ~/Documents is a likely choice, and declining macOS's prompt for the
+  // terminal leaves it exactly as unreadable as an extra folder: the agent can read nothing at
+  // all. Its own line, blocking — but not `security`: it is a permission the person must grant,
+  // not a hole. The persona, links and project-config lines are skipped: each would report on a
+  // folder nobody could open ("Falta CLAUDE.md", "Ninguna"). The cross-check below compares paths
+  // only, so it still runs.
+  const locked = await cannotOpen(shareDir)
+  if (locked) add('Carpeta compartida', false, cannotOpenDetail(shareDir, o.platform), true, false)
+  else await addShareContentChecks(add, shareDir)
+  await addProfileCrossCheck(add, o)
+}
+
+async function addShareContentChecks(
+  add: (name: string, ok: boolean, detail: string, blocking: boolean, security?: boolean) => void,
+  shareDir: string,
+): Promise<void> {
   const persona = await access(join(shareDir, 'CLAUDE.md'))
     .then(() => true)
     .catch(() => false)
@@ -391,36 +468,18 @@ async function addShareChecks(
   // Walk regardless of whether the persona file is there — a shared folder missing
   // CLAUDE.md can still contain files (and escaping symlinks); "no persona" is not the
   // same question as "any links escape", and skipping this while still reporting 'Ninguno'
-  // would claim a clean sweep that never happened. walkShareDir itself turns a missing or
-  // unreadable shareDir into an `unreadable` entry rather than throwing.
-  const rootReal = await realpath(shareDir).catch(() => shareDir)
-  const walk: WalkResult = { escaping: [], unreadable: [], skipped: [] }
-  await walkShareDir(shareDir, rootReal, walk)
-  const linksOk = walk.escaping.length === 0 && walk.unreadable.length === 0
-  // The shared folder's own paths never appear in this detail: they name the shared folder's
-  // internal layout, which no doctor line may print. Say how many and of what kind, not which.
-  const linkBits: string[] = []
-  if (walk.escaping.length) linkBits.push(`${walk.escaping.length} enlace(s) apuntan fuera de la carpeta`)
-  if (walk.unreadable.length) linkBits.push(`${walk.unreadable.length} ruta(s) no se pudieron revisar (sin permiso de lectura)`)
-  if (walk.skipped.length) linkBits.push(`${walk.skipped.length} carpeta(s) no se revisaron por dentro (.git o node_modules)`)
-  add('Sin enlaces que salgan de la carpeta', linksOk, linkBits.length ? linkBits.join(' · ') : 'Ninguno', true, true)
+  // would claim a clean sweep that never happened.
+  await addFolderContentChecks(add, {
+    dir: shareDir,
+    linksName: 'Sin enlaces que salgan de la carpeta',
+    configName: 'Sin configuración de proyecto en la carpeta compartida',
+  })
+}
 
-  const projectConfig = await projectConfigArtifacts(shareDir)
-  const execRisk = projectConfig.filter((rel) => PROJECT_CONFIG_EXEC_RISK.has(rel))
-  const textInjection = projectConfig.filter((rel) => !PROJECT_CONFIG_EXEC_RISK.has(rel))
-  const projectConfigBits: string[] = []
-  if (execRisk.length) projectConfigBits.push(`${execRisk.length} archivo(s)/carpeta(s) que pueden ejecutar código o delegar a otro servidor fuera del control de permisos`)
-  if (textInjection.length) {
-    projectConfigBits.push(`${textInjection.length} archivo(s)/carpeta(s) que se inyectan como instrucciones del agente al arrancar, sin que nadie tenga que leerlos ni pedirlos`)
-  }
-  add(
-    'Sin configuración de proyecto en la carpeta compartida',
-    projectConfig.length === 0,
-    projectConfigBits.length ? `Encontrado — ${projectConfigBits.join(' · ')}` : 'Ninguna',
-    true,
-    true,
-  )
-
+async function addProfileCrossCheck(
+  add: (name: string, ok: boolean, detail: string, blocking: boolean, security?: boolean) => void,
+  o: { shareDir: string; profileHome?: string },
+): Promise<void> {
   // This one needs both flags at once — it says nothing about the shared folder alone — so it
   // only runs when `--profile` was also given, same as before the split.
   if (o.profileHome) {
@@ -447,13 +506,172 @@ async function addShareChecks(
   }
 }
 
+// What a readable folder may hold that it should not: links whose target lies outside it, and
+// project configuration Claude Code may pick up. Shared by the working directory and every extra
+// folder of mode 2, under different names — the persona check stays with the working directory
+// alone, because that is the only folder whose CLAUDE.md Claude loads (verificaciones.md: a
+// CLAUDE.md in an additional directory is not loaded), so asking an extra folder for one would be
+// a false alarm. `prefix` is put before a failing detail because `setup` prints only the detail:
+// with three folders, "1 enlace(s) apuntan fuera de la carpeta" alone does not say which.
+async function addFolderContentChecks(
+  add: (name: string, ok: boolean, detail: string, blocking: boolean, security?: boolean) => void,
+  // `configName` absent: the project-configuration check is skipped (extra folders, see
+  // addScopeChecks). `limits` absent: the walk is unbounded (the working directory, as before).
+  // `linksFenced`: an escaping link is said, not failed (extra folders, see addScopeChecks).
+  o: { dir: string; linksName: string; configName?: string; prefix?: string; limits?: WalkLimits; linksFenced?: boolean },
+): Promise<void> {
+  const prefix = o.prefix ?? ''
+  // walkShareDir turns a missing or unreadable folder into an `unreadable` entry rather than
+  // throwing.
+  const rootReal = await realpath(o.dir).catch(() => o.dir)
+  const walk: WalkResult = { escaping: [], unreadable: [], skipped: [] }
+  await walkShareDir(o.dir, rootReal, walk, o.limits)
+  const linksOk = (o.linksFenced || walk.escaping.length === 0) && walk.unreadable.length === 0
+  // The folder's own paths never appear in this detail: they name its internal layout, which no
+  // doctor line may print. Say how many and of what kind, not which. The folder itself may be
+  // named (in `prefix`): the person chose it and is looking at this screen.
+  const linkBits: string[] = []
+  if (walk.escaping.length) {
+    linkBits.push(
+      o.linksFenced
+        ? `${walk.escaping.length} enlace(s) apuntan fuera de la carpeta, y no es un riesgo: Claude Code sigue cada enlace hasta su destino real y ahí aplica la misma valla y la misma caja fuerte (comprobado con Claude Code 2.1.282), así que tu agente solo puede leer ese destino si ya está en una carpeta que elegiste`
+        : `${walk.escaping.length} enlace(s) apuntan fuera de la carpeta`,
+    )
+  }
+  if (walk.unreadable.length) linkBits.push(`${walk.unreadable.length} ruta(s) no se pudieron revisar (sin permiso de lectura)`)
+  if (walk.skipped.length) linkBits.push(`${walk.skipped.length} carpeta(s) no se revisaron por dentro (.git o node_modules)`)
+  // Partial is said, never passed off as a full sweep — but it does not fail the line: nothing
+  // wrong was found, and a folder being large is not a fault.
+  if (walk.truncated || walk.depthLimited) {
+    linkBits.push(
+      walk.truncated
+        ? `no terminé de revisarla: es muy grande, y me detuve después de ${MAX_SCAN_ENTRIES} elementos`
+        : `no revisé todo: tiene carpetas a más de ${MAX_SCAN_DEPTH} niveles de profundidad`,
+    )
+  }
+  add(o.linksName, linksOk, linkBits.length ? `${linksOk ? '' : prefix}${linkBits.join(' · ')}` : 'Ninguno', true, true)
+
+  if (o.configName === undefined) return
+  const projectConfig = await projectConfigArtifacts(o.dir)
+  const execRisk = projectConfig.filter((rel) => PROJECT_CONFIG_EXEC_RISK.has(rel))
+  const textInjection = projectConfig.filter((rel) => !PROJECT_CONFIG_EXEC_RISK.has(rel) && rel !== NOT_LOADED_TODAY)
+  const projectConfigBits: string[] = []
+  if (execRisk.length) projectConfigBits.push(`${execRisk.length} archivo(s)/carpeta(s) que pueden ejecutar código o delegar a otro servidor fuera del control de permisos`)
+  if (textInjection.length) {
+    projectConfigBits.push(`${textInjection.length} archivo(s)/carpeta(s) que se inyectan como instrucciones del agente al arrancar, sin que nadie tenga que leerlos ni pedirlos`)
+  }
+  if (projectConfig.includes(NOT_LOADED_TODAY)) {
+    projectConfigBits.push(`un ${NOT_LOADED_TODAY}: el Claude Code comprobado (2.1.282) no lo carga, pero es un archivo de instrucciones para agentes y una versión nueva podría cargarlo al arrancar`)
+  }
+  add(
+    o.configName,
+    projectConfig.length === 0,
+    projectConfigBits.length ? `${prefix}Encontrado — ${projectConfigBits.join(' · ')}` : 'Ninguna',
+    true,
+    true,
+  )
+}
+
+// The mode-3 information line. The same words as the consent screen in setup.ts (homeExplanation):
+// the best-known places, and in the same breath what is not covered. The first wording there
+// promised "tus contraseñas y llaves" and a `contraseñas.docx` stayed readable (task 2 review, I2);
+// this is the line read months later, so it must not promise more than that screen does.
+const CAJA_FUERTE_LINE =
+  'siguen cerrados tu llave de AgentBridge; tu Claude de todos los días (tu sesión y tus conversaciones); los lugares más conocidos donde se guardan contraseñas y llaves (las del navegador, las de tu llavero y las que dan acceso a servidores y a la nube); y los archivos .env y los de llaves que terminan en .pem, .key, .p12 o .pfx. La caja fuerte no lo cubre todo: una contraseña escrita en un documento, correos o chats guardados en tu computadora, o un archivo de llaves con un nombre poco común, tu agente sí puede leerlos.'
+
+// Which mode is in force, and in mode 2 what each extra folder holds. Information lines never
+// block: the mode is a choice, not a fault. The extra folders' own checks are the same content
+// checks the shared folder gets, and carry the same weight — whatever an extra folder holds is
+// readable by the next question exactly like the shared folder's contents.
+async function addScopeChecks(
+  add: (name: string, ok: boolean, detail: string, blocking: boolean, security?: boolean) => void,
+  config: ResponderConfig,
+  home: string,
+  platform: NodeJS.Platform,
+): Promise<void> {
+  const scope = config.scope
+  const summary = scopeSummary(scope)
+  add('Alcance del respondedor', true, scope.kind === 'folders' ? `${summary} Son: ${scope.extra.join(', ')}.` : summary, false)
+  if (scope.kind === 'home') add('Caja fuerte', true, CAJA_FUERTE_LINE, false)
+
+  // Whether the model is told the reach it actually has. The permissions enforce the scope either
+  // way, so this never blocks and is not about safety; it is about an agent that refuses a folder
+  // it was given because its CLAUDE.md still says "only this folder". setup says this once, when
+  // it leaves an edited CLAUDE.md alone; this line keeps saying it until it is fixed. In mode 1 a
+  // CLAUDE.md that never mentions the scope file is every 0.3 install, and it describes mode 1
+  // correctly, so there is nothing to say unless it points at a scope file that is wrong.
+  const [persona, scopeText] = await Promise.all([
+    readFile(join(config.shareDir, 'CLAUDE.md'), 'utf8').catch(() => null),
+    readFile(join(config.shareDir, SCOPE_FILE), 'utf8').catch(() => null),
+  ])
+  const pointsAtScope = persona?.includes(SCOPE_FILE) ?? false
+  const scopeCurrent = scopeText === scopeDescription(scope, home)
+  if (scope.kind !== 'folder' || pointsAtScope) {
+    const detail = persona === null
+      ? `No encuentro o no puedo leer el CLAUDE.md de la carpeta compartida, así que no sé si tu agente sabe qué carpetas puede usar. Si no existe, lo escribe: ${CLI_COMMAND} setup`
+      : !pointsAtScope
+      ? `El CLAUDE.md de la carpeta compartida no menciona ${SCOPE_FILE}, así que tu agente puede creer que solo puede usar la carpeta compartida. Añade esta línea sola al principio de ese archivo: @${SCOPE_FILE}`
+      : !scopeCurrent
+        ? `${SCOPE_FILE} en la carpeta compartida falta o no coincide con lo que elegiste, así que tu agente leería un alcance equivocado. Lo vuelve a escribir: ${CLI_COMMAND} setup`
+        : `sí: CLAUDE.md apunta a ${SCOPE_FILE}, y ese archivo dice lo que elegiste`
+    add('Tu agente sabe qué carpetas puede usar', pointsAtScope && scopeCurrent, detail, false)
+  }
+  if (scope.kind !== 'folders') return
+  for (const dir of scope.extra) {
+    const info = await stat(dir).catch(() => null)
+    if (!info?.isDirectory()) {
+      // Said on its own rather than walked: walking a missing folder reports "no se pudo revisar",
+      // which reads as a permission problem and sends the person looking in the wrong place.
+      // `responder` refuses to start on exactly this, so it blocks.
+      add(
+        `Carpeta extra ${dir}`,
+        false,
+        `No encuentro la carpeta extra ${dir}: puede que se haya movido, se haya renombrado, o esté en una unidad que no está conectada. Vuelve a correr: ${CLI_COMMAND} setup y quítala o elige una que exista.`,
+        true,
+        // Not `security`: a folder that is gone exposes nothing; it only stops `responder`.
+        false,
+      )
+      continue
+    }
+    // The folder itself cannot be opened — not a subfolder, the folder. On macOS that is almost
+    // always the privacy settings keeping the terminal out of Documents, Desktop or Downloads:
+    // `stat` passes and `readdir` gets EPERM. Walking would print "1 ruta(s) no se pudieron
+    // revisar" as a security failure with no cause and no way out. Blocking, because the agent
+    // started from the same terminal cannot read it either; not `security`, because a folder
+    // nobody can open exposes nothing. Detected by the error, never by the folder's name.
+    if (await cannotOpen(dir)) {
+      add(`Carpeta extra ${dir}`, false, cannotOpenDetail(dir, platform), true, false)
+      continue
+    }
+    // Links only, and an escaping one does not fail the line (final review, M7): Claude Code resolves
+    // a link and applies the fence and the caja fuerte to its real target (verificaciones.md, V8),
+    // so a link out of an extra folder reaches nothing the chosen folders do not — while a Python
+    // project's `.venv` alone made this a blocking failure, and setup would not offer to start.
+    // The shared folder keeps its stricter line, unchanged since 0.3. The line's name says what it
+    // counts rather than "Sin enlaces…", which would be false beside a link it lets through.
+    // The project-configuration check is the working directory's alone: with Read,
+    // Glob and Grep denied, nothing from an additional directory reached the model on the real
+    // binary — not a skill, a command, a subagent, `.mcp.json`, `CLAUDE.local.md` or `AGENTS.md` —
+    // while the same skill and `CLAUDE.local.md` in the working directory did load
+    // (verificaciones.md, V18 and V19). Flagging them in an extra folder was a false blocking
+    // alarm on the folder people add most: a project.
+    await addFolderContentChecks(add, {
+      dir,
+      linksName: `Enlaces que salen de la carpeta extra ${dir}`,
+      prefix: `En la carpeta extra ${dir}: `,
+      limits: WALK_LIMITS,
+      linksFenced: true,
+    })
+  }
+}
+
 // Everything the dedicated Claude Code profile is responsible for: whether `--profile` was
 // given, never whether `--share` was. Settings, the saved responder configuration, the installed
 // plugin and the login check all live under `profileHome` regardless of whether a shared folder
 // is in the picture at all.
 async function addProfileChecks(
   add: (name: string, ok: boolean, detail: string, blocking: boolean, security?: boolean) => void,
-  o: { profileHome: string; repoDir?: string; run: CommandRunner },
+  o: { profileHome: string; identityHome: string; repoDir?: string; run: CommandRunner; home: string; platform: NodeJS.Platform },
 ): Promise<void> {
   // Everything below lives under `profileHome`, independent of whether a shared folder was given —
   // a profile with no settings.json (or a weakened one) must fail loudly even when doctor is run
@@ -461,8 +679,20 @@ async function addProfileChecks(
   // The reading itself lives beside the writer, in setup-responder.ts: `responder` refuses to
   // start on exactly this verdict (whole-branch review, Important 1), and a second copy here
   // would be free to drift from the one that decides whether a session is safe to spawn.
-  const fence = await inspectResponderSettings(o.profileHome)
+  // Checked against the scope responder.json records, so doctor and `responder` judge the same
+  // file by the same standard. With no readable responder.json there is no scope to hold it to,
+  // and one folder is the strictest reading — that failure is reported on its own line below.
+  const saved = await readResponderConfig(o.profileHome).catch(() => null)
+  const fence = await inspectResponderSettings(o.profileHome, saved?.scope ?? { kind: 'folder' }, {
+    // Unused in mode 1, the only scope doctor falls back to when there is no saved one.
+    shareDir: saved?.shareDir ?? '',
+    identityHome: saved?.identityHome ?? o.identityHome,
+    home: o.home,
+  })
   add('Permisos del respondedor', fence.problems.length === 0, fence.problems.length ? fence.problems.join(' · ') : fence.detail, true, true)
+  // Only with a readable responder.json: without one there is no mode to name, and its absence is
+  // reported on its own line below.
+  if (saved) await addScopeChecks(add, saved, o.home, o.platform)
 
   // What `start.sh`'s own executable-bit check used to stand in for: proof that this profile
   // was actually prepared by setup-responder, not just a folder someone pointed --profile at.
@@ -570,6 +800,9 @@ export async function runDoctor(o: {
   boardTimeoutMs?: number
   miningMs?: number
   platform?: NodeJS.Platform
+  // The personal folder mode 3 opens and the `~/…` rules are anchored to. Injected so tests
+  // describe a machine without reading or naming the real one; defaults to this one.
+  home?: string
 }): Promise<Check[]> {
   const checks: Check[] = []
   // `security` defaults to false so the only calls that carry it are the ones whose failure is
@@ -662,8 +895,10 @@ export async function runDoctor(o: {
   // is the whole point of I1's fix), and `--profile` alone must still examine the profile. The
   // one check that needs both (the cross-containment check) lives inside addShareChecks and
   // only fires when profileHome is also present — see the comment there.
-  if (o.shareDir) await addShareChecks(add, { shareDir: o.shareDir, profileHome: o.profileHome })
-  if (o.profileHome) await addProfileChecks(add, { profileHome: o.profileHome, repoDir: o.repoDir, run })
+  if (o.shareDir) await addShareChecks(add, { shareDir: o.shareDir, profileHome: o.profileHome, platform })
+  if (o.profileHome) {
+    await addProfileChecks(add, { profileHome: o.profileHome, identityHome: o.identityHome, repoDir: o.repoDir, run, home: o.home ?? homedir(), platform })
+  }
   return checks
 }
 

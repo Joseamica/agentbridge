@@ -3,7 +3,7 @@
 Claude Code channel plugin + CLI that lets one person ask another person's agent a question, over
 public Nostr boards. No server of ours: no relay, no account, nothing to host.
 
-- Runbook (Spanish, step by step): docs/runbooks/aceptacion-0.3.md
+- Runbook (Spanish, step by step): docs/runbooks/aceptacion-0.4.md
 - Known gaps and deliberate deferrals: docs/known-gaps.md
 - `npm test` needs no internet. `npm run test:live` is the only suite that talks to public Nostr
   boards; run it on purpose, never in a loop.
@@ -12,6 +12,24 @@ public Nostr boards. No server of ours: no relay, no account, nothing to host.
   hand-rolling another one — the same English leak appeared three times before it was consolidated.
 - `permissions.blockReadsOutsideWorkingDirectories` must stay nested inside `permissions`.
   A copy at the top level of a settings file is accepted by Claude Code and silently ignored.
+  It never turns off: the wider scopes (several folders, the whole personal folder) add
+  `additionalDirectories`, they do not remove the fence.
+- Every deny rule that must hold outside the working directory is anchored — `~/…` for the home,
+  `//<absolute path>/…` for an extra folder. Never write an unanchored `**/…` rule for a wider
+  scope: it is relative to the working directory, so outside it it looks like protection and covers
+  nothing (on Claude Code 2.1.282, `Read(**/.env)` let a direct read of `~/proj/.env` through with
+  the home added; `Read(~/**/.env)` stopped it). The caja fuerte is `CAJA_FUERTE_HOME` plus
+  `cajaFuerteFor()` in `packages/cli/src/commands/setup-responder.ts`; it is fixed in code, and user
+  text calls it "los lugares más conocidos" and never promises it closes every secret.
+- Claude Code behaviours the scopes rest on were verified on 2.1.282
+  (`.superpowers/sdd/2026-09-25-agentbridge-0.4-alcance/verificaciones.md`). A new assumption about
+  Claude Code gets its own probe against the real binary — with a positive control, since "not
+  loaded" proves nothing unless the same probe can say "loaded" — and section 8 of the runbook.
+- `.agentbridge-scope.md` in the shared folder belongs to AgentBridge: rewritten from the scope on
+  every setup and imported by the persona `CLAUDE.md` with `@.agentbridge-scope.md`. A `CLAUDE.md`
+  the owner edited is never touched; setup gives them the one line to add instead. `settings.json`
+  in the dedicated profile is likewise rewritten on every setup, and `responder` refuses to start
+  when it does not match the saved scope exactly.
 - Every printed instruction uses `CLI_COMMAND` (`packages/core/src/published.ts`) — never a
   hand-typed `agentbridge` or a bare command name.
 - Another person's text — a declared name, a note, an answer — goes through `forTerminal` (short

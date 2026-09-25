@@ -22,9 +22,18 @@ import { isSameOrWithin, resolveComparablePath } from '../fs-paths'
 import { defaultInteractiveRunner, type InteractiveRunner } from '../interactive'
 import { describeFsError } from '../spanish-errors'
 import { connect } from './connect'
-import { projectConfigArtifacts, runDoctor, type Check } from './doctor'
+import { MAX_SCAN_DEPTH, MAX_SCAN_ENTRIES, projectConfigArtifacts, runDoctor, type Check } from './doctor'
 import { readResponderConfig, runResponder } from './responder'
-import { defaultRunner, repoDirFromBundleLocation, setupResponder, type CommandRunner } from './setup-responder'
+import { scopeProblem, scopeSummary, type ResponderScope } from './responder-config'
+import {
+  CAJA_FUERTE_HOME,
+  defaultRunner,
+  repoDirFromBundleLocation,
+  responderSettings,
+  setupResponder,
+  type CommandRunner,
+  type ScopePaths,
+} from './setup-responder'
 
 // The guided flow needs two extra things the plain CliContext does not carry: something to
 // drive prompts with (real readline in production, a scripted queue in tests — see
@@ -49,6 +58,13 @@ export type SetupContext = CliContext & {
   // Returns false when no clipboard tool exists. Injected so a test does not depend on whether
   // the machine running it happens to have one.
   copyLink?: (text: string) => Promise<boolean>
+  // Which platform the scope question judges and setupResponder writes for. Injected so the
+  // Windows refusals (modes 2 and 3) can be walked through on any machine; defaults to this one.
+  platform?: NodeJS.Platform
+  // The personal folder the scope question reasons about and setupResponder anchors to. Injected
+  // so a test decides which caja fuerte folders exist, instead of whatever this machine has: the
+  // case-blind caja test proved nothing on a Mac with a real `~/.kube` (task 2 review, M8).
+  personalHome?: string
 }
 
 // The truth today: the key and the name are only ever created by answering these two questions,
@@ -92,7 +108,10 @@ const SHARE_FOLDER_EXPLANATION_ES = [
   'depende de que el modelo se porte bien: está impuesto por configuración, y esa configuración',
   'solo protege lo que está DENTRO de la carpeta que elijas. Por eso:',
   '  - Usa una carpeta nueva y vacía, dedicada solo a esto.',
-  '  - No la apuntes a tu repositorio de trabajo ni a tu carpeta de usuario.',
+  // "carpeta personal", the name option 3 of the scope question uses for the same folder, a few
+  // lines later (task 2 review, M1): two names for one thing read as two things.
+  '  - No la apuntes a tu repositorio de trabajo ni a tu carpeta personal.',
+  '    (Si quieres que tu agente vea toda tu carpeta personal, eso te lo pregunto después.)',
   '  - Copia ahí solo lo que de verdad quieras compartir.',
 ].join('\n')
 
@@ -204,8 +223,17 @@ async function askWithRetries<T>(
 // without ever creating anything on disk — an earlier test instead ran a full guided setup
 // against a path under the real `~/AgentBridge`, and a failing assertion partway through left a
 // stray folder in the owner's actual home when the cleanup at the end of the test never ran.
-export function expandUserPath(raw: string): string {
-  const trimmed = raw.trim()
+//
+// A folder dragged into the macOS Terminal arrives shell-escaped (`Mis\ Documentos`), and some
+// terminals wrap it in quotes instead. Both are undone here, the way a shell would have, before
+// any other check: left in, the backslash reached the glob-character refusal and a person who
+// did exactly what a non-programmer does was told to rename a folder whose name was fine (task 2
+// review, M5). Not on Windows, where the backslash is the path separator.
+export function expandUserPath(raw: string, platform: NodeJS.Platform = process.platform): string {
+  let trimmed = raw.trim()
+  const quoted = /^(['"])(.*)\1$/s.exec(trimmed)
+  if (quoted) trimmed = quoted[2] ?? ''
+  if (platform !== 'win32') trimmed = trimmed.replace(/\\(.)/gs, '$1')
   if (trimmed === '~' || trimmed === '$HOME') return homedir()
   if (trimmed.startsWith('~/')) return join(homedir(), trimmed.slice(2))
   if (trimmed.startsWith('$HOME/')) return join(homedir(), trimmed.slice('$HOME/'.length))
@@ -222,7 +250,7 @@ const MAX_FOLDER_ATTEMPTS = 3
 function hardRefusal(assessment: ShareDirAssessment): string | null {
   if (assessment.problem) return `No puedo usar esa carpeta: ${assessment.problem}.`
   if (assessment.isHome) {
-    return 'Esa es tu carpeta de usuario, y compartirla dejaría visible todo lo que tienes en la computadora.'
+    return 'Esa es tu carpeta personal, y compartirla así dejaría visible todo lo que tienes en la computadora.'
   }
   if (assessment.credentialConflict) {
     // What is actually at stake differs by branch (Q1: the dedicated profile holds no key or
@@ -250,10 +278,11 @@ async function chooseShareDir(o: {
   out: Output
   defaultShare: string
   assess: (shareDir: string) => Promise<ShareDirAssessment>
+  platform: NodeJS.Platform
 }): Promise<{ shareDir: string; assessment: ShareDirAssessment }> {
   for (let attempt = 1; attempt <= MAX_FOLDER_ATTEMPTS; attempt++) {
     const rawShare = (await o.prompt(`Carpeta a compartir (Enter para usar ${o.defaultShare}): `)).trim()
-    const shareDir = resolve(expandUserPath(rawShare) || o.defaultShare)
+    const shareDir = resolve(expandUserPath(rawShare, o.platform) || o.defaultShare)
     // Logged explicitly (not just folded into the question text below) so it is always visible
     // — to a person at a real terminal AND to anything inspecting this command's output — even
     // though a real readline `.question()` would also echo its own question string to the
@@ -288,9 +317,6 @@ async function chooseShareDir(o: {
 // in alongside real files, at any depth) without pretending to be a full secret scanner.
 const CREDENTIAL_NAME_PATTERNS = [/^\.env(\..*)?$/, /\.pem$/i, /\.key$/i, /^id_rsa/i, /^credentials/i]
 
-const MAX_SCAN_DEPTH = 6
-const MAX_SCAN_ENTRIES = 20000
-
 type ShareDirScan = {
   gitDirs: string[]
   suspiciousFiles: string[]
@@ -300,9 +326,11 @@ type ShareDirScan = {
   // here instead, which is what makes the CONFIRMAR gate fire on it.
   symlinks: string[]
   // node_modules is never descended into (same reasoning doctor.ts gives), but silently skipping
-  // it is exactly how `node_modules/pkg/.env` produced no warning even though Grep can still
-  // read it — named here so the gate can say so, the same way doctor.ts's own "skipped" list
-  // names it rather than claiming a clean sweep.
+  // it is exactly how a key file inside `node_modules/pkg/` produced no warning. (The reason
+  // once said Grep could read a `.env` there; on Claude Code 2.1.282 Grep skips denied `.env`
+  // files (verificaciones.md, V6 and V13), but an `id_rsa`, a `credentials.json` or — in mode 1 —
+  // a `.pem` is still readable.) Named here so the gate can say so, the same way doctor.ts's own
+  // "skipped" list names it rather than claiming a clean sweep.
   skippedNodeModules: string[]
   // True only when at least one branch was too deeply nested to fully explore — its own
   // recursion stops, but sibling directories elsewhere in the tree are still scanned. Kept
@@ -426,9 +454,23 @@ export type ShareDirAssessment = {
 
 // Reuses doctor's own project-config detection (projectConfigArtifacts) rather than keeping a
 // second list of the same artifact names — see the comment on that export in doctor.ts.
+//
+// `role: 'extra'` is mode 2's extra folder, which drops two of the reasons, and only there:
+// - project configuration: nothing from an additional directory reaches the model — not a skill,
+//   a command, a subagent, `.mcp.json` or `CLAUDE.local.md` (verificaciones.md, V18, with V19 as
+//   its control). Saying an extra folder holds configuration "que doctor vigila" was untrue: doctor
+//   dropped that check for extra folders, and every project with a `.claude/` got a CONFIRMAR
+//   screen for it (final review, I3).
+// - symlinks: a link inside an extra folder never widens what the agent can read. Claude Code
+//   resolves it and applies the fence and the caja fuerte to the real target (V8), so the target
+//   is readable only if it already lies in a chosen folder. A Python project's `.venv` is enough
+//   to trip this reason (final review, M7).
+// The shared folder keeps both: it is the working directory, where project configuration does
+// load (V19), and its behaviour is unchanged from 0.3.
 export async function assessShareDir(
   shareDirRaw: string,
   guard: { identityHome: string; profileHome: string },
+  role: 'shared' | 'extra' = 'shared',
 ): Promise<ShareDirAssessment> {
   const shareDir = resolve(shareDirRaw)
   const [shareReal, homeReal, identityReal, profileReal] = await Promise.all([
@@ -468,7 +510,7 @@ export async function assessShareDir(
       const shown = scan.suspiciousFiles.slice(0, 5).join(', ') + (scan.suspiciousFiles.length > 5 ? ', …' : '')
       reasons.push(`tiene archivos que parecen credenciales: ${shown}`)
     }
-    if (scan.symlinks.length > 0) {
+    if (scan.symlinks.length > 0 && role === 'shared') {
       const shown = scan.symlinks.slice(0, 5).join(', ') + (scan.symlinks.length > 5 ? ', …' : '')
       reasons.push(
         `tiene enlaces simbólicos que no revisé por dentro: ${shown} — podrían apuntar a cualquier cosa, incluido otro repositorio de trabajo`,
@@ -476,9 +518,9 @@ export async function assessShareDir(
     }
     if (scan.skippedNodeModules.length > 0) {
       const shown = scan.skippedNodeModules.slice(0, 5).join(', ') + (scan.skippedNodeModules.length > 5 ? ', …' : '')
-      reasons.push(`no revisé dentro de node_modules (${shown}) — Grep no está bloqueado, así que un .env ahí adentro seguiría siendo legible`)
+      reasons.push(`no revisé dentro de node_modules (${shown}) — si ahí adentro hay un archivo de llaves o de credenciales, tu agente lo puede leer y yo no lo vi`)
     }
-    const projectConfig = await projectConfigArtifacts(shareDir)
+    const projectConfig = role === 'shared' ? await projectConfigArtifacts(shareDir) : []
     if (projectConfig.length > 0) reasons.push(`ya tiene configuración de proyecto que doctor vigila: ${projectConfig.join(', ')}`)
     // Both of these lead with the actual danger (a repo or credentials might be hiding in what
     // wasn't fully checked), not with a performance-sounding note about size — a real reviewer
@@ -496,6 +538,329 @@ export async function assessShareDir(
     }
   }
   return { exists, isHome, credentialConflict, credentialConflictKind, problem, reasons }
+}
+
+// The question 0.4 adds: how far the answering agent can see. Asked once, after the shared folder
+// is settled, for every contact at once (D1). Enter keeps what this computer already has — the
+// same reason the folder question proposes the saved folder: a re-run pressing Enter must never
+// silently change what a working responder can read, in either direction.
+const SCOPE_QUESTION_LINES = [
+  '¿Qué puede ver tu agente cuando alguien te pregunta?',
+  '  1) Solo esta carpeta (recomendado)',
+  '  2) Esta carpeta y otras que elijas',
+  '  3) Toda tu carpeta personal, menos la caja fuerte',
+]
+
+type ScopeChoice = 1 | 2 | 3
+
+function scopeNumber(scope: ResponderScope): ScopeChoice {
+  return scope.kind === 'folder' ? 1 : scope.kind === 'folders' ? 2 : 3
+}
+
+function parseScopeChoice(raw: string, onEnter: ScopeChoice): ScopeChoice | null {
+  const v = raw.trim()
+  if (v === '') return onEnter
+  if (v === '1') return 1
+  if (v === '2') return 2
+  if (v === '3') return 3
+  return null
+}
+
+// Says exactly what is shut and, in the same breath, what is not (task 2 review, I2). An earlier
+// wording said "tus archivos de llaves siguen cerrados", while only six file kinds are denied: an
+// `id_rsa` or a `credentials.json` in a chosen folder stays readable once CONFIRMAR is typed. A
+// reassurance that is not true is worse than none, because the person relies on it.
+const EXTRA_FOLDERS_EXPLANATION_ES = [
+  'Dime las otras carpetas que tu agente puede leer, una por una.',
+  'Cuando termines, deja la respuesta vacía y presiona Enter.',
+  'Dentro de esas carpetas siguen cerrados los archivos .env y los archivos de llaves que terminan en .pem, .key, .p12 o .pfx.',
+  'Cualquier otro archivo sí se puede leer, aunque guarde una clave: por ejemplo un id_rsa, un credentials.json o una contraseña escrita en un documento.',
+].join('\n')
+
+// Mode 3 says, before the confirmation, the one thing a person must understand to answer it: that
+// it is not "what I mean to share" but every file in the personal folder, for anyone they let ask.
+// The caja fuerte is named in everyday words — nobody who does not program knows what `~/.ssh` is,
+// and they do not need to. It is also named as what it is, the best-known places, followed by
+// what it does not reach: the first wording promised "tus contraseñas y llaves" were shut, and a
+// `contraseñas.docx`, saved mail and chats, or a cloud tool's token file are all readable (task 2
+// review, I2). This is the consent screen for the widest mode; its reassurance has to be as exact
+// as its warning. So it promises no more than is true: not "siempre" and not "que nadie puede
+// abrir" — a future Claude Code could stop honouring a rule, and an everyday Claude kept in a
+// custom CLAUDE_CONFIG_DIR is not in the list — only that nobody can open it through `setup`
+// (ruling 6). It is never shown on Windows, where mode 3 is refused (ruling 5).
+function homeExplanation(home: string): string {
+  return [
+    `Con esta opción, tu agente puede leer cualquier archivo de tu carpeta personal (${home}):`,
+    'tus documentos, tus fotos, tus proyectos, todo lo que tengas ahí.',
+    '',
+    'Lo que sigue cerrado es la "caja fuerte". Nadie la puede abrir desde setup, ni tú:',
+    '  - tu llave de AgentBridge',
+    '  - tu Claude de todos los días: tu sesión y tus conversaciones',
+    '  - los lugares más conocidos donde se guardan contraseñas y llaves: las del navegador, las de tu llavero y las que dan acceso a servidores y a la nube',
+    '  - tus archivos .env, donde los programas guardan sus contraseñas',
+    'Los archivos del sistema, fuera de tu carpeta personal, también siguen cerrados.',
+    '',
+    'La caja fuerte no lo cubre todo. Si tienes una contraseña escrita en un documento, correos o chats',
+    'guardados en tu computadora, o un archivo de llaves con un nombre poco común, tu agente sí puede leerlos.',
+    '',
+    'Importante: cualquier persona a la que le des permiso de preguntarte puede preguntar por',
+    'cualquier otro archivo de tu carpeta personal, y tu agente se lo va a leer. No solo lo que tú',
+    'pensabas compartir: cualquier archivo que no esté en la caja fuerte.',
+    '',
+    `Si estás de acuerdo, escribe ${CONFIRM_WORD}. Cualquier otra respuesta deja solo esta carpeta (opción 1).`,
+  ].join('\n')
+}
+
+// The directory entries of the caja fuerte (`Read(~/<dir>/**)`), as real paths. Read from the list
+// itself rather than kept as a second copy here: task 1 grew that list in review, and a copy would
+// have silently missed every entry added after it was made.
+function cajaFuerteDirs(homeReal: string): string[] {
+  const dirs: string[] = []
+  for (const rule of CAJA_FUERTE_HOME) {
+    const m = /^Read\(~\/([^*]+)\/\*\*\)$/.exec(rule)
+    if (m?.[1]) dirs.push(join(homeReal, m[1]))
+  }
+  return dirs
+}
+
+type ScopeInterview = {
+  prompt: Prompt
+  out: Output
+  shareDir: string
+  identityHome: string
+  profileHome: string
+  // The personal folder: what mode 3 opens and what the `~/…` rules are anchored to.
+  home: string
+  platform: NodeJS.Platform
+  saved: ResponderScope | null
+}
+
+// Whether this machine can enforce a scope, in task 1's own words. The writer itself decides —
+// the same function setupResponder calls — so the question can never accept a scope the write
+// would then refuse, which would end the interview with the folder already chosen and nothing
+// saved. It refuses modes 2 and 3 on Windows, and any path with a glob character.
+function unenforceable(scope: ResponderScope, paths: ScopePaths): string | null {
+  try {
+    responderSettings(scope, paths)
+    return null
+  } catch (err) {
+    if (err instanceof CliError) return err.message
+    throw err
+  }
+}
+
+async function chooseScope(o: ScopeInterview): Promise<ResponderScope> {
+  const paths: ScopePaths = {
+    shareDir: resolve(o.shareDir),
+    identityHome: resolve(o.identityHome),
+    profileHome: resolve(o.profileHome),
+    home: o.home,
+    platform: o.platform,
+  }
+  const onEnter = o.saved ? scopeNumber(o.saved) : 1
+  const enterHint = onEnter === 1 ? 'Enter para la 1' : `Enter para dejar la ${onEnter}, la que tienes ahora`
+  const question = [...SCOPE_QUESTION_LINES, `Escribe 1, 2 o 3 (${enterHint}): `].join('\n')
+  let lastWasBlocked = false
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const raw = await o.prompt(question)
+    const choice = parseScopeChoice(raw, onEnter)
+    if (choice === null) {
+      lastWasBlocked = false
+      o.out.log(`No entendí "${raw.trim()}". Escribe 1, 2 o 3.`)
+      continue
+    }
+    if (choice === 1) return { kind: 'folder' }
+    // Checked before anything else is asked: on Windows there is no point collecting folders the
+    // write would refuse, and a refusal here must lead back to the question, not out of setup.
+    const blocked = unenforceable(choice === 2 ? { kind: 'folders', extra: [] } : { kind: 'home' }, paths)
+    if (blocked) {
+      lastWasBlocked = true
+      o.out.log(blocked)
+      o.out.log('Elige otra opción.')
+      continue
+    }
+    if (choice === 3) return confirmHome(o)
+    const previous = o.saved?.kind === 'folders' ? o.saved.extra : []
+    const extra = await chooseExtraFolders(o, paths, previous)
+    if (extra.length > 0) return { kind: 'folders', extra }
+    o.out.log('No añadiste ninguna carpeta, así que tu agente solo va a ver esta carpeta (opción 1).')
+    return { kind: 'folder' }
+  }
+  // Falls back instead of ending the interview, and always to one folder — never to the saved
+  // scope: "keep what they had" would restore a saved mode 3 without the typed confirmation.
+  // A choice that was understood but is unavailable here is not "no entendí" (review, M2).
+  o.out.log(
+    lastWasBlocked
+      ? `Esa opción no se puede usar en esta computadora, así que dejo solo esta carpeta (opción 1). Para cambiarlo, vuelve a correr: ${CLI_COMMAND} setup`
+      : `No entendí qué opción querías, así que dejo solo esta carpeta (opción 1). Para cambiarlo, vuelve a correr: ${CLI_COMMAND} setup`,
+  )
+  return { kind: 'folder' }
+}
+
+// One attempt, not three: the brief says anything but the word falls back, and here the fallback
+// is the safe answer — unlike the shared-folder gate, where a miss ends the interview.
+async function confirmHome(o: ScopeInterview): Promise<ResponderScope> {
+  o.out.log('')
+  o.out.log(homeExplanation(o.home))
+  const raw = await o.prompt(`Escribe ${CONFIRM_WORD} para continuar: `)
+  if (parseConfirmation(raw)) {
+    // A way back, said at the moment of choosing, so CONFIRMAR does not read as final (review, M10).
+    o.out.log(`Si cambias de opinión, vuelve a correr "${CLI_COMMAND} setup" y elige la opción 1.`)
+    return { kind: 'home' }
+  }
+  o.out.log(`No escribiste ${CONFIRM_WORD}, así que dejo solo esta carpeta (opción 1).`)
+  return { kind: 'folder' }
+}
+
+async function chooseExtraFolders(o: ScopeInterview, paths: ScopePaths, previous: readonly string[]): Promise<string[]> {
+  let chosen: string[] = []
+  const accept = (dir: string, replaces: readonly string[]): void => {
+    chosen = [...chosen.filter((c) => !replaces.includes(c)), dir]
+    for (const c of replaces) o.out.log(`Quité de la lista ${c}: está dentro de esta, así que tu agente la sigue viendo.`)
+  }
+  o.out.log('')
+  o.out.log(EXTRA_FOLDERS_EXPLANATION_ES)
+  if (previous.length > 0) {
+    o.out.log('La vez pasada elegiste además estas carpetas:')
+    for (const dir of previous) o.out.log(`  - ${dir}`)
+    const keep = await askWithRetries(
+      o.prompt,
+      o.out,
+      '¿Las dejo? [S/n]: ',
+      parseProceedOrRetry,
+      'Escribe s (sí), n (no), o solo Enter para dejarlas.',
+      'No entendí tu respuesta.',
+    ).catch((err: unknown) => {
+      // Only the give-up: a closed input must still reach runSetup as a closed input.
+      if (err instanceof CliError) return false
+      throw err
+    })
+    // Kept folders go through every check again: since the last run one may have gained a `.git`
+    // or a key file, or moved inside something the caja fuerte closes. Each is named before its
+    // checks run: a re-run once printed "no existe" and "Escribe CONFIRMAR para añadirla" under a
+    // list of three folders, and the person could not tell which one either sentence was about
+    // (task 2 review, I1).
+    if (keep) {
+      for (const dir of previous) {
+        o.out.log(`Carpeta: ${dir}`)
+        const verdict = await considerExtraFolder(o, paths, dir, chosen)
+        if (verdict.ok) {
+          accept(dir, verdict.replaces)
+          o.out.log('Sigue en la lista.')
+        }
+      }
+    }
+  }
+  let refusedInARow = 0
+  for (;;) {
+    const raw = (await o.prompt('Otra carpeta que tu agente pueda leer (Enter para terminar): ')).trim()
+    if (!raw) break
+    const dir = resolve(expandUserPath(raw, o.platform))
+    o.out.log(`Carpeta: ${dir}`)
+    const verdict = await considerExtraFolder(o, paths, dir, chosen)
+    if (verdict.ok) {
+      accept(dir, verdict.replaces)
+      refusedInARow = 0
+      o.out.log('Añadida.')
+      continue
+    }
+    refusedInARow++
+    // Bounded like the folder question, but ending in what was already chosen rather than in an
+    // error: every folder in `chosen` passed every check.
+    if (refusedInARow >= MAX_FOLDER_ATTEMPTS) {
+      o.out.log('Sigo con las carpetas que ya elegiste.')
+      break
+    }
+    o.out.log('Dime otra, o presiona Enter para terminar.')
+  }
+  return chosen
+}
+
+// `replaces`: folders already on the list that sit inside this one. Adding the parent takes them
+// off, since it covers them — the alternative, refusing the parent with a sentence that named the
+// child, left the person with no way to widen the list but a re-run (task 2 review, M4).
+type ExtraVerdict = { ok: true; replaces: string[] } | { ok: false }
+
+// Every check one extra folder has to pass, each refusal with its own reason and none of them
+// ending the interview. The order matters only for which reason is said: the cheap string checks
+// run before anything touches the disk.
+async function considerExtraFolder(o: ScopeInterview, paths: ScopePaths, dir: string, chosen: readonly string[]): Promise<ExtraVerdict> {
+  const refuse = (reason: string): ExtraVerdict => {
+    o.out.log(reason)
+    return { ok: false }
+  }
+  const [dirReal, homeReal, shareReal, identityReal, profileReal] = await Promise.all([
+    resolveComparablePath(dir),
+    resolveComparablePath(paths.home),
+    resolveComparablePath(paths.shareDir),
+    resolveComparablePath(paths.identityHome),
+    resolveComparablePath(paths.profileHome),
+  ])
+  // Ruling 1 of task 1: the caja fuerte holds in mode 2 as well, so a folder inside it would be
+  // added and then be entirely unreadable — `~/.ssh` chosen as an extra folder is exactly the
+  // hole that ruling closed. Refused here, with the reason, rather than accepted as a folder that
+  // silently shows nothing. Compared without regard to case: on a Mac `~/.SSH` IS `~/.ssh`, and
+  // Claude denies it either way (verificaciones.md, V10–V13).
+  const lower = dirReal.toLowerCase()
+  const closed = [...cajaFuerteDirs(homeReal), identityReal, profileReal]
+  if (closed.some((c) => isSameOrWithin(lower, c.toLowerCase()))) {
+    return refuse(
+      'No puedo añadir esa carpeta: está dentro de la caja fuerte (tu llave de AgentBridge, tu Claude de todos los días o uno de los lugares más conocidos donde se guardan contraseñas y llaves). Tu agente no podría leer nada de ahí, así que no tiene caso añadirla.',
+    )
+  }
+  if (isSameOrWithin(homeReal, dirReal)) {
+    return refuse(
+      'No puedo añadir esa carpeta: es tu carpeta personal, o la contiene. Si quieres que tu agente vea toda tu carpeta personal, elige la opción 3: toda tu carpeta personal, menos la caja fuerte.',
+    )
+  }
+  // How this folder relates to the ones already on the list, said about the folder just typed.
+  const chosenReal = await Promise.all(chosen.map((d) => resolveComparablePath(d)))
+  const replaces: string[] = []
+  for (const [i, c] of chosen.entries()) {
+    const cReal = chosenReal[i] ?? c
+    if (cReal === dirReal) return refuse('No puedo añadir esa carpeta: ya está en la lista.')
+    if (isSameOrWithin(dirReal, cReal)) {
+      return refuse(`No puedo añadir esa carpeta: está dentro de ${c}, que ya añadiste, así que tu agente ya puede leerla.`)
+    }
+    if (isSameOrWithin(cReal, dirReal)) replaces.push(c)
+  }
+  const kept = chosen.filter((c) => !replaces.includes(c))
+  const keptReal = chosenReal.filter((_, i) => !replaces.includes(chosen[i] ?? ''))
+  // A glob character in the name: task 1's writer refuses it, in its own sentence.
+  const blocked = unenforceable({ kind: 'folders', extra: [...kept, dir] }, paths)
+  if (blocked) return refuse(blocked)
+  const problem = scopeProblem(
+    { kind: 'folders', extra: [...keptReal, dirReal] },
+    { shareDir: shareReal, identityHome: identityReal, profileHome: profileReal },
+  )
+  if (problem) {
+    // Judged on real paths (a `/tmp` that is really `/private/tmp` must not slip past), but said
+    // with the paths the person typed: a sentence naming a folder they never mentioned reads as
+    // a different folder.
+    const typed = [...kept, dir]
+    const real = [...keptReal, dirReal]
+    const order = real.map((_, i) => i).sort((x, y) => (real[y] ?? '').length - (real[x] ?? '').length)
+    let said = problem
+    for (const i of order) said = said.replaceAll(real[i] ?? '', typed[i] ?? '')
+    return refuse(`No puedo añadir esa carpeta: ${said}.`)
+  }
+  // The same gate the shared folder went through, less the two reasons that are not true of an
+  // extra folder (see assessShareDir): hard refusals refuse, danger reasons ask.
+  const assessment = await assessShareDir(dir, { identityHome: paths.identityHome, profileHome: paths.profileHome }, 'extra')
+  const hard = hardRefusal(assessment)
+  if (hard) return refuse(hard)
+  // Unlike the shared folder, nothing creates an extra folder: it is one of the person's own,
+  // and a missing one would be a readable directory that does not exist.
+  if (!assessment.exists) {
+    return refuse('No puedo añadir esa carpeta: no existe. Las carpetas extra tienen que existir ya: son carpetas tuyas que quieres que tu agente pueda leer.')
+  }
+  if (assessment.reasons.length === 0) return { ok: true, replaces }
+  o.out.log('Ojo: esa carpeta se ve peligrosa para compartir —')
+  for (const reason of assessment.reasons) o.out.log(`  - ${reason}`)
+  o.out.log(`Si de verdad quieres añadirla, escribe exactamente ${CONFIRM_WORD}. Cualquier otra respuesta la deja fuera.`)
+  if (parseConfirmation(await o.prompt(`Escribe ${CONFIRM_WORD} para añadirla: `))) return { ok: true, replaces }
+  o.out.log('No la añadí.')
+  return { ok: false }
 }
 
 // doctor's own name for the one check this command can fix on the spot instead of merely
@@ -738,9 +1103,12 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     const saved = await readResponderConfig(profileHome).catch(() => null)
     const defaultShare = saved?.shareDir ?? join(homedir(), 'AgentBridge', 'compartido')
 
+    const platform = ctx.platform ?? process.platform
+    const personalHome = ctx.personalHome ?? homedir()
     const { shareDir, assessment } = await chooseShareDir({
       prompt,
       out,
+      platform,
       defaultShare,
       assess: (dir) => assessShareDir(dir, { identityHome: ctx.home, profileHome }),
     })
@@ -768,9 +1136,34 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     out.log(assessment.exists ? 'Voy a usar la carpeta que ya existe.' : 'Esa carpeta no existe todavía; la voy a crear vacía.')
     out.log('')
 
+    const scope = await chooseScope({
+      prompt,
+      out,
+      shareDir,
+      identityHome: ctx.home,
+      profileHome,
+      home: personalHome,
+      platform,
+      // Only a saved scope for this same profile; an unreadable file proposes one folder.
+      saved: saved?.scope ?? null,
+    })
+    out.log(scopeSummary(scope))
+    out.log('')
+
     let setupResult: Awaited<ReturnType<typeof setupResponder>>
     try {
-      setupResult = await setupResponder({ shareDir, repoDir, profileHome, identityHome: ctx.home, run: ctx.run, out, printNextSteps: false })
+      setupResult = await setupResponder({
+        shareDir,
+        repoDir,
+        profileHome,
+        identityHome: ctx.home,
+        run: ctx.run,
+        out,
+        printNextSteps: false,
+        scope,
+        platform,
+        home: personalHome,
+      })
     } catch (err) {
       if (err instanceof CliError) throw err
       // describeFsError names the kind of filesystem problem (permissions, missing path) without
@@ -848,6 +1241,7 @@ async function runGuidedSetup(ctx: SetupContext): Promise<void> {
     // Never "listo para contestar" while something still blocks answering: that is the sentence
     // the person reads to decide whether they are done.
     done.push(canStartResponder ? 'Listo para contestar desde esta computadora.' : 'Dejé preparados la carpeta compartida y el perfil dedicado.')
+    done.push(scopeSummary(scope))
     // The summary is the part people scroll back to, so it has to carry its own subject. It used
     // to say only "Cuando esté resuelto, empieza a contestar con: …" — a sentence whose "esto"
     // had been named eight lines earlier and was gone from the screen by then.
